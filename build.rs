@@ -2,7 +2,6 @@ use std::{env, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
-    println!("cargo:rerun-if-env-changed=CUDA_PATH_V12_9");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none()
         || env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
@@ -10,7 +9,7 @@ fn main() {
         return;
     }
 
-    let cuda_path = env::var_os("CUDA_PATH").or_else(|| env::var_os("CUDA_PATH_V12_9"));
+    let cuda_path = env::var_os("CUDA_PATH");
     let Some(cuda_path) = cuda_path else {
         return;
     };

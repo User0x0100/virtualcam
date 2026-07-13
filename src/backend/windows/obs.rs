@@ -273,8 +273,7 @@ impl Drop for ObsBackend {
 }
 
 fn mul_div_u64(number: u64, multiplier: u64, divisor: u64) -> u64 {
-    let remainder = number % divisor;
-    (number / divisor) * multiplier + (remainder * multiplier) / divisor
+    ((number as u128 * multiplier as u128) / divisor as u128) as u64
 }
 
 #[cfg(test)]

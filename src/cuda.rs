@@ -182,9 +182,9 @@ unsafe fn transfer_then_publish_with_api<T>(
         message: Some("staging allocation was not retained".to_owned()),
     })?;
     if staging.len != frame_size {
-        return Err(Error::Protocol {
-            backend: crate::CameraType::Obs,
-            detail: "CUDA staging size differs from camera frame size",
+        return Err(Error::FrameSizeMismatch {
+            expected: staging.len,
+            actual: frame_size,
         });
     }
     // SAFETY: The caller provides the CUDA pointer/stream validity contract;
