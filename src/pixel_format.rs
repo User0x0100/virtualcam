@@ -1,0 +1,50 @@
+use crate::{Error, Result};
+
+/// Native pixel formats accepted by the supported backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// Tightly packed NV12: a full-resolution Y plane followed by an interleaved UV plane.
+    Nv12,
+    /// Tightly packed four-byte RGBA pixels, matching Unity Capture `FORMAT_UINT8`.
+    Rgba8,
+}
+
+impl PixelFormat {
+    /// Computes the exact tightly packed byte length for `width` by `height`.
+    ///
+    /// Returns [`Error::InvalidDimensions`] when NV12 dimensions are odd or any
+    /// dimension is zero, and [`Error::FrameSizeOverflow`] for arithmetic overflow.
+    pub fn frame_size(self, width: u32, height: u32) -> Result<usize> {
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidDimensions);
+        }
+        if self == Self::Nv12 && (!width.is_multiple_of(2) || !height.is_multiple_of(2)) {
+            return Err(Error::InvalidDimensions);
+        }
+        self.checked_frame_size(width, height)
+    }
+
+    pub(crate) fn checked_frame_size(self, width: u32, height: u32) -> Result<usize> {
+        let width = usize::try_from(width).map_err(|_| Error::FrameSizeOverflow)?;
+        let height = usize::try_from(height).map_err(|_| Error::FrameSizeOverflow)?;
+        let pixels = width.checked_mul(height).ok_or(Error::FrameSizeOverflow)?;
+        match self {
+            Self::Nv12 => pixels
+                .checked_mul(3)
+                .map(|bytes| bytes / 2)
+                .ok_or(Error::FrameSizeOverflow),
+            Self::Rgba8 => pixels.checked_mul(4).ok_or(Error::FrameSizeOverflow),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computes_tightly_packed_sizes() {
+        assert_eq!(PixelFormat::Nv12.frame_size(1920, 1080), Ok(3_110_400));
+        assert_eq!(PixelFormat::Rgba8.frame_size(1920, 1080), Ok(8_294_400));
+    }
+}
