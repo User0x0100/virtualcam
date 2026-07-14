@@ -35,6 +35,34 @@ Frames must be contiguous and have exactly `camera.frame_size()` bytes. NV12 wid
 
 `is_ready()` follows what each upstream protocol can actually report. Unity returns `false` until its DirectShow receiver has created the required objects. OBS has no consumer-presence handshake, so its producer is ready as soon as its queue is open.
 
+## Generated test video example
+
+The `generated_test_video` example creates a moving color-bar, checkerboard, and
+bouncing-marker pattern entirely in code. By default it writes to both installed
+cameras concurrently for 30 seconds at 1280x720 and 30 FPS:
+
+```powershell
+cargo run --release --example generated_test_video
+```
+
+The duration, output selection, dimensions, and frame rate are adjustable:
+
+```powershell
+# Both cameras for 60 seconds.
+cargo run --release --example generated_test_video -- --duration 60
+
+# Test only OBS Virtual Camera.
+cargo run --release --example generated_test_video -- --camera obs --duration 30
+
+# Test only Unity Capture device #1 at a different mode.
+cargo run --release --example generated_test_video -- --camera unity --duration 30 --width 640 --height 480 --fps 24
+```
+
+OBS output uses generated NV12 frames; Unity output uses generated RGBA8 frames.
+No external image or video is read. Unity may be opened by a consumer before or
+during the run—the example keeps polling while its consumer is inactive. Use
+`--help` to list all options. `--release` is recommended for real-time generation.
+
 ## CUDA frames
 
 Enable `cuda` and pass a CUDA Runtime device pointer:
