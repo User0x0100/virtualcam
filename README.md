@@ -92,7 +92,8 @@ cameras concurrently for 30 seconds at 1280x720 and 30 FPS:
 cargo run --release --example generated_test_video
 ```
 
-The duration, output selection, dimensions, and frame rate are adjustable:
+The memory path, CUDA device, duration, output selection, dimensions, and frame
+rate are adjustable. Host memory remains the default:
 
 ```powershell
 # Both cameras for 60 seconds.
@@ -103,12 +104,21 @@ cargo run --release --example generated_test_video -- --camera obs --duration 30
 
 # Test only Unity Capture device #1 at a different mode.
 cargo run --release --example generated_test_video -- --camera unity --duration 30 --width 640 --height 480 --fps 24
+
+# Write the generated video to both cameras from CUDA device memory on device 0.
+cargo run --release --features cuda --example generated_test_video -- --memory cuda --cuda-device 0 --duration 30
 ```
 
 OBS output uses generated NV12 frames; Unity output uses generated RGBA8 frames.
 No external image or video is read. Unity may be opened by a consumer before or
 during the run—the example keeps polling while its consumer is inactive. Use
 `--help` to list all options. `--release` is recommended for real-time generation.
+
+CUDA mode still generates each test frame in code on the CPU, then enqueues H2D
+into a camera-specific device allocation and calls `write_cuda` on the same
+default CUDA stream. The library's D2H therefore runs after that upload and
+targets the selected OBS or Unity shared-memory slot directly. Each camera owns
+an independent device allocation, released explicitly at the end.
 
 ## CUDA frames
 

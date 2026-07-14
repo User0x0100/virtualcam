@@ -24,14 +24,18 @@ Usage:
 
 Options:
   --camera <both|obs|unity>  Cameras to exercise (default: both)
-  --duration <seconds>      Wall-clock duration (default: 30)
-  --width <pixels>          Frame width (default: 1280)
-  --height <pixels>         Frame height (default: 720)
-  --fps <frames/second>     Nominal frame rate (default: 30)
-  -h, --help                Show this help
+  --memory <host|cuda>       Frame memory passed to the camera (default: host)
+  --cuda-device <ordinal>    CUDA device used by --memory cuda (default: 0)
+  --duration <seconds>       Wall-clock duration (default: 30)
+  --width <pixels>           Frame width (default: 1280)
+  --height <pixels>          Frame height (default: 720)
+  --fps <frames/second>      Nominal frame rate (default: 30)
+  -h, --help                 Show this help
 
 When Unity Capture has no active consumer, the example keeps polling and starts
 publishing automatically once device #1 is opened by a consumer application.
+
+CUDA mode requires Windows and `--features cuda`.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,9 +45,17 @@ enum CameraSelection {
     Unity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryKind {
+    Host,
+    Cuda,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Settings {
     selection: CameraSelection,
+    memory: MemoryKind,
+    cuda_device: i32,
     duration_seconds: f64,
     width: u32,
     height: u32,
@@ -54,6 +66,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             selection: CameraSelection::Both,
+            memory: MemoryKind::Host,
+            cuda_device: 0,
             duration_seconds: 30.0,
             width: 1280,
             height: 720,
@@ -73,8 +87,127 @@ struct CameraTarget {
     name: &'static str,
     camera: VirtualCamera,
     frame: Vec<u8>,
+    #[cfg(all(feature = "cuda", windows))]
+    cuda_frame: Option<CudaFrame>,
     counts: StatusCounts,
     consumer_was_inactive: bool,
+}
+
+#[cfg(all(feature = "cuda", windows))]
+struct CudaFrame {
+    device_pointer: *mut core::ffi::c_void,
+    byte_len: usize,
+}
+
+#[cfg(all(feature = "cuda", windows))]
+impl CudaFrame {
+    fn set_device(ordinal: i32) -> Result<(), IoError> {
+        // SAFETY: CUDA validates the requested ordinal and establishes its Runtime
+        // state for the current thread when the device exists.
+        unsafe { cuda_runtime_api::cudaSetDevice(ordinal) }.check("cudaSetDevice")
+    }
+
+    fn new(byte_len: usize) -> Result<Self, IoError> {
+        let mut device_pointer = core::ptr::null_mut();
+        // SAFETY: Writable pointer storage receives a device allocation of byte_len.
+        unsafe { cuda_runtime_api::cudaMalloc(&mut device_pointer, byte_len) }
+            .check("cudaMalloc")?;
+        if device_pointer.is_null() {
+            return Err(IoError::other(
+                "cudaMalloc succeeded but returned a null device pointer",
+            ));
+        }
+
+        Ok(Self {
+            device_pointer,
+            byte_len,
+        })
+    }
+
+    fn upload(&self, host_frame: &[u8]) -> Result<(), IoError> {
+        if host_frame.len() != self.byte_len {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "CUDA upload size mismatch: expected {}, got {}",
+                    self.byte_len,
+                    host_frame.len()
+                ),
+            ));
+        }
+        // SAFETY: Both buffers cover byte_len bytes and remain alive. H2D is
+        // enqueued on the default stream also used by VirtualCamera::write_cuda.
+        unsafe {
+            cuda_runtime_api::cudaMemcpyAsync(
+                self.device_pointer,
+                host_frame.as_ptr().cast(),
+                self.byte_len,
+                cuda_runtime_api::CUDA_MEMCPY_HOST_TO_DEVICE,
+                core::ptr::null_mut(),
+            )
+        }
+        .check("cudaMemcpyAsync(H2D)")
+    }
+
+    const fn device_pointer(&self) -> *const core::ffi::c_void {
+        self.device_pointer.cast_const()
+    }
+
+    fn close(&mut self) -> Result<(), IoError> {
+        let device_pointer = core::mem::replace(&mut self.device_pointer, core::ptr::null_mut());
+        if device_pointer.is_null() {
+            Ok(())
+        } else {
+            // SAFETY: pointer was allocated by this instance and is consumed once.
+            unsafe { cuda_runtime_api::cudaFree(device_pointer) }.check("cudaFree")
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", windows))]
+impl Drop for CudaFrame {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+#[cfg(all(feature = "cuda", windows))]
+mod cuda_runtime_api {
+    use core::ffi::c_void;
+    use std::io::Error as IoError;
+
+    pub(super) const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+
+    #[allow(non_camel_case_types)]
+    #[repr(transparent)]
+    pub(super) struct cudaError_t(i32);
+
+    impl cudaError_t {
+        pub(super) fn check(self, operation: &'static str) -> Result<(), IoError> {
+            if self.0 == 0 {
+                Ok(())
+            } else {
+                Err(IoError::other(format!(
+                    "CUDA operation {operation} failed with code {}",
+                    self.0
+                )))
+            }
+        }
+    }
+
+    #[link(name = "cudart")]
+    unsafe extern "system" {
+        pub(super) fn cudaSetDevice(ordinal: i32) -> cudaError_t;
+        pub(super) fn cudaMalloc(device_pointer: *mut *mut c_void, size: usize) -> cudaError_t;
+        pub(super) fn cudaFree(device_pointer: *mut c_void) -> cudaError_t;
+        pub(super) fn cudaMemcpyAsync(
+            destination: *mut c_void,
+            source: *const c_void,
+            count: usize,
+            kind: i32,
+            stream: *mut c_void,
+        ) -> cudaError_t;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -103,6 +236,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
+    if settings.memory == MemoryKind::Cuda {
+        #[cfg(all(feature = "cuda", windows))]
+        CudaFrame::set_device(settings.cuda_device)?;
+        #[cfg(not(all(feature = "cuda", windows)))]
+        return Err(IoError::new(
+            ErrorKind::Unsupported,
+            "--memory cuda requires Windows and cargo --features cuda",
+        )
+        .into());
+    }
+
     let mut targets = Vec::new();
     for camera_type in selected_camera_types(settings.selection) {
         let camera = match camera_type {
@@ -124,18 +268,31 @@ fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
                 camera_name(camera_type)
             ))
         })?;
+        #[cfg(all(feature = "cuda", windows))]
+        let cuda_frame = match settings.memory {
+            MemoryKind::Host => None,
+            MemoryKind::Cuda => Some(CudaFrame::new(camera.frame_size()).map_err(|error| {
+                IoError::other(format!(
+                    "failed to create {} CUDA frame: {error}",
+                    camera_name(camera_type)
+                ))
+            })?),
+        };
         println!(
-            "opened {}: {}x{} at {:.3} FPS, {:?}, {} bytes/frame",
+            "opened {}: {}x{} at {:.3} FPS, {:?}, {} bytes/frame, {:?} memory",
             camera_name(camera_type),
             settings.width,
             settings.height,
             settings.fps,
             camera.native_format(),
-            camera.frame_size()
+            camera.frame_size(),
+            settings.memory
         );
         targets.push(CameraTarget {
             name: camera_name(camera_type),
             frame: vec![0; camera.frame_size()],
+            #[cfg(all(feature = "cuda", windows))]
+            cuda_frame,
             camera,
             counts: StatusCounts::default(),
             consumer_was_inactive: false,
@@ -179,9 +336,7 @@ fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
                 frame_index,
                 settings.fps,
             );
-            let status = target.camera.write_host(&target.frame).map_err(|error| {
-                IoError::other(format!("{} frame publication failed: {error}", target.name))
-            })?;
+            let status = publish_frame(target, settings.memory)?;
             record_status(target, status);
         }
 
@@ -207,6 +362,15 @@ fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
             .camera
             .close()
             .map_err(|error| IoError::other(format!("failed to close {}: {error}", target.name)))?;
+        #[cfg(all(feature = "cuda", windows))]
+        if let Some(cuda_frame) = target.cuda_frame.as_mut() {
+            cuda_frame.close().map_err(|error| {
+                IoError::other(format!(
+                    "failed to close {} CUDA frame: {error}",
+                    target.name
+                ))
+            })?;
+        }
         println!(
             "{} summary: written={}, skipped-by-consumer={}, consumer-inactive={}",
             target.name,
@@ -217,6 +381,37 @@ fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
     }
     println!("scheduler skips: {scheduler_skips}");
     Ok(())
+}
+
+fn publish_frame(target: &mut CameraTarget, memory: MemoryKind) -> Result<WriteStatus, IoError> {
+    let result = match memory {
+        MemoryKind::Host => target.camera.write_host(&target.frame),
+        MemoryKind::Cuda => {
+            #[cfg(all(feature = "cuda", windows))]
+            {
+                let cuda_frame = target.cuda_frame.as_ref().ok_or_else(|| {
+                    IoError::other(format!("{} has no CUDA frame allocation", target.name))
+                })?;
+                cuda_frame.upload(&target.frame)?;
+                // SAFETY: cuda_frame owns a contiguous allocation of exactly this
+                // length. The default stream orders H2D before the camera's D2H.
+                unsafe {
+                    target
+                        .camera
+                        .write_cuda(cuda_frame.device_pointer(), target.frame.len(), None)
+                }
+            }
+            #[cfg(not(all(feature = "cuda", windows)))]
+            unreachable!("CUDA mode is rejected before camera creation")
+        }
+    };
+
+    result.map_err(|error| {
+        IoError::other(format!(
+            "{} {:?} frame publication failed: {error}",
+            target.name, memory
+        ))
+    })
 }
 
 fn record_status(target: &mut CameraTarget, status: WriteStatus) {
@@ -277,7 +472,8 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Settings, S
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         let value = match argument.as_str() {
-            "--camera" | "--duration" | "--width" | "--height" | "--fps" => arguments
+            "--camera" | "--memory" | "--cuda-device" | "--duration" | "--width" | "--height"
+            | "--fps" => arguments
                 .next()
                 .ok_or_else(|| format!("{argument} requires a value"))?,
             _ => return Err(format!("unknown argument: {argument}\n\n{USAGE}")),
@@ -292,6 +488,14 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Settings, S
                     _ => return Err("--camera must be one of: both, obs, unity".to_owned()),
                 };
             }
+            "--memory" => {
+                settings.memory = match value.to_ascii_lowercase().as_str() {
+                    "host" => MemoryKind::Host,
+                    "cuda" => MemoryKind::Cuda,
+                    _ => return Err("--memory must be one of: host, cuda".to_owned()),
+                };
+            }
+            "--cuda-device" => settings.cuda_device = parse_number(&argument, &value)?,
             "--duration" => settings.duration_seconds = parse_number(&argument, &value)?,
             "--width" => settings.width = parse_number(&argument, &value)?,
             "--height" => settings.height = parse_number(&argument, &value)?,
@@ -316,6 +520,9 @@ where
 fn validate_settings(settings: Settings) -> Result<(), String> {
     if settings.width == 0 || settings.height == 0 {
         return Err("--width and --height must be greater than zero".to_owned());
+    }
+    if settings.cuda_device < 0 {
+        return Err("--cuda-device must be zero or greater".to_owned());
     }
     if !settings.duration_seconds.is_finite()
         || settings.duration_seconds <= 0.0
@@ -555,6 +762,8 @@ mod tests {
             Settings::default()
         );
         assert_eq!(Settings::default().selection, CameraSelection::Both);
+        assert_eq!(Settings::default().memory, MemoryKind::Host);
+        assert_eq!(Settings::default().cuda_device, 0);
         assert_eq!(Settings::default().duration_seconds, 30.0);
     }
 
@@ -564,6 +773,10 @@ mod tests {
             [
                 "--camera",
                 "unity",
+                "--memory",
+                "cuda",
+                "--cuda-device",
+                "2",
                 "--duration",
                 "2.5",
                 "--width",
@@ -577,6 +790,8 @@ mod tests {
         )
         .expect("valid options");
         assert_eq!(settings.selection, CameraSelection::Unity);
+        assert_eq!(settings.memory, MemoryKind::Cuda);
+        assert_eq!(settings.cuda_device, 2);
         assert_eq!(settings.duration_seconds, 2.5);
         assert_eq!((settings.width, settings.height), (641, 479));
         assert_eq!(settings.fps, 24.0);
@@ -606,6 +821,13 @@ mod tests {
             parse_args(["--camera", "obs", "--width", "641", "--height", "480"].map(str::to_owned))
                 .expect_err("odd OBS width must fail");
         assert!(error.contains("even"));
+    }
+
+    #[test]
+    fn rejects_negative_cuda_device() {
+        let error = parse_args(["--cuda-device", "-1"].map(str::to_owned))
+            .expect_err("negative CUDA device must fail");
+        assert!(error.contains("zero or greater"));
     }
 
     #[test]
