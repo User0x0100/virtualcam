@@ -13,9 +13,10 @@ pub enum Error {
     UnsupportedPlatform,
     /// The selected virtual-camera driver is not installed for this process architecture.
     BackendUnavailable(CameraType),
-    /// Dimensions are zero, invalid for NV12, or not representable by the backend ABI.
+    /// Dimensions/stride are zero, invalid for the format, exceed Unity's
+    /// shared-image capacity, or are not representable by the backend ABI.
     InvalidDimensions,
-    /// Frame rate is zero, non-finite, negative, or outside the representable interval range.
+    /// An OBS frame-rate numerator/denominator is zero or produces a zero interval.
     InvalidFrameRate,
     /// A frame or shared-memory layout size overflowed its target integer type.
     FrameSizeOverflow,

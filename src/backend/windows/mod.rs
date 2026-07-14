@@ -2,7 +2,10 @@ mod obs;
 mod protocol;
 mod unity_capture;
 
-use crate::{CameraType, OpenOptions, Result, WriteStatus, config::ValidatedConfig};
+use crate::{
+    Result, WriteStatus,
+    config::{ValidatedObsOptions, ValidatedUnityCaptureOptions},
+};
 
 use self::{obs::ObsBackend, unity_capture::UnityCaptureBackend};
 
@@ -12,15 +15,12 @@ pub(crate) enum Backend {
 }
 
 impl Backend {
-    pub(crate) fn open(
-        camera_type: CameraType,
-        config: ValidatedConfig,
-        options: OpenOptions,
-    ) -> Result<Self> {
-        match camera_type {
-            CameraType::Obs => ObsBackend::open(config, options).map(Self::Obs),
-            CameraType::UnityCapture => UnityCaptureBackend::open(config).map(Self::UnityCapture),
-        }
+    pub(crate) fn open_obs(options: ValidatedObsOptions) -> Result<Self> {
+        ObsBackend::open(options).map(Self::Obs)
+    }
+
+    pub(crate) fn open_unity_capture(options: ValidatedUnityCaptureOptions) -> Result<Self> {
+        UnityCaptureBackend::open(options).map(Self::UnityCapture)
     }
 
     pub(crate) fn is_ready(&mut self) -> Result<bool> {

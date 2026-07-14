@@ -15,8 +15,8 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    CameraType, Error, OpenOptions, Result, WriteStatus,
-    config::ValidatedConfig,
+    CameraType, Error, Result, WriteStatus,
+    config::ValidatedObsOptions,
     platform::windows::{MappedView, OwnedHandle, last_error, registry_key_exists},
 };
 
@@ -36,19 +36,15 @@ pub(crate) struct ObsBackend {
 }
 
 impl ObsBackend {
-    pub(crate) fn open(config: ValidatedConfig, options: OpenOptions) -> Result<Self> {
+    pub(crate) fn open(options: ValidatedObsOptions) -> Result<Self> {
         if !registry_key_exists(OBS_CLSID_KEY) {
             return Err(Error::BackendUnavailable(CameraType::Obs));
         }
-        Self::open_protocol(config, options, VIDEO_NAME)
+        Self::open_protocol(options, VIDEO_NAME)
     }
 
-    fn open_protocol(
-        config: ValidatedConfig,
-        options: OpenOptions,
-        video_name: &[u16],
-    ) -> Result<Self> {
-        let layout = QueueLayout::calculate(config.frame_size)?;
+    fn open_protocol(options: ValidatedObsOptions, video_name: &[u16]) -> Result<Self> {
+        let layout = QueueLayout::calculate(options.frame_size)?;
         if !options.force_open {
             // Upstream performs this conservative read-only open first and treats
             // any successful handle as an occupied producer queue.
@@ -114,9 +110,9 @@ impl ObsBackend {
         }
 
         let header = QueueHeader::new(
-            config.width,
-            config.height,
-            config.obs_interval_100ns,
+            options.width,
+            options.height,
+            options.interval_100ns,
             layout.offsets,
         );
         // SAFETY: The mapped view is writable and at least `layout.total_size`
@@ -149,10 +145,10 @@ impl ObsBackend {
             view: Some(view),
             mapping: Some(mapping),
             layout,
-            y_plane_size: usize::try_from(config.width)
+            y_plane_size: usize::try_from(options.width)
                 .ok()
                 .and_then(|width| {
-                    usize::try_from(config.height)
+                    usize::try_from(options.height)
                         .ok()
                         .and_then(|height| width.checked_mul(height))
                 })
@@ -281,20 +277,21 @@ mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
 
-    use crate::{CameraConfig, config::CameraType};
+    use crate::{ObsFrameRate, ObsOptions};
 
     fn test_name(suffix: &str) -> Vec<u16> {
         let name = format!("Local\\VirtualCamRustObs_{}_{}", std::process::id(), suffix);
         name.encode_utf16().chain(core::iter::once(0)).collect()
     }
 
-    fn validated(width: u32, height: u32) -> ValidatedConfig {
-        CameraConfig {
+    fn validated(width: u32, height: u32, force_open: bool) -> ValidatedObsOptions {
+        ObsOptions {
             width,
             height,
-            fps: 30.0,
+            frame_rate: ObsFrameRate::default(),
+            force_open,
         }
-        .validate(CameraType::Obs)
+        .validate()
         .expect("valid OBS test configuration")
     }
 
@@ -306,16 +303,16 @@ mod tests {
     #[test]
     fn real_mapping_covers_occupancy_force_write_and_stopping() {
         let name = test_name("state");
-        let config = validated(2, 2);
-        let mut original = ObsBackend::open_protocol(config, OpenOptions::default(), &name)
-            .expect("first writer opens a new mapping");
+        let config = validated(2, 2, false);
+        let mut original =
+            ObsBackend::open_protocol(config, &name).expect("first writer opens a new mapping");
 
         assert!(matches!(
-            ObsBackend::open_protocol(config, OpenOptions::default(), &name),
+            ObsBackend::open_protocol(config, &name),
             Err(Error::DeviceInUse)
         ));
 
-        let mut forced = ObsBackend::open_protocol(config, OpenOptions { force_open: true }, &name)
+        let mut forced = ObsBackend::open_protocol(validated(2, 2, true), &name)
             .expect("force mode reuses a large enough mapping");
         let observer = original
             .view
@@ -392,11 +389,7 @@ mod tests {
         assert!(!raw.is_null());
         // SAFETY: Successful creation returned one owned mapping handle.
         let _mapping = unsafe { OwnedHandle::from_raw(raw) };
-        let error = match ObsBackend::open_protocol(
-            validated(64, 64),
-            OpenOptions { force_open: true },
-            &name,
-        ) {
+        let error = match ObsBackend::open_protocol(validated(64, 64, true), &name) {
             Ok(_) => panic!("small mapping must be rejected"),
             Err(error) => error,
         };

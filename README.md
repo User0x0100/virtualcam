@@ -5,24 +5,33 @@
 | Backend | Input | Layout |
 | --- | --- | --- |
 | OBS Virtual Camera | NV12 | tightly packed Y plane, then interleaved UV |
-| Unity Capture | RGBA8 / `FORMAT_UINT8` | tightly packed four-byte RGBA pixels |
+| Unity Capture | RGBA8, RGBA FP16 gamma, or RGBA FP16 linear | tight or explicitly padded rows |
 
-The crate does no scaling, pixel conversion, color conversion, frame-rate control, or background threading. The first release targets Unity Capture device/capture number 0.
+The crate does no scaling, pixel conversion, color conversion, frame-rate control, or background threading. Unity's receiver can optionally scale or mirror after receiving a frame.
 
-## Host frames
+## Independent backend controls
+
+OBS and Unity Capture use separate option types and separate constructors. There
+is no combined structure containing controls that only make sense for one
+backend. Both option types implement `Default`; their 1920x1080 initial mode
+matches the filters' first/default media type.
+
+OBS exposes the complete upstream queue creation parameters—dimensions and an
+exact rational frame rate—plus its backend-only recovery extension:
 
 ```rust,no_run
-use virtualcam::{CameraConfig, CameraType, VirtualCamera, WriteStatus};
+use virtualcam::{ObsFrameRate, ObsOptions, VirtualCamera, WriteStatus};
 
 fn main() -> Result<(), virtualcam::Error> {
-    let mut camera = VirtualCamera::open(
-        CameraType::Obs,
-        CameraConfig {
+    let mut camera = VirtualCamera::open_obs(ObsOptions {
             width: 1280,
             height: 720,
-            fps: 30.0,
-        },
-    )?;
+            frame_rate: ObsFrameRate {
+                numerator: 30_000,
+                denominator: 1001,
+            },
+            force_open: false,
+        })?;
 
     let nv12 = vec![0_u8; camera.frame_size()];
     assert_eq!(camera.write_host(&nv12)?, WriteStatus::Written);
@@ -31,7 +40,45 @@ fn main() -> Result<(), virtualcam::Error> {
 }
 ```
 
-Frames must be contiguous and have exactly `camera.frame_size()` bytes. NV12 width and height must both be even. Unity's tightly packed RGBA8 stride is published in pixels, so it equals `width`, not `width * 4`.
+Unity independently exposes every `SharedImageMemory::Send` metadata control and
+the constructor's capture number:
+
+```rust,no_run
+use virtualcam::{
+    UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions,
+    UnityCaptureResizeMode, VirtualCamera,
+};
+
+# fn run() -> Result<(), virtualcam::Error> {
+let mut camera = VirtualCamera::open_unity_capture(UnityCaptureOptions {
+    width: 1280,
+    height: 720,
+    capture_number: 0, // zero-based: Unity Capture device #1
+    format: UnityCaptureFormat::Rgba8,
+    stride_pixels: None, // tightly packed; Some(value) preserves row padding
+    resize_mode: UnityCaptureResizeMode::Linear,
+    mirror_mode: UnityCaptureMirrorMode::Horizontal,
+    timeout_ms: 1000,
+})?;
+let rgba = vec![0_u8; camera.frame_size()];
+camera.write_host(&rgba)?;
+# Ok(())
+# }
+```
+
+`UnityCaptureFormat` maps exactly to upstream values 0, 1, and 2. Stride is
+expressed in pixels, as in the C++ sender, rather than bytes. `frame_size()`
+includes explicitly configured row padding. The source buffer/data-size
+parameters are supplied by `write_host` or `write_cuda`; width, height, stride,
+format, resize, mirror, and timeout are written into every shared header.
+
+The upstream D3D11 plugin's texture pointer, texture readback, and double
+buffering are not shared-memory camera controls. They are intentionally absent
+because this crate receives an already accessible host or CUDA buffer instead
+of a Unity `ID3D11Texture2D`.
+
+Every frame must contain exactly `camera.frame_size()` bytes. OBS NV12 width and
+height must both be even.
 
 `is_ready()` follows what each upstream protocol can actually report. Unity returns `false` until its DirectShow receiver has created the required objects. OBS has no consumer-presence handshake, so its producer is ready as soon as its queue is open.
 
@@ -94,17 +141,17 @@ On Windows, linking uses `cudart`; `build.rs` adds `%CUDA_PATH%\lib\x64` (or `Wi
 
 ## `force_open`
 
-`OpenOptions::force_open` is an OBS-only dangerous recovery option. Normal mode rejects an existing `OBSVirtualCamVideo` mapping as `DeviceInUse`. Force mode creates/opens it, verifies the mapped region is large enough, and reinitializes the upstream header.
+`ObsOptions::force_open` is an OBS-only dangerous recovery option. Normal mode rejects an existing `OBSVirtualCamVideo` mapping as `DeviceInUse`. Force mode creates/opens it, verifies the mapped region is large enough, and reinitializes the upstream header.
 
-The caller guarantees there is no other active producer. `force_open` cannot establish that fact; concurrent writers create a protocol-level data race and undefined output. It never terminates a process, closes another process's handles, or deletes a referenced named object. Unity Capture has no equivalent producer occupancy check, so this option does nothing extra there.
+The caller guarantees there is no other active producer. `force_open` cannot establish that fact; concurrent writers create a protocol-level data race and undefined output. It never terminates a process, closes another process's handles, or deletes a referenced named object. Unity Capture has no equivalent field because it has no corresponding producer occupancy check.
 
 ## Platforms and features
 
 | Platform | Compiles | Runtime behavior |
 | --- | --- | --- |
 | Windows | yes | OBS and Unity Capture producers |
-| Linux | yes | `VirtualCamera::open` returns `UnsupportedPlatform` |
-| macOS | yes | `VirtualCamera::open` returns `UnsupportedPlatform` |
+| Linux | yes | backend-specific open methods return `UnsupportedPlatform` |
+| macOS | yes | backend-specific open methods return `UnsupportedPlatform` |
 
 - default: only the target-specific `windows-sys` dependency on Windows.
 - `cuda`: direct CUDA Runtime FFI; independent of `tracing`.

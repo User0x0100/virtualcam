@@ -1,13 +1,13 @@
 //! A small, protocol-compatible producer for installed Windows virtual cameras.
 //!
-//! `virtualcam` writes tightly packed frames to the shared-memory protocols used
-//! by OBS Virtual Camera and Unity Capture. OBS accepts [`PixelFormat::Nv12`];
-//! Unity Capture accepts [`PixelFormat::Rgba8`]. The crate never scales, converts,
-//! schedules, or rate-limits frames.
+//! `virtualcam` writes frames to the shared-memory protocols used by OBS Virtual
+//! Camera and Unity Capture. OBS accepts [`PixelFormat::Nv12`]; Unity Capture
+//! accepts RGBA8 and the upstream gamma/linear RGBA binary16 formats. The crate
+//! never scales, converts, schedules, or rate-limits frames.
 //!
 //! Windows is the only functional platform in this release. The public API is
 //! intentionally platform-neutral, so Linux and macOS applications still compile;
-//! [`VirtualCamera::open`] returns [`Error::UnsupportedPlatform`] there.
+//! the backend-specific open methods return [`Error::UnsupportedPlatform`] there.
 //!
 //! Host frames are published with [`VirtualCamera::write_host`]. With the `cuda`
 //! feature, `VirtualCamera::write_cuda` copies device memory into one reusable
@@ -28,17 +28,14 @@
 //! # Example
 //!
 //! ```no_run
-//! use virtualcam::{CameraConfig, CameraType, VirtualCamera};
+//! use virtualcam::{ObsOptions, VirtualCamera};
 //!
 //! # fn run() -> Result<(), virtualcam::Error> {
-//! let mut camera = VirtualCamera::open(
-//!     CameraType::Obs,
-//!     CameraConfig {
-//!         width: 1280,
-//!         height: 720,
-//!         fps: 30.0,
-//!     },
-//! )?;
+//! let mut camera = VirtualCamera::open_obs(ObsOptions {
+//!     width: 1280,
+//!     height: 720,
+//!     ..ObsOptions::default()
+//! })?;
 //! let frame = vec![0_u8; camera.frame_size()];
 //! camera.write_host(&frame)?;
 //! camera.close()?;
@@ -78,7 +75,10 @@ mod platform;
 mod status;
 
 pub use camera::VirtualCamera;
-pub use config::{CameraConfig, CameraType, OpenOptions};
+pub use config::{
+    CameraType, ObsFrameRate, ObsOptions, UnityCaptureFormat, UnityCaptureMirrorMode,
+    UnityCaptureOptions, UnityCaptureResizeMode,
+};
 #[cfg(feature = "cuda")]
 pub use cuda::CudaStream;
 pub use error::{Error, Result};

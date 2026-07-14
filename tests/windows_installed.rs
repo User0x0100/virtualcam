@@ -3,18 +3,29 @@
 use std::sync::Mutex;
 
 use virtualcam::{
-    CameraConfig, CameraType, Error, OpenOptions, PixelFormat, VirtualCamera, WriteStatus,
+    CameraType, Error, ObsFrameRate, ObsOptions, PixelFormat, UnityCaptureFormat,
+    UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode, VirtualCamera,
+    WriteStatus,
 };
 
 // Both installed-driver tests touch globally named protocol objects. Serializing
 // them also makes failures easier to attribute when they are explicitly enabled.
 static INSTALLED_DRIVER_LOCK: Mutex<()> = Mutex::new(());
 
-fn tiny_config() -> CameraConfig {
-    CameraConfig {
+fn tiny_obs_options() -> ObsOptions {
+    ObsOptions {
         width: 2,
         height: 2,
-        fps: 30.0,
+        frame_rate: ObsFrameRate::default(),
+        force_open: false,
+    }
+}
+
+fn tiny_unity_options() -> UnityCaptureOptions {
+    UnityCaptureOptions {
+        width: 2,
+        height: 2,
+        ..UnityCaptureOptions::default()
     }
 }
 
@@ -24,7 +35,7 @@ fn installed_obs_covers_metadata_publication_occupancy_and_lifecycle() {
     let _serial = INSTALLED_DRIVER_LOCK
         .lock()
         .expect("installed-driver test lock");
-    let mut camera = VirtualCamera::open(CameraType::Obs, tiny_config())
+    let mut camera = VirtualCamera::open_obs(tiny_obs_options())
         .expect("OBS Virtual Camera must be installed and idle");
 
     assert_eq!(camera.camera_type(), CameraType::Obs);
@@ -41,7 +52,7 @@ fn installed_obs_covers_metadata_publication_occupancy_and_lifecycle() {
     );
 
     assert!(matches!(
-        VirtualCamera::open(CameraType::Obs, tiny_config()),
+        VirtualCamera::open_obs(tiny_obs_options()),
         Err(Error::DeviceInUse)
     ));
     for frame in [
@@ -79,16 +90,15 @@ fn installed_obs_covers_metadata_publication_occupancy_and_lifecycle() {
     assert_eq!(camera.write_host(&[0; 6]), Err(Error::AlreadyClosed));
 
     // Normal reopen proves the previous mapping handle and view were released.
-    let reopened = VirtualCamera::open(CameraType::Obs, tiny_config())
+    let reopened = VirtualCamera::open_obs(tiny_obs_options())
         .expect("OBS mapping must be reusable after close");
     drop(reopened);
 
     // With no competing writer, force mode remains a valid explicit open path.
-    let mut forced = VirtualCamera::open_with_options(
-        CameraType::Obs,
-        tiny_config(),
-        OpenOptions { force_open: true },
-    )
+    let mut forced = VirtualCamera::open_obs(ObsOptions {
+        force_open: true,
+        ..tiny_obs_options()
+    })
     .expect("force-open OBS while idle");
     assert_eq!(
         forced.write_host(&[16, 16, 16, 16, 128, 128]),
@@ -103,7 +113,7 @@ fn installed_unity_covers_inactive_or_active_consumer_and_lifecycle() {
     let _serial = INSTALLED_DRIVER_LOCK
         .lock()
         .expect("installed-driver test lock");
-    let mut camera = VirtualCamera::open(CameraType::UnityCapture, tiny_config())
+    let mut camera = VirtualCamera::open_unity_capture(tiny_unity_options())
         .expect("Unity Capture must be installed for this process architecture");
 
     assert_eq!(camera.camera_type(), CameraType::UnityCapture);
@@ -149,12 +159,21 @@ fn installed_unity_covers_inactive_or_active_consumer_and_lifecycle() {
     assert_eq!(camera.is_ready(), Err(Error::AlreadyClosed));
     assert_eq!(camera.write_host(&rgba), Err(Error::AlreadyClosed));
 
-    // force_open is documented as an OBS-only switch and must not prevent Unity.
-    let reopened = VirtualCamera::open_with_options(
-        CameraType::UnityCapture,
-        tiny_config(),
-        OpenOptions { force_open: true },
-    )
-    .expect("Unity ignores OBS force-open option");
-    drop(reopened);
+    let mut controlled = VirtualCamera::open_unity_capture(UnityCaptureOptions {
+        format: UnityCaptureFormat::Rgba16FloatLinear,
+        resize_mode: UnityCaptureResizeMode::Linear,
+        mirror_mode: UnityCaptureMirrorMode::Horizontal,
+        timeout_ms: 250,
+        ..tiny_unity_options()
+    })
+    .expect("Unity producer reopens with non-default controls");
+    assert_eq!(controlled.native_format(), PixelFormat::Rgba16FloatLinear);
+    assert_eq!(controlled.frame_size(), 32);
+    assert!(matches!(
+        controlled.write_host(&[0; 32]),
+        Ok(WriteStatus::Written
+            | WriteStatus::FrameSkippedByConsumer
+            | WriteStatus::ConsumerInactive)
+    ));
+    controlled.close().expect("close controlled Unity producer");
 }

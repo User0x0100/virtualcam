@@ -2,14 +2,10 @@ use std::ffi::CString;
 
 use core::mem::{align_of, offset_of, size_of};
 
-use crate::{CameraType, Error, Result};
+use crate::{CameraType, Error, Result, UnityCaptureOptions};
 
-pub(crate) const MAX_CAPTURE_NUMBER: u8 = b'z' - b'0';
-pub(crate) const MAX_SHARED_IMAGE_SIZE: usize = 3840 * 2160 * 4 * size_of::<i16>();
-pub(crate) const FORMAT_UINT8: i32 = 0;
-pub(crate) const RESIZE_MODE_DISABLED: i32 = 0;
-pub(crate) const MIRROR_MODE_DISABLED: i32 = 0;
-pub(crate) const DEFAULT_TIMEOUT_MS: i32 = 1000;
+pub(crate) const MAX_CAPTURE_NUMBER: u8 = UnityCaptureOptions::MAX_CAPTURE_NUMBER;
+pub(crate) const MAX_SHARED_IMAGE_SIZE: usize = UnityCaptureOptions::MAX_FRAME_BYTES;
 
 /// Mirrors `SharedImageMemory::SharedMemHeader` from
 /// schellingb/UnityCapture@3ed54c325e0ad71afcf4f246c07e5e17b3d7f2d2,
@@ -87,6 +83,7 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureResizeMode};
 
     #[test]
     fn shared_header_matches_msvc_c_layout() {
@@ -127,9 +124,13 @@ mod tests {
     fn protocol_constants_match_unity_capture_contract() {
         assert_eq!(MAX_CAPTURE_NUMBER, 74);
         assert_eq!(MAX_SHARED_IMAGE_SIZE, 66_355_200);
-        assert_eq!(FORMAT_UINT8, 0);
-        assert_eq!(RESIZE_MODE_DISABLED, 0);
-        assert_eq!(MIRROR_MODE_DISABLED, 0);
-        assert_eq!(DEFAULT_TIMEOUT_MS, 1000);
+        assert_eq!(UnityCaptureFormat::Rgba8 as i32, 0);
+        assert_eq!(UnityCaptureFormat::Rgba16FloatGamma as i32, 1);
+        assert_eq!(UnityCaptureFormat::Rgba16FloatLinear as i32, 2);
+        assert_eq!(UnityCaptureResizeMode::Disabled as i32, 0);
+        assert_eq!(UnityCaptureResizeMode::Linear as i32, 1);
+        assert_eq!(UnityCaptureMirrorMode::Disabled as i32, 0);
+        assert_eq!(UnityCaptureMirrorMode::Horizontal as i32, 1);
+        assert_eq!(UnityCaptureOptions::default().timeout_ms, 1000);
     }
 }

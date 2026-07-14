@@ -11,7 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use virtualcam::{CameraConfig, CameraType, PixelFormat, VirtualCamera, WriteStatus};
+use virtualcam::{
+    CameraType, ObsFrameRate, ObsOptions, PixelFormat, UnityCaptureOptions, VirtualCamera,
+    WriteStatus,
+};
 
 const USAGE: &str = "\
 Generated virtual-camera test video
@@ -100,14 +103,22 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
-    let config = CameraConfig {
-        width: settings.width,
-        height: settings.height,
-        fps: settings.fps,
-    };
     let mut targets = Vec::new();
     for camera_type in selected_camera_types(settings.selection) {
-        let camera = VirtualCamera::open(camera_type, config.clone()).map_err(|error| {
+        let camera = match camera_type {
+            CameraType::Obs => VirtualCamera::open_obs(ObsOptions {
+                width: settings.width,
+                height: settings.height,
+                frame_rate: obs_frame_rate(settings.fps),
+                ..ObsOptions::default()
+            }),
+            CameraType::UnityCapture => VirtualCamera::open_unity_capture(UnityCaptureOptions {
+                width: settings.width,
+                height: settings.height,
+                ..UnityCaptureOptions::default()
+            }),
+        }
+        .map_err(|error| {
             IoError::other(format!(
                 "failed to open {}: {error}",
                 camera_name(camera_type)
@@ -242,6 +253,25 @@ const fn camera_name(camera_type: CameraType) -> &'static str {
     }
 }
 
+fn obs_frame_rate(fps: f64) -> ObsFrameRate {
+    const PRECISION: u32 = 1_000_000;
+    let numerator = (fps * f64::from(PRECISION)).round() as u32;
+    let divisor = greatest_common_divisor(numerator, PRECISION);
+    ObsFrameRate {
+        numerator: numerator / divisor,
+        denominator: PRECISION / divisor,
+    }
+}
+
+const fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
 fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Settings, String> {
     let mut settings = Settings::default();
     let mut arguments = arguments.into_iter();
@@ -323,6 +353,8 @@ fn fill_pattern(
     let state = pattern_state(width, height, frame_index, fps);
     match format {
         PixelFormat::Rgba8 => fill_rgba(frame, width, height, state),
+        PixelFormat::Rgba16FloatGamma => fill_rgba16(frame, width, height, state, false),
+        PixelFormat::Rgba16FloatLinear => fill_rgba16(frame, width, height, state, true),
         PixelFormat::Nv12 => fill_nv12(frame, width, height, state),
     }
 }
@@ -371,6 +403,59 @@ fn fill_rgba(frame: &mut [u8], width: usize, height: usize, state: PatternState)
             frame[offset..offset + 4].copy_from_slice(&[r, g, b, 255]);
         }
     }
+}
+
+fn fill_rgba16(frame: &mut [u8], width: usize, height: usize, state: PatternState, linear: bool) {
+    debug_assert_eq!(frame.len(), width * height * 8);
+    for y in 0..height {
+        for x in 0..width {
+            let (r, g, b) = pattern_rgb(x, y, width, height, state);
+            let components = [
+                encode_color_component(r, linear),
+                encode_color_component(g, linear),
+                encode_color_component(b, linear),
+                f32_to_binary16(1.0),
+            ];
+            let offset = (y * width + x) * 8;
+            for (index, component) in components.into_iter().enumerate() {
+                frame[offset + index * 2..offset + index * 2 + 2]
+                    .copy_from_slice(&component.to_le_bytes());
+            }
+        }
+    }
+}
+
+fn encode_color_component(value: u8, linear: bool) -> u16 {
+    let value = f32::from(value) / 255.0;
+    let value = if linear {
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    } else {
+        value
+    };
+    f32_to_binary16(value)
+}
+
+fn f32_to_binary16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mantissa = bits & 0x7f_ffff;
+    if exponent <= 0 {
+        if exponent < -10 {
+            return sign;
+        }
+        let mantissa = mantissa | 0x80_0000;
+        let shift = 14 - exponent;
+        return sign | ((mantissa + (1 << (shift - 1))) >> shift) as u16;
+    }
+    if exponent >= 31 {
+        return sign | 0x7c00;
+    }
+    sign | ((exponent as u16) << 10) | ((mantissa + 0x1000) >> 13) as u16
 }
 
 fn fill_nv12(frame: &mut [u8], width: usize, height: usize, state: PatternState) {
@@ -498,6 +583,24 @@ mod tests {
     }
 
     #[test]
+    fn floating_fps_is_reduced_to_an_obs_ratio() {
+        assert_eq!(
+            obs_frame_rate(30.0),
+            ObsFrameRate {
+                numerator: 30,
+                denominator: 1,
+            }
+        );
+        assert_eq!(
+            obs_frame_rate(29.97),
+            ObsFrameRate {
+                numerator: 2997,
+                denominator: 100,
+            }
+        );
+    }
+
+    #[test]
     fn obs_selection_rejects_odd_nv12_dimensions() {
         let error =
             parse_args(["--camera", "obs", "--width", "641", "--height", "480"].map(str::to_owned))
@@ -519,6 +622,25 @@ mod tests {
         fill_pattern(PixelFormat::Rgba8, &mut rgba, width, height, 30, 30.0);
         assert_ne!(rgba, first_rgba);
         assert!(rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+
+        let mut fp16 = vec![
+            0;
+            PixelFormat::Rgba16FloatLinear
+                .frame_size(width, height)
+                .expect("FP16 size")
+        ];
+        fill_pattern(
+            PixelFormat::Rgba16FloatLinear,
+            &mut fp16,
+            width,
+            height,
+            0,
+            30.0,
+        );
+        assert!(
+            fp16.chunks_exact(8)
+                .all(|pixel| pixel[6..8] == [0x00, 0x3c])
+        );
 
         let mut nv12 = vec![
             0;

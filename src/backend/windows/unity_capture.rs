@@ -9,21 +9,20 @@ use windows_sys::Win32::{
 
 use crate::{
     CameraType, Error, Result, WriteStatus,
-    config::ValidatedConfig,
+    config::ValidatedUnityCaptureOptions,
     platform::windows::{MappedView, MutexGuard, OwnedHandle, last_error, registry_key_exists},
 };
 
 use super::protocol::unity_capture::{
-    DATA_OFFSET, DEFAULT_TIMEOUT_MS, FORMAT_UINT8, MAX_SHARED_IMAGE_SIZE, MIRROR_MODE_DISABLED,
-    ObjectNames, RESIZE_MODE_DISABLED, SharedMemHeader,
+    DATA_OFFSET, MAX_SHARED_IMAGE_SIZE, ObjectNames, SharedMemHeader,
 };
 
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
 #[cfg(target_pointer_width = "64")]
-const UNITY_CLSID_KEY: &str = "CLSID\\{5C2CD55C-92AD-4999-8666-912BD3E70010}";
+const UNITY_CLSID_SUFFIX_BASE: u8 = 0x10;
 #[cfg(target_pointer_width = "32")]
-const UNITY_CLSID_KEY: &str = "CLSID\\{5C2CD55C-92AD-4999-8666-912BD3E70020}";
+const UNITY_CLSID_SUFFIX_BASE: u8 = 0x20;
 
 pub(crate) struct UnityCaptureBackend {
     view: Option<MappedView>,
@@ -36,22 +35,28 @@ pub(crate) struct UnityCaptureBackend {
     height: i32,
     stride_pixels: i32,
     frame_size: u32,
+    format: i32,
+    resize_mode: i32,
+    mirror_mode: i32,
+    timeout_ms: i32,
     open: bool,
 }
 
 impl UnityCaptureBackend {
-    pub(crate) fn open(config: ValidatedConfig) -> Result<Self> {
-        if !registry_key_exists(UNITY_CLSID_KEY) {
+    pub(crate) fn open(options: ValidatedUnityCaptureOptions) -> Result<Self> {
+        if !registry_key_exists(&unity_clsid_key(options.capture_number)) {
             return Err(Error::BackendUnavailable(CameraType::UnityCapture));
         }
-        Self::open_protocol(config, ObjectNames::for_capture(0)?)
+        Self::open_protocol(options, ObjectNames::for_capture(options.capture_number)?)
     }
 
-    fn open_protocol(config: ValidatedConfig, names: ObjectNames) -> Result<Self> {
-        let width = i32::try_from(config.width).map_err(|_| Error::InvalidDimensions)?;
-        let height = i32::try_from(config.height).map_err(|_| Error::InvalidDimensions)?;
-        let frame_size = u32::try_from(config.frame_size).map_err(|_| Error::FrameSizeOverflow)?;
-        if config.frame_size > MAX_SHARED_IMAGE_SIZE {
+    fn open_protocol(options: ValidatedUnityCaptureOptions, names: ObjectNames) -> Result<Self> {
+        let width = i32::try_from(options.width).map_err(|_| Error::InvalidDimensions)?;
+        let height = i32::try_from(options.height).map_err(|_| Error::InvalidDimensions)?;
+        let stride_pixels =
+            i32::try_from(options.stride_pixels).map_err(|_| Error::InvalidDimensions)?;
+        let frame_size = u32::try_from(options.frame_size).map_err(|_| Error::FrameSizeOverflow)?;
+        if options.frame_size > MAX_SHARED_IMAGE_SIZE {
             return Err(Error::InvalidDimensions);
         }
 
@@ -64,10 +69,14 @@ impl UnityCaptureBackend {
             names,
             width,
             height,
-            // Upstream passes D3D RowPitch / 4 for FORMAT_UINT8, so stride is
-            // measured in RGBA pixels, not bytes. Tightly packed input => width.
-            stride_pixels: width,
+            // Upstream divides D3D RowPitch by bytes per pixel, so stride is in
+            // pixels for RGBA8 and both RGBA binary16 formats.
+            stride_pixels,
             frame_size,
+            format: options.format as i32,
+            resize_mode: options.resize_mode as i32,
+            mirror_mode: options.mirror_mode as i32,
+            timeout_ms: options.timeout_ms,
             open: true,
         })
     }
@@ -126,19 +135,16 @@ impl UnityCaptureBackend {
                 core::ptr::addr_of_mut!((*header).stride),
                 self.stride_pixels,
             );
-            core::ptr::write(core::ptr::addr_of_mut!((*header).format), FORMAT_UINT8);
+            core::ptr::write(core::ptr::addr_of_mut!((*header).format), self.format);
             core::ptr::write(
                 core::ptr::addr_of_mut!((*header).resize_mode),
-                RESIZE_MODE_DISABLED,
+                self.resize_mode,
             );
             core::ptr::write(
                 core::ptr::addr_of_mut!((*header).mirror_mode),
-                MIRROR_MODE_DISABLED,
+                self.mirror_mode,
             );
-            core::ptr::write(
-                core::ptr::addr_of_mut!((*header).timeout),
-                DEFAULT_TIMEOUT_MS,
-            );
+            core::ptr::write(core::ptr::addr_of_mut!((*header).timeout), self.timeout_ms);
             core::ptr::copy_nonoverlapping(
                 frame.as_ptr(),
                 view.as_ptr().add(DATA_OFFSET),
@@ -278,6 +284,17 @@ impl UnityCaptureBackend {
     }
 }
 
+fn unity_clsid_key(capture_number: u8) -> String {
+    // Upstream reserves base+1 for the property page, so device #2 begins at
+    // base+2 while capture zero retains the architecture-specific base CLSID.
+    let suffix = if capture_number == 0 {
+        UNITY_CLSID_SUFFIX_BASE
+    } else {
+        UNITY_CLSID_SUFFIX_BASE + 1 + capture_number
+    };
+    format!("CLSID\\{{5C2CD55C-92AD-4999-8666-912BD3E700{suffix:02X}}}")
+}
+
 impl Drop for UnityCaptureBackend {
     fn drop(&mut self) {
         let _ = self.close();
@@ -315,7 +332,9 @@ mod tests {
     use crate::backend::windows::protocol::unity_capture::{
         MAX_SHARED_IMAGE_SIZE, SharedMemHeader,
     };
-    use crate::{CameraConfig, config::CameraType};
+    use crate::{
+        UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode,
+    };
 
     fn test_names(suffix: &str) -> ObjectNames {
         let stem = format!(
@@ -331,14 +350,45 @@ mod tests {
         }
     }
 
-    fn validated() -> ValidatedConfig {
-        CameraConfig {
+    fn validated() -> ValidatedUnityCaptureOptions {
+        UnityCaptureOptions {
             width: 2,
             height: 2,
-            fps: 30.0,
+            ..UnityCaptureOptions::default()
         }
-        .validate(CameraType::UnityCapture)
+        .validate()
         .expect("valid Unity Capture test configuration")
+    }
+
+    fn validated_with_controls() -> ValidatedUnityCaptureOptions {
+        UnityCaptureOptions {
+            width: 2,
+            height: 2,
+            format: UnityCaptureFormat::Rgba16FloatGamma,
+            stride_pixels: Some(3),
+            resize_mode: UnityCaptureResizeMode::Linear,
+            mirror_mode: UnityCaptureMirrorMode::Horizontal,
+            timeout_ms: 250,
+            ..UnityCaptureOptions::default()
+        }
+        .validate()
+        .expect("valid controlled Unity Capture configuration")
+    }
+
+    #[test]
+    fn capture_number_maps_to_architecture_specific_clsid() {
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(unity_clsid_key(0).ends_with("0010}"));
+            assert!(unity_clsid_key(1).ends_with("0012}"));
+            assert!(unity_clsid_key(UnityCaptureOptions::MAX_CAPTURE_NUMBER).ends_with("005B}"));
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            assert!(unity_clsid_key(0).ends_with("0020}"));
+            assert!(unity_clsid_key(1).ends_with("0022}"));
+            assert!(unity_clsid_key(UnityCaptureOptions::MAX_CAPTURE_NUMBER).ends_with("006B}"));
+        }
     }
 
     #[test]
@@ -411,8 +461,9 @@ mod tests {
         // SAFETY: Successful CreateMutexA returned one owned handle.
         let mutex = unsafe { OwnedHandle::from_raw(mutex_raw) };
 
-        let mut sender = UnityCaptureBackend::open_protocol(validated(), sender_names)
-            .expect("construct sender state");
+        let mut sender =
+            UnityCaptureBackend::open_protocol(validated_with_controls(), sender_names)
+                .expect("construct sender state");
         assert!(!sender.is_ready().expect("first handshake attempt"));
 
         let receiver_guard =
@@ -474,7 +525,7 @@ mod tests {
         // Receiver requests a frame before waiting for Sent.
         // SAFETY: Receiver opened want with EVENT_MODIFY_STATE.
         assert_ne!(unsafe { SetEvent(want.raw()) }, 0);
-        let frame = [1_u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let frame = [7_u8; 48];
         assert_eq!(sender.write_host_frame(&frame), Ok(WriteStatus::Written));
         // SAFETY: Receiver owns a live waitable sent-event handle.
         assert_eq!(unsafe { WaitForSingleObject(sent.raw(), 0) }, WAIT_OBJECT_0);
@@ -484,11 +535,20 @@ mod tests {
         unsafe {
             assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).width)), 2);
             assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).height)), 2);
-            assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).stride)), 2);
+            assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).stride)), 3);
             assert_eq!(
                 core::ptr::read(core::ptr::addr_of!((*header).format)),
-                FORMAT_UINT8
+                UnityCaptureFormat::Rgba16FloatGamma as i32
             );
+            assert_eq!(
+                core::ptr::read(core::ptr::addr_of!((*header).resize_mode)),
+                UnityCaptureResizeMode::Linear as i32
+            );
+            assert_eq!(
+                core::ptr::read(core::ptr::addr_of!((*header).mirror_mode)),
+                UnityCaptureMirrorMode::Horizontal as i32
+            );
+            assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).timeout)), 250);
             assert_eq!(
                 core::slice::from_raw_parts(receiver_view.as_ptr().add(DATA_OFFSET), frame.len()),
                 frame
@@ -507,7 +567,7 @@ mod tests {
         // A receiver capacity regression is rejected without signaling Sent.
         // SAFETY: Receiver view contains the aligned header and stays mapped.
         unsafe {
-            core::ptr::write(core::ptr::addr_of_mut!((*header).max_size), 15);
+            core::ptr::write(core::ptr::addr_of_mut!((*header).max_size), 47);
         }
         // SAFETY: Receiver opened want with EVENT_MODIFY_STATE.
         assert_ne!(unsafe { SetEvent(want.raw()) }, 0);
@@ -528,12 +588,12 @@ mod tests {
     fn connected_sender_rejects_mapping_smaller_than_frame() {
         let receiver_names = test_names("small_mapping");
         let sender_names = test_names("small_mapping");
-        let config = CameraConfig {
+        let config = UnityCaptureOptions {
             width: 64,
             height: 64,
-            fps: 30.0,
+            ..UnityCaptureOptions::default()
         }
-        .validate(CameraType::UnityCapture)
+        .validate()
         .expect("valid Unity Capture test configuration");
 
         // SAFETY: Null security attributes and stable NUL-terminated test name.

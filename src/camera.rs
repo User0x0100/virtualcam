@@ -2,7 +2,7 @@ use std::{marker::PhantomData, rc::Rc};
 
 #[cfg(windows)]
 use crate::backend::Backend;
-use crate::{CameraConfig, CameraType, Error, OpenOptions, PixelFormat, Result, WriteStatus};
+use crate::{CameraType, Error, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
 
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaStream;
@@ -26,46 +26,69 @@ pub struct VirtualCamera {
 }
 
 impl VirtualCamera {
-    /// Opens a producer using conservative default options.
+    /// Opens an OBS Virtual Camera producer with OBS-specific controls.
     ///
-    /// On Windows, the selected driver must be installed. OBS creates its queue
-    /// immediately and fails with [`Error::DeviceInUse`] if the fixed mapping
-    /// exists. Unity Capture only creates local state; its DirectShow consumer
-    /// may start later. On other platforms this returns
-    /// [`Error::UnsupportedPlatform`].
-    pub fn open(camera_type: CameraType, config: CameraConfig) -> Result<Self> {
-        Self::open_with_options(camera_type, config, OpenOptions::default())
-    }
-
-    /// Opens a producer with explicit recovery options.
-    ///
-    /// `options.force_open` only affects OBS. See [`OpenOptions::force_open`] for
-    /// its protocol-level data-race contract.
-    pub fn open_with_options(
-        camera_type: CameraType,
-        config: CameraConfig,
-        options: OpenOptions,
-    ) -> Result<Self> {
+    /// OBS creates its fixed shared queue immediately and reports
+    /// [`Error::DeviceInUse`] when another mapping exists, unless the caller
+    /// explicitly accepts [`ObsOptions::force_open`]'s contract.
+    pub fn open_obs(options: ObsOptions) -> Result<Self> {
         #[cfg(not(windows))]
         {
-            let _ = (camera_type, config, options);
+            let _ = options;
             Err(Error::UnsupportedPlatform)
         }
 
         #[cfg(windows)]
         {
-            let validated = config.validate(camera_type)?;
-            let backend = Backend::open(camera_type, validated, options)?;
+            let validated = options.validate()?;
+            let backend = Backend::open_obs(validated)?;
             trace_debug!(
-                camera_type = ?camera_type,
+                camera_type = ?CameraType::Obs,
                 width = validated.width,
                 height = validated.height,
-                fps = validated.fps,
+                interval_100ns = validated.interval_100ns,
                 "virtual camera opened"
             );
             Ok(Self {
-                camera_type,
-                native_format: camera_type.native_format(),
+                camera_type: CameraType::Obs,
+                native_format: PixelFormat::Nv12,
+                frame_size: validated.frame_size,
+                closed: false,
+                backend,
+                #[cfg(all(feature = "cuda", windows))]
+                cuda_staging: None,
+                not_send_or_sync: PhantomData,
+            })
+        }
+    }
+
+    /// Opens a Unity Capture producer with Unity-specific protocol controls.
+    ///
+    /// Opening only creates local sender state. The selected Unity Capture
+    /// DirectShow device may become active later; use [`Self::is_ready`] or
+    /// inspect [`WriteStatus::ConsumerInactive`].
+    pub fn open_unity_capture(options: UnityCaptureOptions) -> Result<Self> {
+        #[cfg(not(windows))]
+        {
+            let _ = options;
+            Err(Error::UnsupportedPlatform)
+        }
+
+        #[cfg(windows)]
+        {
+            let validated = options.validate()?;
+            let backend = Backend::open_unity_capture(validated)?;
+            trace_debug!(
+                camera_type = ?CameraType::UnityCapture,
+                capture_number = validated.capture_number,
+                width = validated.width,
+                height = validated.height,
+                format = ?validated.format,
+                "virtual camera opened"
+            );
+            Ok(Self {
+                camera_type: CameraType::UnityCapture,
+                native_format: validated.format.pixel_format(),
                 frame_size: validated.frame_size,
                 closed: false,
                 backend,
@@ -86,7 +109,9 @@ impl VirtualCamera {
         self.native_format
     }
 
-    /// Returns the exact number of bytes required for each tightly packed frame.
+    /// Returns the exact number of bytes required for each frame.
+    ///
+    /// This includes Unity row padding when `stride_pixels` was explicitly set.
     pub const fn frame_size(&self) -> usize {
         self.frame_size
     }
@@ -117,10 +142,11 @@ impl VirtualCamera {
         }
     }
 
-    /// Publishes one tightly packed host-memory frame.
+    /// Publishes one host-memory frame.
     ///
-    /// `frame` must use [`Self::native_format`], be contiguous, and contain
-    /// exactly [`Self::frame_size`] bytes. `Written` means the full frame has
+    /// `frame` must use [`Self::native_format`], include any configured Unity
+    /// row padding, and contain exactly [`Self::frame_size`] bytes. `Written`
+    /// means the full frame has
     /// been copied and the backend's publication fields or event were updated.
     pub fn write_host(&mut self, frame: &[u8]) -> Result<WriteStatus> {
         if self.closed {

@@ -37,7 +37,7 @@ Rust coverage: `src/backend/windows/obs.rs` and `src/backend/windows/protocol/ob
 | Slots | 3; header and each `(32-byte frame header + NV12)` extent aligned to 32 | checked layout calculation |
 | Frame | timestamp at slot start; image at `slot + 32`; Y then UV | tight NV12 split at `width * height` |
 | Publish order | increment write index, timestamp, Y, UV, read index, READY | identical observable order |
-| Interval | `fps_den * 10_000_000 / fps_num` in 100ns units | truncating `10_000_000.0 / fps` because public input is `f64` |
+| Interval | `fps_den * 10_000_000 / fps_num` in 100ns units | exact `ObsFrameRate` integer calculation |
 | Timestamp | `video_data.timestamp`, derived from QPC as nanoseconds | QPC converted to nanoseconds with upstream mul/div algorithm |
 | Close | writer stores STOPPING before unmap/close | same |
 
@@ -56,15 +56,16 @@ Rust coverage: `src/backend/windows/unity_capture.rs` and `src/backend/windows/p
 
 | Property | Pinned upstream sender behavior | Rust mapping |
 | --- | --- | --- |
-| Names | `UnityCapture_Mutx0`, `Want0`, `Sent0`, `Data0`; capture 0 replaces suffix with NUL | exact suffix rule; v0.1 uses unsuffixed capture 0 |
+| Names | `UnityCapture_Mutx0`, `Want0`, `Sent0`, `Data0`; capture 0 replaces suffix with NUL | exact suffix rule for configurable capture numbers |
 | Mutex | receiver creates; sender opens with `SYNCHRONIZE`; infinite wait | same |
 | Want event | sender creates automatic-reset event | same |
 | Sent event | receiver creates automatic-reset event; sender opens `EVENT_MODIFY_STATE` | same |
 | Mapping | receiver creates `sizeof(header) + MAX_SHARED_IMAGE_SIZE`; sender opens/maps `FILE_MAP_WRITE` | same sender path |
 | Header | `DWORD maxSize`, then seven C `int`, then `uint8_t data[1]` | size 36, alignment 4, data offset 32 |
 | Maximum | `3840 * 2160 * 4 * sizeof(short)` = 66,355,200 bytes | exact bound |
-| RGBA8 stride | D3D `RowPitch / 4` | tight input publishes `width` pixels |
-| Metadata | `FORMAT_UINT8`, resize disabled, mirror disabled, timeout | values 0, 0, 0, 1000ms |
+| Formats | `FORMAT_UINT8`, `FORMAT_FP16_GAMMA`, `FORMAT_FP16_LINEAR` | exact configurable values 0, 1, 2 |
+| Stride | D3D `RowPitch / 4` or `/ 8`, in pixels | tight `width` default or explicit pixel stride |
+| Metadata | resize mode, mirror mode, timeout | configurable exact C enum/int values; upstream defaults 0, 0, 1000ms |
 | Send order | maxSize check; mutex; metadata; data; release; signal Sent; poll Want | exact order |
 | Skip | Want poll is not signaled after the send | `FrameSkippedByConsumer` after successful publication |
 
@@ -72,14 +73,14 @@ Rust coverage: `src/backend/windows/unity_capture.rs` and `src/backend/windows/p
 
 ## Intentional differences and safety checks
 
-- The public `fps: f64` cannot retain an OBS numerator/denominator pair. The interval uses the same division-and-truncation result for the supplied floating value.
+- OBS exposes its upstream numerator/denominator rate pair instead of losing precision through a floating frame rate.
 - A registry preflight reports `BackendUnavailable` before creating resources. OBS uses its pinned CLSID; Unity uses the architecture-specific capture-0 CLSID.
 - If a mapping appears in OBS's normal-mode race window between preflight open and creation, Rust returns `DeviceInUse`. Upstream does not inspect `ERROR_ALREADY_EXISTS` at that second point.
 - `force_open` is a requested extension, isolated in the OBS open path. It validates the accessible mapped region with `VirtualQuery` before reinitializing.
 - Unity Capture's C++ destructor omits `UnmapViewOfFile`; Rust owns and unmaps the view with RAII.
 - Failed mutex waits/releases and event operations become errors with their exact Win32 code instead of being ignored.
 - The OBS application also writes `obs-virtualcam.txt` as a last-format fallback. This library owns only transfer/protocol resources and does not write application configuration files; a live queue carries its current dimensions and interval.
-- The first unified API exposes Unity capture number 0 only. All suffix rules remain implemented and tested for future API expansion.
+- Unity's D3D11 texture readback and optional double-buffering are outside `SharedImageMemory::Send`; host/CUDA callers already provide an accessible buffer, so those plugin-only controls are not fabricated by this crate.
 
 ## Upgrade checklist
 
