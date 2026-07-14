@@ -10,11 +10,12 @@ use windows_sys::Win32::{
 use crate::{
     CameraType, Error, Result, WriteStatus,
     config::ValidatedUnityCaptureOptions,
-    platform::windows::{MappedView, MutexGuard, OwnedHandle, last_error, registry_key_exists},
+    platform::windows::{MappedView, MutexGuard, OwnedHandle, last_error},
 };
 
-use super::protocol::unity_capture::{
-    DATA_OFFSET, MAX_SHARED_IMAGE_SIZE, ObjectNames, SharedMemHeader,
+use super::{
+    FrameSource,
+    protocol::unity_capture::{DATA_OFFSET, MAX_SHARED_IMAGE_SIZE, ObjectNames, SharedMemHeader},
 };
 
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
@@ -43,14 +44,7 @@ pub(crate) struct UnityCaptureBackend {
 }
 
 impl UnityCaptureBackend {
-    pub(crate) fn open(options: ValidatedUnityCaptureOptions) -> Result<Self> {
-        if !registry_key_exists(&unity_clsid_key(options.capture_number)) {
-            return Err(Error::BackendUnavailable(CameraType::UnityCapture));
-        }
-        Self::open_protocol(options, ObjectNames::for_capture(options.capture_number)?)
-    }
-
-    fn open_protocol(options: ValidatedUnityCaptureOptions, names: ObjectNames) -> Result<Self> {
+    pub(crate) fn open(options: ValidatedUnityCaptureOptions, names: ObjectNames) -> Result<Self> {
         let width = i32::try_from(options.width).map_err(|_| Error::InvalidDimensions)?;
         let height = i32::try_from(options.height).map_err(|_| Error::InvalidDimensions)?;
         let stride_pixels =
@@ -92,28 +86,14 @@ impl UnityCaptureBackend {
         Ok(ready)
     }
 
-    pub(crate) fn write_host_frame(&mut self, frame: &[u8]) -> Result<WriteStatus> {
-        if frame.len() != self.frame_size as usize {
+    pub(super) fn write_frame(&mut self, frame: FrameSource<'_>) -> Result<WriteStatus> {
+        let byte_len = frame.byte_len();
+        if byte_len != self.frame_size as usize {
             return Err(Error::FrameSizeMismatch {
                 expected: self.frame_size as usize,
-                actual: frame.len(),
+                actual: byte_len,
             });
         }
-
-        self.write_frame_with(|destination, frame_size| {
-            // SAFETY: The backend holds the protocol mutex and provides the
-            // complete writable data range checked against `frame.len()` above.
-            unsafe {
-                core::ptr::copy_nonoverlapping(frame.as_ptr(), destination, frame_size);
-            }
-            Ok(())
-        })
-    }
-
-    pub(crate) fn write_frame_with(
-        &mut self,
-        write_frame: impl FnOnce(*mut u8, usize) -> Result<()>,
-    ) -> Result<WriteStatus> {
         if !self.open {
             return Err(Error::AlreadyClosed);
         }
@@ -147,8 +127,7 @@ impl UnityCaptureBackend {
         let guard = MutexGuard::acquire(mutex, "WaitForSingleObject(UnityCapture_Mutx)")?;
         // SAFETY: The mapped view is writable through FILE_MAP_WRITE and contains
         // `required` bytes. The current thread owns the protocol mutex. Each field
-        // is naturally aligned and uses the exact C ABI type. The callback must
-        // finish the complete frame write before returning.
+        // is naturally aligned and uses the exact C ABI type.
         unsafe {
             core::ptr::write(core::ptr::addr_of_mut!((*header).width), self.width);
             core::ptr::write(core::ptr::addr_of_mut!((*header).height), self.height);
@@ -168,9 +147,9 @@ impl UnityCaptureBackend {
             core::ptr::write(core::ptr::addr_of_mut!((*header).timeout), self.timeout_ms);
         }
         // SAFETY: `required` validation proves the full data range is writable,
-        // and `guard` keeps the receiver out until the callback has completed.
+        // and `guard` keeps the receiver out until the copy has completed.
         let destination = unsafe { view.as_ptr().add(DATA_OFFSET) };
-        write_frame(destination, self.frame_size as usize)?;
+        frame.copy_to(destination)?;
         guard.release("ReleaseMutex(UnityCapture_Mutx)")?;
 
         let sent = self
@@ -216,7 +195,9 @@ impl UnityCaptureBackend {
             let raw =
                 unsafe { OpenMutexA(SYNCHRONIZE_ACCESS, 0, self.names.mutex.as_ptr().cast()) };
             if raw.is_null() {
-                return inactive_or_error("OpenMutexA(UnityCapture_Mutx)");
+                // SAFETY: Read immediately after the failed OpenMutexA call.
+                let code = unsafe { GetLastError() };
+                return missing_object_or_error("OpenMutexA(UnityCapture_Mutx)", code);
             }
             // SAFETY: Successful OpenMutexA returned one owned kernel handle.
             self.mutex = Some(unsafe { OwnedHandle::from_raw(raw) });
@@ -250,7 +231,7 @@ impl UnityCaptureBackend {
                 // SAFETY: `GetLastError` reads thread-local state.
                 let code = unsafe { GetLastError() };
                 guard.release("ReleaseMutex(UnityCapture_Mutx/open inactive)")?;
-                return inactive_code_or_error("OpenEventA(UnityCapture_Sent)", code);
+                return missing_object_or_error("OpenEventA(UnityCapture_Sent)", code);
             }
             // SAFETY: Successful OpenEventA returned one owned event handle.
             self.sent_event = Some(unsafe { OwnedHandle::from_raw(raw) });
@@ -264,7 +245,7 @@ impl UnityCaptureBackend {
                 // SAFETY: `GetLastError` reads thread-local state immediately.
                 let code = unsafe { GetLastError() };
                 guard.release("ReleaseMutex(UnityCapture_Mutx/open inactive)")?;
-                return inactive_code_or_error("OpenFileMappingA(UnityCapture_Data)", code);
+                return missing_object_or_error("OpenFileMappingA(UnityCapture_Data)", code);
             }
             // SAFETY: Successful OpenFileMappingA returned one owned handle.
             self.mapping = Some(unsafe { OwnedHandle::from_raw(raw) });
@@ -304,7 +285,7 @@ impl UnityCaptureBackend {
     }
 }
 
-fn unity_clsid_key(capture_number: u8) -> String {
+pub(super) fn unity_clsid_key(capture_number: u8) -> String {
     // Upstream reserves base+1 for the property page, so device #2 begins at
     // base+2 while capture zero retains the architecture-specific base CLSID.
     let suffix = if capture_number == 0 {
@@ -321,13 +302,7 @@ impl Drop for UnityCaptureBackend {
     }
 }
 
-fn inactive_or_error(operation: &'static str) -> Result<bool> {
-    // SAFETY: Called immediately after a failed Win32 open operation.
-    let code = unsafe { GetLastError() };
-    inactive_code_or_error(operation, code)
-}
-
-fn inactive_code_or_error(operation: &'static str, code: u32) -> Result<bool> {
+fn missing_object_or_error(operation: &'static str, code: u32) -> Result<bool> {
     if code == ERROR_FILE_NOT_FOUND {
         Ok(false)
     } else {
@@ -413,22 +388,23 @@ mod tests {
 
     #[test]
     fn consumer_inactive_without_receiver_objects() {
-        let mut sender = UnityCaptureBackend::open_protocol(
-            validated(),
-            test_names("inactive_without_receiver"),
-        )
-        .expect("construct sender state");
+        let mut sender =
+            UnityCaptureBackend::open(validated(), test_names("inactive_without_receiver"))
+                .expect("construct sender state");
 
         assert_eq!(sender.is_ready(), Ok(false));
         assert_eq!(
-            sender.write_host_frame(&[0; 16]),
+            sender.write_frame(FrameSource::Host(&[0; 16])),
             Ok(WriteStatus::ConsumerInactive)
         );
         assert!(sender.mutex.is_none());
         assert!(sender.want_event.is_none());
         sender.close().expect("close inactive sender");
         assert_eq!(sender.is_ready(), Err(Error::AlreadyClosed));
-        assert_eq!(sender.write_host_frame(&[0; 16]), Err(Error::AlreadyClosed));
+        assert_eq!(
+            sender.write_frame(FrameSource::Host(&[0; 16])),
+            Err(Error::AlreadyClosed)
+        );
     }
 
     #[test]
@@ -442,8 +418,8 @@ mod tests {
         // SAFETY: Successful CreateMutexA returned one owned handle.
         let _mutex = unsafe { OwnedHandle::from_raw(mutex_raw) };
 
-        let mut sender = UnityCaptureBackend::open_protocol(validated(), sender_names)
-            .expect("construct sender state");
+        let mut sender =
+            UnityCaptureBackend::open(validated(), sender_names).expect("construct sender state");
         assert_eq!(sender.is_ready(), Ok(false));
         assert!(sender.mutex.is_some());
         assert!(sender.want_event.is_some());
@@ -481,9 +457,8 @@ mod tests {
         // SAFETY: Successful CreateMutexA returned one owned handle.
         let mutex = unsafe { OwnedHandle::from_raw(mutex_raw) };
 
-        let mut sender =
-            UnityCaptureBackend::open_protocol(validated_with_controls(), sender_names)
-                .expect("construct sender state");
+        let mut sender = UnityCaptureBackend::open(validated_with_controls(), sender_names)
+            .expect("construct sender state");
         assert!(!sender.is_ready().expect("first handshake attempt"));
 
         let receiver_guard =
@@ -546,30 +521,10 @@ mod tests {
         // SAFETY: Receiver opened want with EVENT_MODIFY_STATE.
         assert_ne!(unsafe { SetEvent(want.raw()) }, 0);
         let frame = [7_u8; 48];
-        // SAFETY: The connected sender view contains its complete data field.
-        let expected_destination = unsafe {
-            sender
-                .view
-                .as_ref()
-                .expect("sender view remains connected")
-                .as_ptr()
-                .add(DATA_OFFSET)
-        };
-        let mut direct_destination = core::ptr::null_mut();
         assert_eq!(
-            sender.write_frame_with(|destination, frame_size| {
-                direct_destination = destination;
-                assert_eq!(frame_size, frame.len());
-                // SAFETY: Sender owns the protocol mutex and supplied the complete
-                // writable data field to this callback.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(frame.as_ptr(), destination, frame_size);
-                }
-                Ok(())
-            }),
+            sender.write_frame(FrameSource::Host(&frame)),
             Ok(WriteStatus::Written)
         );
-        assert_eq!(direct_destination, expected_destination);
         // SAFETY: Receiver owns a live waitable sent-event handle.
         assert_eq!(unsafe { WaitForSingleObject(sent.raw(), 0) }, WAIT_OBJECT_0);
 
@@ -599,27 +554,13 @@ mod tests {
         }
 
         assert_eq!(
-            sender.write_host_frame(&frame),
+            sender.write_frame(FrameSource::Host(&frame)),
             Ok(WriteStatus::FrameSkippedByConsumer)
         );
         // FrameSkippedByConsumer describes the absent Want request; the frame
         // data is still copied and Sent is still signaled by the protocol.
         // SAFETY: Receiver owns a live waitable Sent event handle.
         assert_eq!(unsafe { WaitForSingleObject(sent.raw(), 0) }, WAIT_OBJECT_0);
-
-        let copy_error = Error::Cuda {
-            operation: "cudaStreamSynchronize",
-            code: 29,
-            message: None,
-        };
-        assert_eq!(
-            sender.write_frame_with(|_, _| Err(copy_error.clone())),
-            Err(copy_error)
-        );
-        // A failed direct writer releases the mutex through its guard and does
-        // not signal Sent or poll Want as if a complete frame had been published.
-        // SAFETY: Receiver owns a live waitable Sent event handle.
-        assert_eq!(unsafe { WaitForSingleObject(sent.raw(), 0) }, WAIT_TIMEOUT);
 
         // A receiver capacity regression is rejected without signaling Sent.
         // SAFETY: Receiver view contains the aligned header and stays mapped.
@@ -629,7 +570,7 @@ mod tests {
         // SAFETY: Receiver opened want with EVENT_MODIFY_STATE.
         assert_ne!(unsafe { SetEvent(want.raw()) }, 0);
         assert!(matches!(
-            sender.write_host_frame(&frame),
+            sender.write_frame(FrameSource::Host(&frame)),
             Err(Error::Protocol {
                 backend: CameraType::UnityCapture,
                 detail: "frame exceeds receiver maxSize",
@@ -660,8 +601,8 @@ mod tests {
         // SAFETY: Successful CreateMutexA returned one owned handle.
         let mutex = unsafe { OwnedHandle::from_raw(mutex_raw) };
 
-        let mut sender = UnityCaptureBackend::open_protocol(config, sender_names)
-            .expect("construct sender state");
+        let mut sender =
+            UnityCaptureBackend::open(config, sender_names).expect("construct sender state");
         assert_eq!(sender.is_ready(), Ok(false));
         let receiver_guard =
             MutexGuard::acquire(mutex.raw(), "WaitForSingleObject(test small mutex)")
@@ -714,7 +655,7 @@ mod tests {
         // SAFETY: Receiver owns a live Want event handle.
         assert_ne!(unsafe { SetEvent(want.raw()) }, 0);
         assert!(matches!(
-            sender.write_host_frame(&vec![0; 64 * 64 * 4]),
+            sender.write_frame(FrameSource::Host(&vec![0; 64 * 64 * 4])),
             Err(Error::Protocol {
                 backend: CameraType::UnityCapture,
                 detail: "Unity Capture mapping is smaller than the configured frame",

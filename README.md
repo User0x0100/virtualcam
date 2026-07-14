@@ -189,8 +189,8 @@ source and stream valid until return, and maintain any required thread/context
 affinity. The crate never calls `cudaSetDevice`, context APIs,
 `cudaDeviceSynchronize`, stream creation/destruction, `cudaHostRegister`, or
 `cudaHostUnregister`. `close` and `Drop` make no CUDA calls. CUDA failures retain
-the failing operation and exact numeric `cudaError_t`; `Error::Cuda::message` is
-`None` because the minimal binding does not call `cudaGetErrorString`.
+the failing operation and exact numeric `cudaError_t`; the minimal binding does
+not call `cudaGetErrorString`.
 
 On Windows, linking uses `cudart`; `build.rs` adds `%CUDA_PATH%\lib\x64` (or `Win32`) when that environment variable is present. The default build never compiles or links CUDA code.
 
@@ -219,8 +219,7 @@ See [UPSTREAM.md](UPSTREAM.md) for pinned protocol sources, exact ABI details, a
 The default suite uses real Win32 mappings, mutexes, and events under unique
 test-only names. It covers protocol layout, queue publication and wraparound,
 Unity's inactive/partial/active handshakes, resource cleanup, public API
-validation, direct shared-slot callbacks, and injected CUDA
-copy/synchronization failures:
+validation, direct shared-slot publication, and exact CUDA error mapping:
 
 ```powershell
 cargo test --all-features

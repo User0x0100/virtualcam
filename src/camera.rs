@@ -4,8 +4,6 @@ use std::{marker::PhantomData, rc::Rc};
 use crate::backend::Backend;
 use crate::{CameraType, Error, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
 
-#[cfg(all(feature = "cuda", windows))]
-use crate::cuda;
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaStream;
 
@@ -222,21 +220,9 @@ impl VirtualCamera {
         }
         #[cfg(windows)]
         {
-            let backend = &mut self.backend;
-            backend.write_frame_with(|host_destination, destination_len| {
-                debug_assert_eq!(destination_len, byte_len);
-                // SAFETY: The caller upholds the source/context/stream contract;
-                // the backend keeps this exact shared-memory destination reserved
-                // and unpublished until this closure returns after synchronization.
-                unsafe {
-                    cuda::copy_device_to_shared_memory(
-                        host_destination,
-                        device_ptr,
-                        destination_len,
-                        stream,
-                    )
-                }
-            })
+            // SAFETY: The caller upholds the source/context/stream contract and
+            // byte_len was checked against the backend's exact frame length.
+            unsafe { self.backend.write_cuda_frame(device_ptr, byte_len, stream) }
         }
     }
 

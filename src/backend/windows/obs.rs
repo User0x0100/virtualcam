@@ -17,14 +17,15 @@ use windows_sys::Win32::{
 use crate::{
     CameraType, Error, Result, WriteStatus,
     config::ValidatedObsOptions,
-    platform::windows::{MappedView, OwnedHandle, last_error, registry_key_exists},
+    platform::windows::{MappedView, OwnedHandle, last_error},
 };
 
-use super::protocol::obs::{
-    QueueHeader, QueueLayout, SLOT_COUNT, STATE_READY, STATE_STOPPING, VIDEO_NAME,
+use super::{
+    FrameSource,
+    protocol::obs::{QueueHeader, QueueLayout, SLOT_COUNT, STATE_READY, STATE_STOPPING},
 };
 
-const OBS_CLSID_KEY: &str = "CLSID\\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}";
+pub(super) const OBS_CLSID_KEY: &str = "CLSID\\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}";
 
 pub(crate) struct ObsBackend {
     view: Option<MappedView>,
@@ -36,14 +37,7 @@ pub(crate) struct ObsBackend {
 }
 
 impl ObsBackend {
-    pub(crate) fn open(options: ValidatedObsOptions) -> Result<Self> {
-        if !registry_key_exists(OBS_CLSID_KEY) {
-            return Err(Error::BackendUnavailable(CameraType::Obs));
-        }
-        Self::open_protocol(options, VIDEO_NAME)
-    }
-
-    fn open_protocol(options: ValidatedObsOptions, video_name: &[u16]) -> Result<Self> {
+    pub(crate) fn open(options: ValidatedObsOptions, video_name: &[u16]) -> Result<Self> {
         let layout = QueueLayout::calculate(options.frame_size)?;
         if !options.force_open {
             // Upstream performs this conservative read-only open first and treats
@@ -167,28 +161,14 @@ impl ObsBackend {
         Ok(true)
     }
 
-    pub(crate) fn write_host_frame(&mut self, frame: &[u8]) -> Result<WriteStatus> {
-        if frame.len() != self.layout.frame_size {
+    pub(super) fn write_frame(&mut self, frame: FrameSource<'_>) -> Result<WriteStatus> {
+        let byte_len = frame.byte_len();
+        if byte_len != self.layout.frame_size {
             return Err(Error::FrameSizeMismatch {
                 expected: self.layout.frame_size,
-                actual: frame.len(),
+                actual: byte_len,
             });
         }
-
-        self.write_frame_with(|destination, frame_size| {
-            // SAFETY: The backend provides a distinct writable frame slot of
-            // `frame_size` bytes, which was checked against `frame.len()` above.
-            unsafe {
-                core::ptr::copy_nonoverlapping(frame.as_ptr(), destination, frame_size);
-            }
-            Ok(())
-        })
-    }
-
-    pub(crate) fn write_frame_with(
-        &mut self,
-        write_frame: impl FnOnce(*mut u8, usize) -> Result<()>,
-    ) -> Result<WriteStatus> {
         if !self.open {
             return Err(Error::AlreadyClosed);
         }
@@ -226,7 +206,7 @@ impl ObsBackend {
             core::ptr::write(timestamp_ptr, timestamp);
             view.as_ptr().add(slot_offset + 32)
         };
-        write_frame(destination, self.layout.frame_size)?;
+        frame.copy_to(destination)?;
 
         compiler_fence(Ordering::SeqCst);
         // SAFETY: These are the initialized volatile publication fields in the
@@ -315,14 +295,14 @@ mod tests {
         let name = test_name("state");
         let config = validated(2, 2, false);
         let mut original =
-            ObsBackend::open_protocol(config, &name).expect("first writer opens a new mapping");
+            ObsBackend::open(config, &name).expect("first writer opens a new mapping");
 
         assert!(matches!(
-            ObsBackend::open_protocol(config, &name),
+            ObsBackend::open(config, &name),
             Err(Error::DeviceInUse)
         ));
 
-        let mut forced = ObsBackend::open_protocol(validated(2, 2, true), &name)
+        let mut forced = ObsBackend::open(validated(2, 2, true), &name)
             .expect("force mode reuses a large enough mapping");
         let observer = original
             .view
@@ -337,7 +317,7 @@ mod tests {
 
         let frame = [1_u8, 2, 3, 4, 5, 6];
         assert!(matches!(
-            forced.write_host_frame(&frame[..5]),
+            forced.write_frame(FrameSource::Host(&frame[..5])),
             Err(Error::FrameSizeMismatch {
                 expected: 6,
                 actual: 5,
@@ -351,45 +331,13 @@ mod tests {
             assert_eq!(core::ptr::read_volatile(addr_of!((*header).state)), 1);
         }
 
-        let copy_error = Error::Cuda {
-            operation: "cudaMemcpyAsync",
-            code: 17,
-            message: None,
-        };
-        assert_eq!(
-            forced.write_frame_with(|_, _| Err(copy_error.clone())),
-            Err(copy_error)
-        );
-        // Reserving a slot advances write_idx as required by the OBS protocol,
-        // but a failed writer callback must not advance read_idx or publish READY.
+        // Exercise the backend's real volatile increment at u32 wraparound.
         // SAFETY: `header` remains a live initialized queue header.
         unsafe {
-            assert_eq!(core::ptr::read_volatile(addr_of!((*header).write_idx)), 1);
-            assert_eq!(core::ptr::read_volatile(addr_of!((*header).read_idx)), 0);
-            assert_eq!(core::ptr::read_volatile(addr_of!((*header).state)), 1);
-
-            // Exercise the backend's real volatile increment at u32 wraparound.
             core::ptr::write_volatile(addr_of_mut!((*header).write_idx), u32::MAX);
         }
-        let forced_view = forced.view.as_ref().expect("forced view remains mapped");
-        // SAFETY: The queue header and selected frame slot are inside this live view.
-        let expected_destination = unsafe {
-            let forced_header = forced_view.as_ptr().cast::<QueueHeader>();
-            forced_view
-                .as_ptr()
-                .add((*forced_header).offsets[0] as usize + 32)
-        };
-        let mut direct_destination = core::ptr::null_mut();
         assert_eq!(
-            forced.write_frame_with(|destination, frame_size| {
-                direct_destination = destination;
-                assert_eq!(frame_size, frame.len());
-                // SAFETY: The callback receives the selected writable queue slot.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(frame.as_ptr(), destination, frame_size);
-                }
-                Ok(())
-            }),
+            forced.write_frame(FrameSource::Host(&frame)),
             Ok(WriteStatus::Written)
         );
         // SAFETY: All fields and the selected slot are in the observer's live view.
@@ -401,7 +349,6 @@ mod tests {
                 STATE_READY
             );
             let slot = (*header).offsets[0] as usize;
-            assert_eq!(direct_destination, expected_destination);
             assert!(core::ptr::read(observer.as_ptr().add(slot).cast::<u64>()) > 0);
             assert_eq!(
                 core::slice::from_raw_parts(observer.as_ptr().add(slot + 32), frame.len()),
@@ -438,7 +385,7 @@ mod tests {
         assert!(!raw.is_null());
         // SAFETY: Successful creation returned one owned mapping handle.
         let _mapping = unsafe { OwnedHandle::from_raw(raw) };
-        let error = match ObsBackend::open_protocol(validated(64, 64, true), &name) {
+        let error = match ObsBackend::open(validated(64, 64, true), &name) {
             Ok(_) => panic!("small mapping must be rejected"),
             Err(error) => error,
         };

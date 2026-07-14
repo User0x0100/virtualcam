@@ -63,10 +63,7 @@ macro_rules! trace_warn {
 mod backend;
 mod camera;
 mod config;
-#[cfg(all(feature = "cuda", windows))]
-mod cuda;
-#[cfg(all(feature = "cuda", not(windows)))]
-#[path = "cuda_unsupported.rs"]
+#[cfg(feature = "cuda")]
 mod cuda;
 mod error;
 mod pixel_format;

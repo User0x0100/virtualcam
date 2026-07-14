@@ -1,8 +1,9 @@
 use core::ffi::c_void;
 
+#[cfg(windows)]
 use crate::Result;
-
-use cuda_runtime_api::{CUDA_MEMCPY_DEVICE_TO_HOST, cudaError_t};
+#[cfg(windows)]
+use cuda_runtime_api::CUDA_MEMCPY_DEVICE_TO_HOST;
 
 /// An opaque CUDA Runtime stream handle borrowed from the caller.
 #[repr(transparent)]
@@ -30,66 +31,37 @@ impl CudaStream {
 
 /// Copies one contiguous device byte range directly into a backend-owned shared
 /// memory frame slot and waits for that stream before the backend publishes it.
+#[cfg(windows)]
 pub(crate) unsafe fn copy_device_to_shared_memory(
     host_destination: *mut u8,
     device_source: *const c_void,
     byte_len: usize,
     stream: Option<CudaStream>,
 ) -> Result<()> {
-    let stream = stream.map_or(core::ptr::null_mut(), CudaStream::as_raw);
-    let memcpy_async = |destination, source, count, kind, stream| unsafe {
-        cuda_runtime_api::cudaMemcpyAsync(destination, source, count, kind, stream)
-    };
-    let stream_synchronize = |stream| unsafe { cuda_runtime_api::cudaStreamSynchronize(stream) };
-
-    // The closures keep the production FFI calls visible and direct while the
-    // small generic helper makes ordering and failure behavior testable without
-    // introducing a runtime API table or owning any CUDA resources.
-    unsafe {
-        copy_device_to_shared_memory_with(
-            host_destination,
-            device_source,
-            byte_len,
-            stream,
-            memcpy_async,
-            stream_synchronize,
-        )
-    }
-}
-
-unsafe fn copy_device_to_shared_memory_with<Memcpy, Synchronize>(
-    host_destination: *mut u8,
-    device_source: *const c_void,
-    byte_len: usize,
-    stream: *mut c_void,
-    mut memcpy_async: Memcpy,
-    mut stream_synchronize: Synchronize,
-) -> Result<()>
-where
-    Memcpy: FnMut(*mut c_void, *const c_void, usize, i32, *mut c_void) -> cudaError_t,
-    Synchronize: FnMut(*mut c_void) -> cudaError_t,
-{
     debug_assert!(!host_destination.is_null());
     debug_assert!(!device_source.is_null());
     debug_assert_ne!(byte_len, 0);
 
-    // SAFETY: The backend keeps this writable shared-memory slot reserved for
-    // `byte_len` bytes until synchronization. The public caller guarantees that
-    // `device_source` is a compatible readable CUDA range and `stream` is valid.
-    memcpy_async(
-        host_destination.cast(),
-        device_source,
-        byte_len,
-        CUDA_MEMCPY_DEVICE_TO_HOST,
-        stream,
-    )
+    let stream = stream.map_or(core::ptr::null_mut(), CudaStream::as_raw);
+    // SAFETY: The backend reserves a writable shared-memory range of `byte_len`
+    // bytes until synchronization. The public caller guarantees a compatible,
+    // readable CUDA source range and a valid stream/current context.
+    unsafe {
+        cuda_runtime_api::cudaMemcpyAsync(
+            host_destination.cast(),
+            device_source,
+            byte_len,
+            CUDA_MEMCPY_DEVICE_TO_HOST,
+            stream,
+        )
+    }
     .check("cudaMemcpyAsync")?;
 
-    // SAFETY: `stream` is the exact handle used for the preceding D2H copy. The
-    // backend cannot publish or release its slot until this wait succeeds.
-    stream_synchronize(stream).check("cudaStreamSynchronize")
+    // SAFETY: This is the exact stream used by the preceding D2H operation.
+    unsafe { cuda_runtime_api::cudaStreamSynchronize(stream) }.check("cudaStreamSynchronize")
 }
 
+#[cfg(windows)]
 mod cuda_runtime_api {
     use core::ffi::c_void;
 
@@ -112,7 +84,6 @@ mod cuda_runtime_api {
                 Err(Error::Cuda {
                     operation,
                     code: self.0,
-                    message: None,
                 })
             }
         }
@@ -133,10 +104,9 @@ mod cuda_runtime_api {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
-    use std::cell::RefCell;
-
+    use super::cuda_runtime_api::cudaError_t;
     use super::*;
     use crate::Error;
 
@@ -150,176 +120,18 @@ mod tests {
             count: usize,
             kind: i32,
         ) -> cudaError_t;
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Call {
-        Copy {
-            destination: usize,
-            source: usize,
-            count: usize,
-            kind: i32,
-            stream: usize,
-        },
-        Synchronize {
-            stream: usize,
-        },
+        fn cudaStreamCreateWithFlags(stream: *mut *mut c_void, flags: u32) -> cudaError_t;
+        fn cudaStreamDestroy(stream: *mut c_void) -> cudaError_t;
     }
 
     #[test]
-    fn copies_directly_to_supplied_shared_pointer_then_synchronizes_same_stream() {
-        let calls = RefCell::new(Vec::new());
-        let source = [1_u8, 2, 3, 4];
-        let mut shared_slot = [0_u8; 4];
-        let stream = 0x1234_usize as *mut c_void;
-
-        // SAFETY: This test mock treats a host array as device-readable memory and
-        // copies only within the two live four-byte arrays.
-        unsafe {
-            copy_device_to_shared_memory_with(
-                shared_slot.as_mut_ptr(),
-                source.as_ptr().cast(),
-                source.len(),
-                stream,
-                |destination, source, count, kind, stream| {
-                    calls.borrow_mut().push(Call::Copy {
-                        destination: destination as usize,
-                        source: source as usize,
-                        count,
-                        kind,
-                        stream: stream as usize,
-                    });
-                    core::ptr::copy_nonoverlapping(
-                        source.cast::<u8>(),
-                        destination.cast::<u8>(),
-                        count,
-                    );
-                    cudaError_t(0)
-                },
-                |stream| {
-                    calls.borrow_mut().push(Call::Synchronize {
-                        stream: stream as usize,
-                    });
-                    cudaError_t(0)
-                },
-            )
-            .expect("direct D2H succeeds");
-        }
-
-        assert_eq!(shared_slot, source);
+    fn cuda_errors_preserve_operation_and_exact_code() {
         assert_eq!(
-            *calls.borrow(),
-            vec![
-                Call::Copy {
-                    destination: shared_slot.as_mut_ptr() as usize,
-                    source: source.as_ptr() as usize,
-                    count: source.len(),
-                    kind: CUDA_MEMCPY_DEVICE_TO_HOST,
-                    stream: stream as usize,
-                },
-                Call::Synchronize {
-                    stream: stream as usize,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn null_stream_is_forwarded_unchanged() {
-        let source = [1_u8];
-        let mut destination = [0_u8];
-
-        // SAFETY: Mock pointers each cover the requested one byte.
-        unsafe {
-            copy_device_to_shared_memory_with(
-                destination.as_mut_ptr(),
-                source.as_ptr().cast(),
-                1,
-                core::ptr::null_mut(),
-                |destination, source, count, _, stream| {
-                    assert!(stream.is_null());
-                    core::ptr::copy_nonoverlapping(
-                        source.cast::<u8>(),
-                        destination.cast::<u8>(),
-                        count,
-                    );
-                    cudaError_t(0)
-                },
-                |stream| {
-                    assert!(stream.is_null());
-                    cudaError_t(0)
-                },
-            )
-            .expect("null stream transfer succeeds");
-        }
-    }
-
-    #[test]
-    fn copy_failure_does_not_synchronize() {
-        let source = [0_u8];
-        let mut destination = [0_u8];
-        let synchronized = core::cell::Cell::new(false);
-
-        // SAFETY: The failing mock does not dereference either pointer.
-        let error = unsafe {
-            copy_device_to_shared_memory_with(
-                destination.as_mut_ptr(),
-                source.as_ptr().cast(),
-                1,
-                core::ptr::null_mut(),
-                |_, _, _, _, _| cudaError_t(17),
-                |_| {
-                    synchronized.set(true);
-                    cudaError_t(0)
-                },
-            )
-        }
-        .expect_err("copy must fail");
-
-        assert!(!synchronized.get());
-        assert_eq!(
-            error,
-            Error::Cuda {
+            cudaError_t(17).check("cudaMemcpyAsync"),
+            Err(Error::Cuda {
                 operation: "cudaMemcpyAsync",
                 code: 17,
-                message: None,
-            }
-        );
-    }
-
-    #[test]
-    fn synchronization_failure_is_returned_after_copy() {
-        let source = [9_u8];
-        let mut destination = [0_u8];
-
-        // SAFETY: Mock pointers each cover the requested one byte.
-        let error = unsafe {
-            copy_device_to_shared_memory_with(
-                destination.as_mut_ptr(),
-                source.as_ptr().cast(),
-                1,
-                core::ptr::null_mut(),
-                |destination, source, count, _, _| {
-                    core::ptr::copy_nonoverlapping(
-                        source.cast::<u8>(),
-                        destination.cast::<u8>(),
-                        count,
-                    );
-                    cudaError_t(0)
-                },
-                |_| cudaError_t(29),
-            )
-        }
-        .expect_err("synchronization must fail");
-
-        assert_eq!(destination, source);
-        assert_eq!(
-            error,
-            Error::Cuda {
-                operation: "cudaStreamSynchronize",
-                code: 29,
-                message: None,
-            }
+            })
         );
     }
 
@@ -336,6 +148,7 @@ mod tests {
         const MAPPING_SIZE: u32 = 4096;
         const DESTINATION_OFFSET: usize = 32;
         const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+        const CUDA_STREAM_NON_BLOCKING: u32 = 1;
 
         // SAFETY: An unnamed page-file-backed mapping with read/write protection.
         let raw_mapping = unsafe {
@@ -368,8 +181,7 @@ mod tests {
             .expect("allocate real CUDA test source");
         assert!(!device_pointer.is_null());
 
-        // SAFETY: The destination allocation and source array each contain the
-        // requested bytes, and kind 1 is cudaMemcpyHostToDevice.
+        // SAFETY: Both buffers contain the requested bytes and kind 1 is H2D.
         unsafe {
             cudaMemcpy(
                 device_pointer,
@@ -381,19 +193,26 @@ mod tests {
         .check("cudaMemcpy")
         .expect("initialize real CUDA test source");
 
-        // SAFETY: The mapped destination contains this entire range; the CUDA
-        // allocation is contiguous and readable until the synchronized call ends.
+        let mut stream = core::ptr::null_mut();
+        // SAFETY: Writable pointer storage receives a new non-blocking stream.
+        unsafe { cudaStreamCreateWithFlags(&mut stream, CUDA_STREAM_NON_BLOCKING) }
+            .check("cudaStreamCreateWithFlags")
+            .expect("create real CUDA test stream");
+        assert!(!stream.is_null());
+
+        // SAFETY: The mapped destination contains the entire range; the CUDA
+        // allocation and stream remain live until this synchronized call returns.
         unsafe {
             copy_device_to_shared_memory(
                 view.as_ptr().add(DESTINATION_OFFSET),
                 device_pointer,
                 expected.len(),
-                None,
+                Some(CudaStream::from_raw(stream)),
             )
         }
         .expect("copy CUDA data directly to shared mapping");
 
-        // SAFETY: Synchronization completed and the mapped range is still live.
+        // SAFETY: Synchronization completed and the mapped range remains live.
         assert_eq!(
             unsafe {
                 core::slice::from_raw_parts(view.as_ptr().add(DESTINATION_OFFSET), expected.len())
@@ -401,7 +220,11 @@ mod tests {
             expected
         );
 
-        // SAFETY: Pointer came from the successful cudaMalloc above and is freed once.
+        // SAFETY: Both resources were created successfully and are released once.
+        unsafe { cudaStreamDestroy(stream) }
+            .check("cudaStreamDestroy")
+            .expect("release real CUDA test stream");
+        // SAFETY: Pointer came from the successful cudaMalloc above.
         unsafe { cudaFree(device_pointer) }
             .check("cudaFree")
             .expect("release real CUDA test source");

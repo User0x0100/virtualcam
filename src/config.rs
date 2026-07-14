@@ -208,7 +208,7 @@ impl ObsOptions {
             return Err(Error::InvalidFrameRate);
         }
 
-        let frame_size = PixelFormat::Nv12.checked_frame_size(self.width, self.height)?;
+        let frame_size = PixelFormat::Nv12.frame_size(self.width, self.height)?;
         let interval = u128::from(self.frame_rate.denominator) * 10_000_000
             / u128::from(self.frame_rate.numerator);
         let interval_100ns = u64::try_from(interval).map_err(|_| Error::InvalidFrameRate)?;

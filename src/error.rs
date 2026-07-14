@@ -53,10 +53,6 @@ pub enum Error {
         operation: &'static str,
         /// Exact `cudaError_t` value.
         code: i32,
-        /// Optional runtime-provided error string. The direct CUDA binding in
-        /// this release preserves `operation` and the exact code and leaves this
-        /// field as `None` rather than calling another diagnostic FFI function.
-        message: Option<String>,
     },
     /// Shared protocol state was incompatible with a safe publication.
     Protocol {
@@ -101,19 +97,11 @@ impl fmt::Display for Error {
                     "Win32 operation {operation} failed with code {code}"
                 )
             }
-            Self::Cuda {
-                operation,
-                code,
-                message,
-            } => {
+            Self::Cuda { operation, code } => {
                 write!(
                     formatter,
                     "CUDA operation {operation} failed with code {code}"
-                )?;
-                if let Some(message) = message {
-                    write!(formatter, ": {message}")?;
-                }
-                Ok(())
+                )
             }
             Self::Protocol { backend, detail } => {
                 write!(formatter, "{backend:?} protocol error: {detail}")

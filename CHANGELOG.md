@@ -7,5 +7,5 @@
 - Added optional direct CUDA D2H into camera shared memory with caller-owned
   streams and contexts, without a crate-owned intermediate allocation.
 - Added optional zero-default-overhead `tracing` events.
-- Added checked ABI layouts, real Win32 named-object state tests, direct CUDA
-  destination/failure/order mocks, and ignored installed-driver integration tests.
+- Added checked ABI layouts, real Win32 named-object state tests, a real CUDA D2H
+  shared-mapping test, and ignored installed-driver integration tests.
