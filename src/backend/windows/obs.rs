@@ -1,29 +1,15 @@
-use core::{
-    ptr::{addr_of, addr_of_mut},
-    sync::atomic::{Ordering, compiler_fence},
-};
+use core::ptr::{addr_of, addr_of_mut};
+use core::sync::atomic::{Ordering, compiler_fence};
 
-use windows_sys::Win32::{
-    Foundation::{ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE},
-    System::{
-        Memory::{
-            CreateFileMappingW, FILE_MAP_ALL_ACCESS, FILE_MAP_READ, OpenFileMappingW,
-            PAGE_READWRITE,
-        },
-        Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
-    },
-};
+use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_ALL_ACCESS, FILE_MAP_READ, OpenFileMappingW, PAGE_READWRITE};
+use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
-use crate::{
-    CameraType, Error, Result, WriteStatus,
-    config::ValidatedObsOptions,
-    platform::windows::{MappedView, OwnedHandle, last_error},
-};
-
-use super::{
-    FrameSource,
-    protocol::obs::{QueueHeader, QueueLayout, SLOT_COUNT, STATE_READY, STATE_STOPPING},
-};
+use super::FrameSource;
+use super::protocol::obs::{QueueHeader, QueueLayout, SLOT_COUNT, STATE_READY, STATE_STOPPING};
+use crate::config::ValidatedObsOptions;
+use crate::platform::windows::{MappedView, OwnedHandle, last_error};
+use crate::{CameraType, Error, Result, WriteStatus};
 
 pub(super) const OBS_CLSID_KEY: &str = "CLSID\\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}";
 
@@ -54,20 +40,10 @@ impl ObsBackend {
             trace_warn!("OBS force_open bypassed the conservative occupancy check");
         }
 
-        let mapping_size =
-            u32::try_from(layout.total_size).map_err(|_| Error::FrameSizeOverflow)?;
+        let mapping_size = u32::try_from(layout.total_size).map_err(|_| Error::FrameSizeOverflow)?;
         // SAFETY: INVALID_HANDLE_VALUE selects a page-file-backed mapping;
         // protection, 32-bit size, and static NUL-terminated name match upstream.
-        let raw_mapping = unsafe {
-            CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                std::ptr::null(),
-                PAGE_READWRITE,
-                0,
-                mapping_size,
-                video_name.as_ptr(),
-            )
-        };
+        let raw_mapping = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, mapping_size, video_name.as_ptr()) };
         if raw_mapping.is_null() {
             return Err(last_error("CreateFileMappingW(OBSVirtualCamVideo)"));
         }
@@ -85,11 +61,7 @@ impl ObsBackend {
             return Err(Error::DeviceInUse);
         }
 
-        let view = MappedView::map(
-            mapping.raw(),
-            FILE_MAP_ALL_ACCESS,
-            "MapViewOfFile(OBSVirtualCamVideo)",
-        )?;
+        let view = MappedView::map(mapping.raw(), FILE_MAP_ALL_ACCESS, "MapViewOfFile(OBSVirtualCamVideo)")?;
         if already_exists && view.accessible_len() < layout.total_size {
             return Err(Error::ExistingMappingTooSmall {
                 required: layout.total_size,
@@ -103,12 +75,7 @@ impl ObsBackend {
             });
         }
 
-        let header = QueueHeader::new(
-            options.width,
-            options.height,
-            options.interval_100ns,
-            layout.offsets,
-        );
+        let header = QueueHeader::new(options.width, options.height, options.interval_100ns, layout.offsets);
         // SAFETY: The mapped view is writable and at least `layout.total_size`
         // bytes long. Its base has allocation alignment, which exceeds the
         // QueueHeader alignment. `header` does not alias the destination.
@@ -128,11 +95,7 @@ impl ObsBackend {
         })?;
 
         if already_exists {
-            trace_warn!(
-                required = layout.total_size,
-                available = view.accessible_len(),
-                "OBS force_open reinitialized an existing mapping"
-            );
+            trace_warn!(required = layout.total_size, available = view.accessible_len(), "OBS force_open reinitialized an existing mapping");
         }
 
         Ok(Self {
@@ -141,11 +104,7 @@ impl ObsBackend {
             layout,
             y_plane_size: usize::try_from(options.width)
                 .ok()
-                .and_then(|width| {
-                    usize::try_from(options.height)
-                        .ok()
-                        .and_then(|height| width.checked_mul(height))
-                })
+                .and_then(|width| usize::try_from(options.height).ok().and_then(|height| width.checked_mul(height)))
                 .ok_or(Error::FrameSizeOverflow)?,
             clock_frequency,
             open: true,
@@ -264,9 +223,9 @@ fn mul_div_u64(number: u64, multiplier: u64, divisor: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
 
+    use super::*;
     use crate::{ObsFrameRate, ObsOptions};
 
     fn test_name(suffix: &str) -> Vec<u16> {
@@ -294,35 +253,18 @@ mod tests {
     fn real_mapping_covers_occupancy_force_write_and_stopping() {
         let name = test_name("state");
         let config = validated(2, 2, false);
-        let mut original =
-            ObsBackend::open(config, &name).expect("first writer opens a new mapping");
+        let mut original = ObsBackend::open(config, &name).expect("first writer opens a new mapping");
 
-        assert!(matches!(
-            ObsBackend::open(config, &name),
-            Err(Error::DeviceInUse)
-        ));
+        assert!(matches!(ObsBackend::open(config, &name), Err(Error::DeviceInUse)));
 
-        let mut forced = ObsBackend::open(validated(2, 2, true), &name)
-            .expect("force mode reuses a large enough mapping");
-        let observer = original
-            .view
-            .as_ref()
-            .expect("original view remains mapped");
+        let mut forced = ObsBackend::open(validated(2, 2, true), &name).expect("force mode reuses a large enough mapping");
+        let observer = original.view.as_ref().expect("original view remains mapped");
         let header = observer.as_ptr().cast::<QueueHeader>();
         // SAFETY: `observer` maps the same live initialized queue header.
-        assert_eq!(
-            unsafe { core::ptr::read_volatile(addr_of!((*header).state)) },
-            1
-        );
+        assert_eq!(unsafe { core::ptr::read_volatile(addr_of!((*header).state)) }, 1);
 
         let frame = [1_u8, 2, 3, 4, 5, 6];
-        assert!(matches!(
-            forced.write_frame(FrameSource::Host(&frame[..5])),
-            Err(Error::FrameSizeMismatch {
-                expected: 6,
-                actual: 5,
-            })
-        ));
+        assert!(matches!(forced.write_frame(FrameSource::Host(&frame[..5])), Err(Error::FrameSizeMismatch { expected: 6, actual: 5 })));
         // A rejected frame must not advance or publish queue state.
         // SAFETY: `header` remains a live initialized queue header.
         unsafe {
@@ -336,34 +278,22 @@ mod tests {
         unsafe {
             core::ptr::write_volatile(addr_of_mut!((*header).write_idx), u32::MAX);
         }
-        assert_eq!(
-            forced.write_frame(FrameSource::Host(&frame)),
-            Ok(WriteStatus::Written)
-        );
+        assert_eq!(forced.write_frame(FrameSource::Host(&frame)), Ok(WriteStatus::Written));
         // SAFETY: All fields and the selected slot are in the observer's live view.
         unsafe {
             assert_eq!(core::ptr::read_volatile(addr_of!((*header).write_idx)), 0);
             assert_eq!(core::ptr::read_volatile(addr_of!((*header).read_idx)), 0);
-            assert_eq!(
-                core::ptr::read_volatile(addr_of!((*header).state)),
-                STATE_READY
-            );
+            assert_eq!(core::ptr::read_volatile(addr_of!((*header).state)), STATE_READY);
             let slot = (*header).offsets[0] as usize;
             assert!(core::ptr::read(observer.as_ptr().add(slot).cast::<u64>()) > 0);
-            assert_eq!(
-                core::slice::from_raw_parts(observer.as_ptr().add(slot + 32), frame.len()),
-                frame
-            );
+            assert_eq!(core::slice::from_raw_parts(observer.as_ptr().add(slot + 32), frame.len()), frame);
         }
 
         forced.close().expect("forced writer closes");
         forced.close().expect("close is idempotent");
         // SAFETY: `original` keeps an independent mapped view live after forced
         // close and can observe the required STOPPING publication.
-        assert_eq!(
-            unsafe { core::ptr::read_volatile(addr_of!((*header).state)) },
-            STATE_STOPPING
-        );
+        assert_eq!(unsafe { core::ptr::read_volatile(addr_of!((*header).state)) }, STATE_STOPPING);
         original.close().expect("original writer closes");
     }
 
@@ -372,16 +302,7 @@ mod tests {
         let name = test_name("small");
         // SAFETY: Creates a page-file-backed test mapping with a unique name and
         // a deliberately insufficient one-page extent.
-        let raw = unsafe {
-            CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                std::ptr::null(),
-                PAGE_READWRITE,
-                0,
-                4096,
-                name.as_ptr(),
-            )
-        };
+        let raw = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, 4096, name.as_ptr()) };
         assert!(!raw.is_null());
         // SAFETY: Successful creation returned one owned mapping handle.
         let _mapping = unsafe { OwnedHandle::from_raw(raw) };

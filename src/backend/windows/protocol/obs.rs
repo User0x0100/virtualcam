@@ -78,25 +78,16 @@ impl QueueLayout {
         let mut offsets = [0_u32; SLOT_COUNT];
         for offset in &mut offsets {
             *offset = u32::try_from(size).map_err(|_| Error::FrameSizeOverflow)?;
-            size = size
-                .checked_add(FRAME_HEADER_SIZE)
-                .and_then(|value| value.checked_add(frame_size))
-                .ok_or(Error::FrameSizeOverflow)?;
+            size = size.checked_add(FRAME_HEADER_SIZE).and_then(|value| value.checked_add(frame_size)).ok_or(Error::FrameSizeOverflow)?;
             size = align_32(size)?;
         }
         u32::try_from(size).map_err(|_| Error::FrameSizeOverflow)?;
-        Ok(Self {
-            total_size: size,
-            offsets,
-            frame_size,
-        })
+        Ok(Self { total_size: size, offsets, frame_size })
     }
 }
 
 fn align_32(size: usize) -> Result<usize> {
-    size.checked_add(31)
-        .map(|value| value & !31)
-        .ok_or(Error::FrameSizeOverflow)
+    size.checked_add(31).map(|value| value & !31).ok_or(Error::FrameSizeOverflow)
 }
 
 const _: () = {
@@ -143,10 +134,7 @@ mod tests {
 
     #[test]
     fn layout_rejects_size_overflow() {
-        assert_eq!(
-            QueueLayout::calculate(usize::MAX),
-            Err(Error::FrameSizeOverflow)
-        );
+        assert_eq!(QueueLayout::calculate(usize::MAX), Err(Error::FrameSizeOverflow));
     }
 
     #[test]

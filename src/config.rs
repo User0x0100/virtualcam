@@ -25,10 +25,7 @@ pub struct ObsFrameRate {
 
 impl Default for ObsFrameRate {
     fn default() -> Self {
-        Self {
-            numerator: 30,
-            denominator: 1,
-        }
+        Self { numerator: 30, denominator: 1 }
     }
 }
 
@@ -197,11 +194,7 @@ pub(crate) struct ValidatedUnityCaptureOptions {
 #[cfg(windows)]
 impl ObsOptions {
     pub(crate) fn validate(self) -> Result<ValidatedObsOptions> {
-        if self.width == 0
-            || self.height == 0
-            || !self.width.is_multiple_of(2)
-            || !self.height.is_multiple_of(2)
-        {
+        if self.width == 0 || self.height == 0 || !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
             return Err(Error::InvalidDimensions);
         }
         if self.frame_rate.numerator == 0 || self.frame_rate.denominator == 0 {
@@ -209,8 +202,7 @@ impl ObsOptions {
         }
 
         let frame_size = PixelFormat::Nv12.frame_size(self.width, self.height)?;
-        let interval = u128::from(self.frame_rate.denominator) * 10_000_000
-            / u128::from(self.frame_rate.numerator);
+        let interval = u128::from(self.frame_rate.denominator) * 10_000_000 / u128::from(self.frame_rate.numerator);
         let interval_100ns = u64::try_from(interval).map_err(|_| Error::InvalidFrameRate)?;
         if interval_100ns == 0 {
             return Err(Error::InvalidFrameRate);
@@ -229,11 +221,7 @@ impl ObsOptions {
 #[cfg(windows)]
 impl UnityCaptureOptions {
     pub(crate) fn validate(self) -> Result<ValidatedUnityCaptureOptions> {
-        if self.width == 0
-            || self.height == 0
-            || self.width > i32::MAX as u32
-            || self.height > i32::MAX as u32
-        {
+        if self.width == 0 || self.height == 0 || self.width > i32::MAX as u32 || self.height > i32::MAX as u32 {
             return Err(Error::InvalidDimensions);
         }
         if self.capture_number > Self::MAX_CAPTURE_NUMBER {
@@ -249,11 +237,7 @@ impl UnityCaptureOptions {
         }
         let frame_size = usize::try_from(stride_pixels)
             .ok()
-            .and_then(|stride| {
-                usize::try_from(self.height)
-                    .ok()
-                    .and_then(|height| stride.checked_mul(height))
-            })
+            .and_then(|stride| usize::try_from(self.height).ok().and_then(|height| stride.checked_mul(height)))
             .and_then(|pixels| pixels.checked_mul(self.format.bytes_per_pixel()))
             .ok_or(Error::FrameSizeOverflow)?;
         if frame_size > Self::MAX_FRAME_BYTES || u32::try_from(frame_size).is_err() {
@@ -285,10 +269,7 @@ mod tests {
             ObsOptions {
                 width: 1920,
                 height: 1080,
-                frame_rate: ObsFrameRate {
-                    numerator: 30,
-                    denominator: 1,
-                },
+                frame_rate: ObsFrameRate { numerator: 30, denominator: 1 },
                 force_open: false,
             }
         );
@@ -312,64 +293,30 @@ mod tests {
         let options = ObsOptions {
             width: 2,
             height: 2,
-            frame_rate: ObsFrameRate {
-                numerator: 30_000,
-                denominator: 1001,
-            },
+            frame_rate: ObsFrameRate { numerator: 30_000, denominator: 1001 },
             force_open: false,
         };
-        assert_eq!(
-            options.validate().expect("valid rate").interval_100ns,
-            333_666
-        );
+        assert_eq!(options.validate().expect("valid rate").interval_100ns, 333_666);
 
         for frame_rate in [
-            ObsFrameRate {
-                numerator: 0,
-                denominator: 1,
-            },
-            ObsFrameRate {
-                numerator: 1,
-                denominator: 0,
-            },
-            ObsFrameRate {
-                numerator: u32::MAX,
-                denominator: 1,
-            },
+            ObsFrameRate { numerator: 0, denominator: 1 },
+            ObsFrameRate { numerator: 1, denominator: 0 },
+            ObsFrameRate { numerator: u32::MAX, denominator: 1 },
         ] {
-            assert!(matches!(
-                ObsOptions {
-                    frame_rate,
-                    ..options
-                }
-                .validate(),
-                Err(Error::InvalidFrameRate)
-            ));
+            assert!(matches!(ObsOptions { frame_rate, ..options }.validate(), Err(Error::InvalidFrameRate)));
         }
     }
 
     #[test]
     fn obs_rejects_zero_and_odd_nv12_dimensions() {
         for (width, height) in [(0, 2), (2, 0), (3, 2), (2, 3)] {
-            assert!(matches!(
-                ObsOptions {
-                    width,
-                    height,
-                    ..ObsOptions::default()
-                }
-                .validate(),
-                Err(Error::InvalidDimensions)
-            ));
+            assert!(matches!(ObsOptions { width, height, ..ObsOptions::default() }.validate(), Err(Error::InvalidDimensions)));
         }
     }
 
     #[test]
     fn unity_formats_and_stride_produce_upstream_data_sizes() {
-        for (format, bytes_per_pixel) in [
-            (UnityCaptureFormat::Rgba8, 4),
-            (UnityCaptureFormat::Rgba16FloatGamma, 8),
-            (UnityCaptureFormat::Rgba16FloatLinear, 8),
-        ] {
+        for (format, bytes_per_pixel) in [(UnityCaptureFormat::Rgba8, 4), (UnityCaptureFormat::Rgba16FloatGamma, 8), (UnityCaptureFormat::Rgba16FloatLinear, 8)] {
             let validated = UnityCaptureOptions {
                 width: 3,
                 height: 2,

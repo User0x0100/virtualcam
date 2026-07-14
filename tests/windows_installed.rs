@@ -2,11 +2,7 @@
 
 use std::sync::Mutex;
 
-use virtualcam::{
-    CameraType, Error, ObsFrameRate, ObsOptions, PixelFormat, UnityCaptureFormat,
-    UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode, VirtualCamera,
-    WriteStatus,
-};
+use virtualcam::{CameraType, Error, ObsFrameRate, ObsOptions, PixelFormat, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode, VirtualCamera, WriteStatus};
 
 // Both installed-driver tests touch globally named protocol objects. Serializing
 // them also makes failures easier to attribute when they are explicitly enabled.
@@ -32,34 +28,18 @@ fn tiny_unity_options() -> UnityCaptureOptions {
 #[test]
 #[ignore = "requires an installed, idle OBS Virtual Camera"]
 fn installed_obs_covers_metadata_publication_occupancy_and_lifecycle() {
-    let _serial = INSTALLED_DRIVER_LOCK
-        .lock()
-        .expect("installed-driver test lock");
-    let mut camera = VirtualCamera::open_obs(tiny_obs_options())
-        .expect("OBS Virtual Camera must be installed and idle");
+    let _serial = INSTALLED_DRIVER_LOCK.lock().expect("installed-driver test lock");
+    let mut camera = VirtualCamera::open_obs(tiny_obs_options()).expect("OBS Virtual Camera must be installed and idle");
 
     assert_eq!(camera.camera_type(), CameraType::Obs);
     assert_eq!(camera.native_format(), PixelFormat::Nv12);
     assert_eq!(camera.frame_size(), 6);
     assert!(camera.is_open());
     assert_eq!(camera.is_ready(), Ok(true));
-    assert_eq!(
-        camera.write_host(&[0; 5]),
-        Err(Error::FrameSizeMismatch {
-            expected: 6,
-            actual: 5,
-        })
-    );
+    assert_eq!(camera.write_host(&[0; 5]), Err(Error::FrameSizeMismatch { expected: 6, actual: 5 }));
 
-    assert!(matches!(
-        VirtualCamera::open_obs(tiny_obs_options()),
-        Err(Error::DeviceInUse)
-    ));
-    for frame in [
-        [16, 16, 16, 16, 128, 128],
-        [32, 32, 32, 32, 96, 160],
-        [235, 235, 235, 235, 128, 128],
-    ] {
+    assert!(matches!(VirtualCamera::open_obs(tiny_obs_options()), Err(Error::DeviceInUse)));
+    for frame in [[16, 16, 16, 16, 128, 128], [32, 32, 32, 32, 96, 160], [235, 235, 235, 235, 128, 128]] {
         assert_eq!(camera.write_host(&frame), Ok(WriteStatus::Written));
     }
 
@@ -76,10 +56,7 @@ fn installed_obs_covers_metadata_publication_occupancy_and_lifecycle() {
         assert_eq!(
             // SAFETY: Length mismatch is intentionally rejected before pointer use.
             unsafe { camera.write_cuda(std::ptr::null(), camera.frame_size() - 1, None) },
-            Err(Error::FrameSizeMismatch {
-                expected: 6,
-                actual: 5,
-            })
+            Err(Error::FrameSizeMismatch { expected: 6, actual: 5 })
         );
     }
 
@@ -90,55 +67,31 @@ fn installed_obs_covers_metadata_publication_occupancy_and_lifecycle() {
     assert_eq!(camera.write_host(&[0; 6]), Err(Error::AlreadyClosed));
 
     // Normal reopen proves the previous mapping handle and view were released.
-    let reopened = VirtualCamera::open_obs(tiny_obs_options())
-        .expect("OBS mapping must be reusable after close");
+    let reopened = VirtualCamera::open_obs(tiny_obs_options()).expect("OBS mapping must be reusable after close");
     drop(reopened);
 
     // With no competing writer, force mode remains a valid explicit open path.
-    let mut forced = VirtualCamera::open_obs(ObsOptions {
-        force_open: true,
-        ..tiny_obs_options()
-    })
-    .expect("force-open OBS while idle");
-    assert_eq!(
-        forced.write_host(&[16, 16, 16, 16, 128, 128]),
-        Ok(WriteStatus::Written)
-    );
+    let mut forced = VirtualCamera::open_obs(ObsOptions { force_open: true, ..tiny_obs_options() }).expect("force-open OBS while idle");
+    assert_eq!(forced.write_host(&[16, 16, 16, 16, 128, 128]), Ok(WriteStatus::Written));
     forced.close().expect("close force-open OBS producer");
 }
 
 #[test]
 #[ignore = "requires an installed Unity Capture virtual camera"]
 fn installed_unity_covers_inactive_or_active_consumer_and_lifecycle() {
-    let _serial = INSTALLED_DRIVER_LOCK
-        .lock()
-        .expect("installed-driver test lock");
-    let mut camera = VirtualCamera::open_unity_capture(tiny_unity_options())
-        .expect("Unity Capture must be installed for this process architecture");
+    let _serial = INSTALLED_DRIVER_LOCK.lock().expect("installed-driver test lock");
+    let mut camera = VirtualCamera::open_unity_capture(tiny_unity_options()).expect("Unity Capture must be installed for this process architecture");
 
     assert_eq!(camera.camera_type(), CameraType::UnityCapture);
     assert_eq!(camera.native_format(), PixelFormat::Rgba8);
     assert_eq!(camera.frame_size(), 16);
     assert!(camera.is_open());
-    assert_eq!(
-        camera.write_host(&[0; 15]),
-        Err(Error::FrameSizeMismatch {
-            expected: 16,
-            actual: 15,
-        })
-    );
+    assert_eq!(camera.write_host(&[0; 15]), Err(Error::FrameSizeMismatch { expected: 16, actual: 15 }));
 
     let ready_before_write = camera.is_ready().expect("query Unity readiness");
-    let rgba = [
-        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
-    ];
-    let status = camera
-        .write_host(&rgba)
-        .expect("publish or report inactivity");
-    assert!(matches!(
-        status,
-        WriteStatus::Written | WriteStatus::FrameSkippedByConsumer | WriteStatus::ConsumerInactive
-    ));
+    let rgba = [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255];
+    let status = camera.write_host(&rgba).expect("publish or report inactivity");
+    assert!(matches!(status, WriteStatus::Written | WriteStatus::FrameSkippedByConsumer | WriteStatus::ConsumerInactive));
     if ready_before_write {
         assert_ne!(status, WriteStatus::ConsumerInactive);
     }
@@ -169,11 +122,6 @@ fn installed_unity_covers_inactive_or_active_consumer_and_lifecycle() {
     .expect("Unity producer reopens with non-default controls");
     assert_eq!(controlled.native_format(), PixelFormat::Rgba16FloatLinear);
     assert_eq!(controlled.frame_size(), 32);
-    assert!(matches!(
-        controlled.write_host(&[0; 32]),
-        Ok(WriteStatus::Written
-            | WriteStatus::FrameSkippedByConsumer
-            | WriteStatus::ConsumerInactive)
-    ));
+    assert!(matches!(controlled.write_host(&[0; 32]), Ok(WriteStatus::Written | WriteStatus::FrameSkippedByConsumer | WriteStatus::ConsumerInactive)));
     controlled.close().expect("close controlled Unity producer");
 }

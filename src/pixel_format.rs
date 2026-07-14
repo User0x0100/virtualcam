@@ -29,14 +29,9 @@ impl PixelFormat {
         let height = usize::try_from(height).map_err(|_| Error::FrameSizeOverflow)?;
         let pixels = width.checked_mul(height).ok_or(Error::FrameSizeOverflow)?;
         match self {
-            Self::Nv12 => pixels
-                .checked_mul(3)
-                .map(|bytes| bytes / 2)
-                .ok_or(Error::FrameSizeOverflow),
+            Self::Nv12 => pixels.checked_mul(3).map(|bytes| bytes / 2).ok_or(Error::FrameSizeOverflow),
             Self::Rgba8 => pixels.checked_mul(4).ok_or(Error::FrameSizeOverflow),
-            Self::Rgba16FloatGamma | Self::Rgba16FloatLinear => {
-                pixels.checked_mul(8).ok_or(Error::FrameSizeOverflow)
-            }
+            Self::Rgba16FloatGamma | Self::Rgba16FloatLinear => pixels.checked_mul(8).ok_or(Error::FrameSizeOverflow),
         }
     }
 }
@@ -49,35 +44,20 @@ mod tests {
     fn computes_tightly_packed_sizes() {
         assert_eq!(PixelFormat::Nv12.frame_size(1920, 1080), Ok(3_110_400));
         assert_eq!(PixelFormat::Rgba8.frame_size(1920, 1080), Ok(8_294_400));
-        assert_eq!(
-            PixelFormat::Rgba16FloatGamma.frame_size(1920, 1080),
-            Ok(16_588_800)
-        );
-        assert_eq!(
-            PixelFormat::Rgba16FloatLinear.frame_size(1920, 1080),
-            Ok(16_588_800)
-        );
+        assert_eq!(PixelFormat::Rgba16FloatGamma.frame_size(1920, 1080), Ok(16_588_800));
+        assert_eq!(PixelFormat::Rgba16FloatLinear.frame_size(1920, 1080), Ok(16_588_800));
     }
 
     #[test]
     fn rejects_zero_and_odd_nv12_dimensions() {
         for (width, height) in [(0, 2), (2, 0), (3, 2), (2, 3)] {
-            assert_eq!(
-                PixelFormat::Nv12.frame_size(width, height),
-                Err(Error::InvalidDimensions)
-            );
+            assert_eq!(PixelFormat::Nv12.frame_size(width, height), Err(Error::InvalidDimensions));
         }
-        assert_eq!(
-            PixelFormat::Rgba16FloatLinear.frame_size(0, 2),
-            Err(Error::InvalidDimensions)
-        );
+        assert_eq!(PixelFormat::Rgba16FloatLinear.frame_size(0, 2), Err(Error::InvalidDimensions));
     }
 
     #[test]
     fn detects_rgba_size_overflow() {
-        assert_eq!(
-            PixelFormat::Rgba8.frame_size(u32::MAX, u32::MAX),
-            Err(Error::FrameSizeOverflow)
-        );
+        assert_eq!(PixelFormat::Rgba8.frame_size(u32::MAX, u32::MAX), Err(Error::FrameSizeOverflow));
     }
 }

@@ -66,9 +66,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedPlatform => {
-                formatter.write_str("virtual cameras are unsupported on this platform")
-            }
+            Self::UnsupportedPlatform => formatter.write_str("virtual cameras are unsupported on this platform"),
             Self::BackendUnavailable(backend) => {
                 write!(formatter, "{backend:?} virtual camera is not installed")
             }
@@ -76,32 +74,17 @@ impl fmt::Display for Error {
             Self::InvalidFrameRate => formatter.write_str("invalid frame rate"),
             Self::FrameSizeOverflow => formatter.write_str("frame or shared-memory size overflow"),
             Self::FrameSizeMismatch { expected, actual } => {
-                write!(
-                    formatter,
-                    "frame size mismatch: expected {expected} bytes, got {actual}"
-                )
+                write!(formatter, "frame size mismatch: expected {expected} bytes, got {actual}")
             }
             Self::DeviceInUse => formatter.write_str("virtual camera producer is already in use"),
-            Self::ExistingMappingTooSmall {
-                required,
-                available,
-            } => write!(
-                formatter,
-                "existing mapping is too small: requires {required} accessible bytes, has {available}"
-            ),
+            Self::ExistingMappingTooSmall { required, available } => write!(formatter, "existing mapping is too small: requires {required} accessible bytes, has {available}"),
             Self::ConsumerInactive => formatter.write_str("virtual camera consumer is inactive"),
             Self::AlreadyClosed => formatter.write_str("virtual camera is already closed"),
             Self::Windows { operation, code } => {
-                write!(
-                    formatter,
-                    "Win32 operation {operation} failed with code {code}"
-                )
+                write!(formatter, "Win32 operation {operation} failed with code {code}")
             }
             Self::Cuda { operation, code } => {
-                write!(
-                    formatter,
-                    "CUDA operation {operation} failed with code {code}"
-                )
+                write!(formatter, "CUDA operation {operation} failed with code {code}")
             }
             Self::Protocol { backend, detail } => {
                 write!(formatter, "{backend:?} protocol error: {detail}")

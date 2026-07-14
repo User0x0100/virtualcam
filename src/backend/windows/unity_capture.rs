@@ -1,22 +1,13 @@
-use windows_sys::Win32::{
-    Foundation::{ERROR_FILE_NOT_FOUND, GetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-    System::{
-        Memory::{FILE_MAP_WRITE, OpenFileMappingA},
-        Threading::{CreateEventA, EVENT_MODIFY_STATE, OpenEventA, SetEvent, WaitForSingleObject},
-        WindowsProgramming::OpenMutexA,
-    },
-};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, OpenFileMappingA};
+use windows_sys::Win32::System::Threading::{CreateEventA, EVENT_MODIFY_STATE, OpenEventA, SetEvent, WaitForSingleObject};
+use windows_sys::Win32::System::WindowsProgramming::OpenMutexA;
 
-use crate::{
-    CameraType, Error, Result, WriteStatus,
-    config::ValidatedUnityCaptureOptions,
-    platform::windows::{MappedView, MutexGuard, OwnedHandle, last_error},
-};
-
-use super::{
-    FrameSource,
-    protocol::unity_capture::{DATA_OFFSET, MAX_SHARED_IMAGE_SIZE, ObjectNames, SharedMemHeader},
-};
+use super::FrameSource;
+use super::protocol::unity_capture::{DATA_OFFSET, MAX_SHARED_IMAGE_SIZE, ObjectNames, SharedMemHeader};
+use crate::config::ValidatedUnityCaptureOptions;
+use crate::platform::windows::{MappedView, MutexGuard, OwnedHandle, last_error};
+use crate::{CameraType, Error, Result, WriteStatus};
 
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
@@ -47,8 +38,7 @@ impl UnityCaptureBackend {
     pub(crate) fn open(options: ValidatedUnityCaptureOptions, names: ObjectNames) -> Result<Self> {
         let width = i32::try_from(options.width).map_err(|_| Error::InvalidDimensions)?;
         let height = i32::try_from(options.height).map_err(|_| Error::InvalidDimensions)?;
-        let stride_pixels =
-            i32::try_from(options.stride_pixels).map_err(|_| Error::InvalidDimensions)?;
+        let stride_pixels = i32::try_from(options.stride_pixels).map_err(|_| Error::InvalidDimensions)?;
         let frame_size = u32::try_from(options.frame_size).map_err(|_| Error::FrameSizeOverflow)?;
         if options.frame_size > MAX_SHARED_IMAGE_SIZE {
             return Err(Error::InvalidDimensions);
@@ -113,9 +103,7 @@ impl UnityCaptureBackend {
                 detail: "frame exceeds receiver maxSize",
             });
         }
-        let required = DATA_OFFSET
-            .checked_add(self.frame_size as usize)
-            .ok_or(Error::FrameSizeOverflow)?;
+        let required = DATA_OFFSET.checked_add(self.frame_size as usize).ok_or(Error::FrameSizeOverflow)?;
         if view.accessible_len() < required {
             return Err(Error::Protocol {
                 backend: CameraType::UnityCapture,
@@ -131,19 +119,10 @@ impl UnityCaptureBackend {
         unsafe {
             core::ptr::write(core::ptr::addr_of_mut!((*header).width), self.width);
             core::ptr::write(core::ptr::addr_of_mut!((*header).height), self.height);
-            core::ptr::write(
-                core::ptr::addr_of_mut!((*header).stride),
-                self.stride_pixels,
-            );
+            core::ptr::write(core::ptr::addr_of_mut!((*header).stride), self.stride_pixels);
             core::ptr::write(core::ptr::addr_of_mut!((*header).format), self.format);
-            core::ptr::write(
-                core::ptr::addr_of_mut!((*header).resize_mode),
-                self.resize_mode,
-            );
-            core::ptr::write(
-                core::ptr::addr_of_mut!((*header).mirror_mode),
-                self.mirror_mode,
-            );
+            core::ptr::write(core::ptr::addr_of_mut!((*header).resize_mode), self.resize_mode);
+            core::ptr::write(core::ptr::addr_of_mut!((*header).mirror_mode), self.mirror_mode);
             core::ptr::write(core::ptr::addr_of_mut!((*header).timeout), self.timeout_ms);
         }
         // SAFETY: `required` validation proves the full data range is writable,
@@ -152,21 +131,13 @@ impl UnityCaptureBackend {
         frame.copy_to(destination)?;
         guard.release("ReleaseMutex(UnityCapture_Mutx)")?;
 
-        let sent = self
-            .sent_event
-            .as_ref()
-            .ok_or(Error::ConsumerInactive)?
-            .raw();
+        let sent = self.sent_event.as_ref().ok_or(Error::ConsumerInactive)?.raw();
         // SAFETY: `sent` is the live event opened with EVENT_MODIFY_STATE.
         if unsafe { SetEvent(sent) } == 0 {
             return Err(last_error("SetEvent(UnityCapture_Sent)"));
         }
 
-        let want = self
-            .want_event
-            .as_ref()
-            .ok_or(Error::ConsumerInactive)?
-            .raw();
+        let want = self.want_event.as_ref().ok_or(Error::ConsumerInactive)?.raw();
         // SAFETY: `want` is a live auto-reset event created by this sender. A zero
         // timeout implements upstream's non-blocking frame-skip test.
         let wait = unsafe { WaitForSingleObject(want, 0) };
@@ -192,8 +163,7 @@ impl UnityCaptureBackend {
         if self.mutex.is_none() {
             // SAFETY: Name is a stable NUL-terminated ANSI string. SYNCHRONIZE is
             // the exact sender access mask in `SharedImageMemory::Open(false)`.
-            let raw =
-                unsafe { OpenMutexA(SYNCHRONIZE_ACCESS, 0, self.names.mutex.as_ptr().cast()) };
+            let raw = unsafe { OpenMutexA(SYNCHRONIZE_ACCESS, 0, self.names.mutex.as_ptr().cast()) };
             if raw.is_null() {
                 // SAFETY: Read immediately after the failed OpenMutexA call.
                 let code = unsafe { GetLastError() };
@@ -211,8 +181,7 @@ impl UnityCaptureBackend {
             // sender-side CreateEventA in upstream Open(false).
             // SAFETY: Null security attributes and stable NUL-terminated name are
             // valid; the returned handle is checked before ownership is taken.
-            let raw =
-                unsafe { CreateEventA(std::ptr::null(), 0, 0, self.names.want.as_ptr().cast()) };
+            let raw = unsafe { CreateEventA(std::ptr::null(), 0, 0, self.names.want.as_ptr().cast()) };
             if raw.is_null() {
                 let error = last_error("CreateEventA(UnityCapture_Want)");
                 guard.release("ReleaseMutex(UnityCapture_Mutx/open error)")?;
@@ -239,8 +208,7 @@ impl UnityCaptureBackend {
 
         if self.mapping.is_none() {
             // SAFETY: Stable NUL-terminated name and exact FILE_MAP_WRITE access.
-            let raw =
-                unsafe { OpenFileMappingA(FILE_MAP_WRITE, 0, self.names.data.as_ptr().cast()) };
+            let raw = unsafe { OpenFileMappingA(FILE_MAP_WRITE, 0, self.names.data.as_ptr().cast()) };
             if raw.is_null() {
                 // SAFETY: `GetLastError` reads thread-local state immediately.
                 let code = unsafe { GetLastError() };
@@ -253,8 +221,7 @@ impl UnityCaptureBackend {
 
         if self.view.is_none() {
             let mapping = self.mapping.as_ref().ok_or(Error::ConsumerInactive)?.raw();
-            let view =
-                MappedView::map(mapping, FILE_MAP_WRITE, "MapViewOfFile(UnityCapture_Data)")?;
+            let view = MappedView::map(mapping, FILE_MAP_WRITE, "MapViewOfFile(UnityCapture_Data)")?;
             if view.accessible_len() < DATA_OFFSET {
                 guard.release("ReleaseMutex(UnityCapture_Mutx/open invalid mapping)")?;
                 return Err(Error::Protocol {
@@ -288,11 +255,7 @@ impl UnityCaptureBackend {
 pub(super) fn unity_clsid_key(capture_number: u8) -> String {
     // Upstream reserves base+1 for the property page, so device #2 begins at
     // base+2 while capture zero retains the architecture-specific base CLSID.
-    let suffix = if capture_number == 0 {
-        UNITY_CLSID_SUFFIX_BASE
-    } else {
-        UNITY_CLSID_SUFFIX_BASE + 1 + capture_number
-    };
+    let suffix = if capture_number == 0 { UNITY_CLSID_SUFFIX_BASE } else { UNITY_CLSID_SUFFIX_BASE + 1 + capture_number };
     format!("CLSID\\{{5C2CD55C-92AD-4999-8666-912BD3E700{suffix:02X}}}")
 }
 
@@ -315,28 +278,16 @@ fn missing_object_or_error(operation: &'static str, code: u32) -> Result<bool> {
 mod tests {
     use std::ffi::CString;
 
-    use windows_sys::Win32::{
-        Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0},
-        System::{
-            Memory::{CreateFileMappingA, FILE_MAP_WRITE, PAGE_READWRITE},
-            Threading::{CreateEventA, CreateMutexA, OpenEventA, SetEvent, WaitForSingleObject},
-        },
-    };
+    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Memory::{CreateFileMappingA, FILE_MAP_WRITE, PAGE_READWRITE};
+    use windows_sys::Win32::System::Threading::{CreateEventA, CreateMutexA, OpenEventA, SetEvent, WaitForSingleObject};
 
     use super::*;
-    use crate::backend::windows::protocol::unity_capture::{
-        MAX_SHARED_IMAGE_SIZE, SharedMemHeader,
-    };
-    use crate::{
-        UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode,
-    };
+    use crate::backend::windows::protocol::unity_capture::{MAX_SHARED_IMAGE_SIZE, SharedMemHeader};
+    use crate::{UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode};
 
     fn test_names(suffix: &str) -> ObjectNames {
-        let stem = format!(
-            "Local\\VirtualCamRustUnity_{}_{}",
-            std::process::id(),
-            suffix
-        );
+        let stem = format!("Local\\VirtualCamRustUnity_{}_{}", std::process::id(), suffix);
         ObjectNames {
             mutex: CString::new(format!("{stem}_Mutx")).expect("mutex name"),
             want: CString::new(format!("{stem}_Want")).expect("want name"),
@@ -388,23 +339,15 @@ mod tests {
 
     #[test]
     fn consumer_inactive_without_receiver_objects() {
-        let mut sender =
-            UnityCaptureBackend::open(validated(), test_names("inactive_without_receiver"))
-                .expect("construct sender state");
+        let mut sender = UnityCaptureBackend::open(validated(), test_names("inactive_without_receiver")).expect("construct sender state");
 
         assert_eq!(sender.is_ready(), Ok(false));
-        assert_eq!(
-            sender.write_frame(FrameSource::Host(&[0; 16])),
-            Ok(WriteStatus::ConsumerInactive)
-        );
+        assert_eq!(sender.write_frame(FrameSource::Host(&[0; 16])), Ok(WriteStatus::ConsumerInactive));
         assert!(sender.mutex.is_none());
         assert!(sender.want_event.is_none());
         sender.close().expect("close inactive sender");
         assert_eq!(sender.is_ready(), Err(Error::AlreadyClosed));
-        assert_eq!(
-            sender.write_frame(FrameSource::Host(&[0; 16])),
-            Err(Error::AlreadyClosed)
-        );
+        assert_eq!(sender.write_frame(FrameSource::Host(&[0; 16])), Err(Error::AlreadyClosed));
     }
 
     #[test]
@@ -412,14 +355,12 @@ mod tests {
         let receiver_names = test_names("partial_cleanup");
         let sender_names = test_names("partial_cleanup");
         // SAFETY: Null security attributes and a stable NUL-terminated test name.
-        let mutex_raw =
-            unsafe { CreateMutexA(std::ptr::null(), 0, receiver_names.mutex.as_ptr().cast()) };
+        let mutex_raw = unsafe { CreateMutexA(std::ptr::null(), 0, receiver_names.mutex.as_ptr().cast()) };
         assert!(!mutex_raw.is_null());
         // SAFETY: Successful CreateMutexA returned one owned handle.
         let _mutex = unsafe { OwnedHandle::from_raw(mutex_raw) };
 
-        let mut sender =
-            UnityCaptureBackend::open(validated(), sender_names).expect("construct sender state");
+        let mut sender = UnityCaptureBackend::open(validated(), sender_names).expect("construct sender state");
         assert_eq!(sender.is_ready(), Ok(false));
         assert!(sender.mutex.is_some());
         assert!(sender.want_event.is_some());
@@ -428,8 +369,7 @@ mod tests {
 
         // Prove the sender created the partial-handshake Want object.
         // SAFETY: Stable NUL-terminated name and exact modify access.
-        let want_raw =
-            unsafe { OpenEventA(EVENT_MODIFY_STATE, 0, receiver_names.want.as_ptr().cast()) };
+        let want_raw = unsafe { OpenEventA(EVENT_MODIFY_STATE, 0, receiver_names.want.as_ptr().cast()) };
         assert!(!want_raw.is_null());
         // SAFETY: Successful OpenEventA returned one owned handle.
         drop(unsafe { OwnedHandle::from_raw(want_raw) });
@@ -437,8 +377,7 @@ mod tests {
         sender.close().expect("close partial sender");
         // No handle should keep the sender-created event alive after close.
         // SAFETY: A failed named-object lookup returns null and sets last error.
-        let reopened =
-            unsafe { OpenEventA(EVENT_MODIFY_STATE, 0, receiver_names.want.as_ptr().cast()) };
+        let reopened = unsafe { OpenEventA(EVENT_MODIFY_STATE, 0, receiver_names.want.as_ptr().cast()) };
         assert!(reopened.is_null());
         // SAFETY: Read immediately after the failed OpenEventA call.
         assert_eq!(unsafe { GetLastError() }, ERROR_FILE_NOT_FOUND);
@@ -451,38 +390,30 @@ mod tests {
 
         // Receiver Open(true) creates the mutex first.
         // SAFETY: Null security attributes and stable NUL-terminated test name.
-        let mutex_raw =
-            unsafe { CreateMutexA(std::ptr::null(), 0, receiver_names.mutex.as_ptr().cast()) };
+        let mutex_raw = unsafe { CreateMutexA(std::ptr::null(), 0, receiver_names.mutex.as_ptr().cast()) };
         assert!(!mutex_raw.is_null());
         // SAFETY: Successful CreateMutexA returned one owned handle.
         let mutex = unsafe { OwnedHandle::from_raw(mutex_raw) };
 
-        let mut sender = UnityCaptureBackend::open(validated_with_controls(), sender_names)
-            .expect("construct sender state");
+        let mut sender = UnityCaptureBackend::open(validated_with_controls(), sender_names).expect("construct sender state");
         assert!(!sender.is_ready().expect("first handshake attempt"));
 
-        let receiver_guard =
-            MutexGuard::acquire(mutex.raw(), "WaitForSingleObject(test receiver mutex)")
-                .expect("receiver owns mutex");
+        let receiver_guard = MutexGuard::acquire(mutex.raw(), "WaitForSingleObject(test receiver mutex)").expect("receiver owns mutex");
         // Sender's first attempt created the automatic-reset want event.
         // SAFETY: Stable NUL-terminated name and exact receiver modify access.
-        let want_raw =
-            unsafe { OpenEventA(EVENT_MODIFY_STATE, 0, receiver_names.want.as_ptr().cast()) };
+        let want_raw = unsafe { OpenEventA(EVENT_MODIFY_STATE, 0, receiver_names.want.as_ptr().cast()) };
         assert!(!want_raw.is_null());
         // SAFETY: Successful OpenEventA returned one owned handle.
         let want = unsafe { OwnedHandle::from_raw(want_raw) };
 
         // Receiver creates the automatic-reset sent event.
         // SAFETY: Null security attributes, false reset/initial flags, stable name.
-        let sent_raw =
-            unsafe { CreateEventA(std::ptr::null(), 0, 0, receiver_names.sent.as_ptr().cast()) };
+        let sent_raw = unsafe { CreateEventA(std::ptr::null(), 0, 0, receiver_names.sent.as_ptr().cast()) };
         assert!(!sent_raw.is_null());
         // SAFETY: Successful CreateEventA returned one owned handle.
         let sent = unsafe { OwnedHandle::from_raw(sent_raw) };
 
-        let mapping_size = core::mem::size_of::<SharedMemHeader>()
-            .checked_add(MAX_SHARED_IMAGE_SIZE)
-            .expect("mapping size");
+        let mapping_size = core::mem::size_of::<SharedMemHeader>().checked_add(MAX_SHARED_IMAGE_SIZE).expect("mapping size");
         // SAFETY: Page-file mapping size follows receiver Open(true), with stable name.
         let mapping_raw = unsafe {
             CreateFileMappingA(
@@ -497,23 +428,13 @@ mod tests {
         assert!(!mapping_raw.is_null());
         // SAFETY: Successful CreateFileMappingA returned one owned handle.
         let mapping = unsafe { OwnedHandle::from_raw(mapping_raw) };
-        let receiver_view = MappedView::map(
-            mapping.raw(),
-            FILE_MAP_WRITE,
-            "MapViewOfFile(test Unity receiver)",
-        )
-        .expect("map receiver data");
+        let receiver_view = MappedView::map(mapping.raw(), FILE_MAP_WRITE, "MapViewOfFile(test Unity receiver)").expect("map receiver data");
         let header = receiver_view.as_ptr().cast::<SharedMemHeader>();
         // SAFETY: Receiver view contains the aligned header and owns the mutex.
         unsafe {
-            core::ptr::write(
-                core::ptr::addr_of_mut!((*header).max_size),
-                u32::try_from(MAX_SHARED_IMAGE_SIZE).expect("maximum fits DWORD"),
-            );
+            core::ptr::write(core::ptr::addr_of_mut!((*header).max_size), u32::try_from(MAX_SHARED_IMAGE_SIZE).expect("maximum fits DWORD"));
         }
-        receiver_guard
-            .release("ReleaseMutex(test receiver open)")
-            .expect("release receiver mutex");
+        receiver_guard.release("ReleaseMutex(test receiver open)").expect("release receiver mutex");
 
         assert!(sender.is_ready().expect("completed sender handshake"));
 
@@ -521,10 +442,7 @@ mod tests {
         // SAFETY: Receiver opened want with EVENT_MODIFY_STATE.
         assert_ne!(unsafe { SetEvent(want.raw()) }, 0);
         let frame = [7_u8; 48];
-        assert_eq!(
-            sender.write_frame(FrameSource::Host(&frame)),
-            Ok(WriteStatus::Written)
-        );
+        assert_eq!(sender.write_frame(FrameSource::Host(&frame)), Ok(WriteStatus::Written));
         // SAFETY: Receiver owns a live waitable sent-event handle.
         assert_eq!(unsafe { WaitForSingleObject(sent.raw(), 0) }, WAIT_OBJECT_0);
 
@@ -534,29 +452,14 @@ mod tests {
             assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).width)), 2);
             assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).height)), 2);
             assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).stride)), 3);
-            assert_eq!(
-                core::ptr::read(core::ptr::addr_of!((*header).format)),
-                UnityCaptureFormat::Rgba16FloatGamma as i32
-            );
-            assert_eq!(
-                core::ptr::read(core::ptr::addr_of!((*header).resize_mode)),
-                UnityCaptureResizeMode::Linear as i32
-            );
-            assert_eq!(
-                core::ptr::read(core::ptr::addr_of!((*header).mirror_mode)),
-                UnityCaptureMirrorMode::Horizontal as i32
-            );
+            assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).format)), UnityCaptureFormat::Rgba16FloatGamma as i32);
+            assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).resize_mode)), UnityCaptureResizeMode::Linear as i32);
+            assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).mirror_mode)), UnityCaptureMirrorMode::Horizontal as i32);
             assert_eq!(core::ptr::read(core::ptr::addr_of!((*header).timeout)), 250);
-            assert_eq!(
-                core::slice::from_raw_parts(receiver_view.as_ptr().add(DATA_OFFSET), frame.len()),
-                frame
-            );
+            assert_eq!(core::slice::from_raw_parts(receiver_view.as_ptr().add(DATA_OFFSET), frame.len()), frame);
         }
 
-        assert_eq!(
-            sender.write_frame(FrameSource::Host(&frame)),
-            Ok(WriteStatus::FrameSkippedByConsumer)
-        );
+        assert_eq!(sender.write_frame(FrameSource::Host(&frame)), Ok(WriteStatus::FrameSkippedByConsumer));
         // FrameSkippedByConsumer describes the absent Want request; the frame
         // data is still copied and Sent is still signaled by the protocol.
         // SAFETY: Receiver owns a live waitable Sent event handle.
@@ -595,61 +498,39 @@ mod tests {
         .expect("valid Unity Capture test configuration");
 
         // SAFETY: Null security attributes and stable NUL-terminated test name.
-        let mutex_raw =
-            unsafe { CreateMutexA(std::ptr::null(), 0, receiver_names.mutex.as_ptr().cast()) };
+        let mutex_raw = unsafe { CreateMutexA(std::ptr::null(), 0, receiver_names.mutex.as_ptr().cast()) };
         assert!(!mutex_raw.is_null());
         // SAFETY: Successful CreateMutexA returned one owned handle.
         let mutex = unsafe { OwnedHandle::from_raw(mutex_raw) };
 
-        let mut sender =
-            UnityCaptureBackend::open(config, sender_names).expect("construct sender state");
+        let mut sender = UnityCaptureBackend::open(config, sender_names).expect("construct sender state");
         assert_eq!(sender.is_ready(), Ok(false));
-        let receiver_guard =
-            MutexGuard::acquire(mutex.raw(), "WaitForSingleObject(test small mutex)")
-                .expect("receiver owns mutex");
+        let receiver_guard = MutexGuard::acquire(mutex.raw(), "WaitForSingleObject(test small mutex)").expect("receiver owns mutex");
 
         // SAFETY: The sender's first connection attempt created this named event.
-        let want_raw =
-            unsafe { OpenEventA(EVENT_MODIFY_STATE, 0, receiver_names.want.as_ptr().cast()) };
+        let want_raw = unsafe { OpenEventA(EVENT_MODIFY_STATE, 0, receiver_names.want.as_ptr().cast()) };
         assert!(!want_raw.is_null());
         // SAFETY: Successful OpenEventA returned one owned handle.
         let want = unsafe { OwnedHandle::from_raw(want_raw) };
         // SAFETY: Null attributes, auto reset, initially unsignaled, stable name.
-        let sent_raw =
-            unsafe { CreateEventA(std::ptr::null(), 0, 0, receiver_names.sent.as_ptr().cast()) };
+        let sent_raw = unsafe { CreateEventA(std::ptr::null(), 0, 0, receiver_names.sent.as_ptr().cast()) };
         assert!(!sent_raw.is_null());
         // SAFETY: Successful CreateEventA returned one owned handle.
         let sent = unsafe { OwnedHandle::from_raw(sent_raw) };
 
         // A 4 KiB view can hold the header but not the 16 KiB RGBA frame.
         // SAFETY: Page-file-backed mapping with a stable test-only name.
-        let mapping_raw = unsafe {
-            CreateFileMappingA(
-                INVALID_HANDLE_VALUE,
-                std::ptr::null(),
-                PAGE_READWRITE,
-                0,
-                4096,
-                receiver_names.data.as_ptr().cast(),
-            )
-        };
+        let mapping_raw = unsafe { CreateFileMappingA(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, 4096, receiver_names.data.as_ptr().cast()) };
         assert!(!mapping_raw.is_null());
         // SAFETY: Successful CreateFileMappingA returned one owned handle.
         let mapping = unsafe { OwnedHandle::from_raw(mapping_raw) };
-        let receiver_view = MappedView::map(
-            mapping.raw(),
-            FILE_MAP_WRITE,
-            "MapViewOfFile(test small Unity receiver)",
-        )
-        .expect("map small receiver data");
+        let receiver_view = MappedView::map(mapping.raw(), FILE_MAP_WRITE, "MapViewOfFile(test small Unity receiver)").expect("map small receiver data");
         let header = receiver_view.as_ptr().cast::<SharedMemHeader>();
         // SAFETY: The view contains the aligned max_size field under receiver lock.
         unsafe {
             core::ptr::write(core::ptr::addr_of_mut!((*header).max_size), u32::MAX);
         }
-        receiver_guard
-            .release("ReleaseMutex(test small receiver open)")
-            .expect("release receiver mutex");
+        receiver_guard.release("ReleaseMutex(test small receiver open)").expect("release receiver mutex");
 
         assert_eq!(sender.is_ready(), Ok(true));
         // SAFETY: Receiver owns a live Want event handle.

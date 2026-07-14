@@ -1,16 +1,9 @@
 use std::ptr::NonNull;
 
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0},
-    System::{
-        Memory::{
-            MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
-            VirtualQuery,
-        },
-        Registry::{HKEY, HKEY_CLASSES_ROOT, KEY_READ, RegCloseKey, RegOpenKeyExW},
-        Threading::{INFINITE, ReleaseMutex, WaitForSingleObject},
-    },
-};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0};
+use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile, VirtualQuery};
+use windows_sys::Win32::System::Registry::{HKEY, HKEY_CLASSES_ROOT, KEY_READ, RegCloseKey, RegOpenKeyExW};
+use windows_sys::Win32::System::Threading::{INFINITE, ReleaseMutex, WaitForSingleObject};
 
 use crate::{Error, Result};
 
@@ -58,11 +51,7 @@ pub(crate) struct MappedView {
 }
 
 impl MappedView {
-    pub(crate) fn map(
-        handle: HANDLE,
-        desired_access: u32,
-        operation: &'static str,
-    ) -> Result<Self> {
+    pub(crate) fn map(handle: HANDLE, desired_access: u32, operation: &'static str) -> Result<Self> {
         // SAFETY: `handle` is a live file-mapping handle. Offsets and length are
         // zero, requesting a view of the complete mapping as specified by both
         // upstream protocols.
@@ -74,13 +63,7 @@ impl MappedView {
         let mut info = MEMORY_BASIC_INFORMATION::default();
         // SAFETY: `ptr` came from a successful `MapViewOfFile`; `info` points to
         // writable storage of the exact structure size expected by VirtualQuery.
-        let queried = unsafe {
-            VirtualQuery(
-                ptr.as_ptr().cast(),
-                &mut info,
-                core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-            )
-        };
+        let queried = unsafe { VirtualQuery(ptr.as_ptr().cast(), &mut info, core::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
         if queried == 0 {
             // SAFETY: The successful mapped view is still owned locally and is
             // being unwound before returning the VirtualQuery error.
@@ -90,10 +73,7 @@ impl MappedView {
             return Err(last_error("VirtualQuery(mapped view)"));
         }
 
-        Ok(Self {
-            ptr,
-            accessible_len: info.RegionSize,
-        })
+        Ok(Self { ptr, accessible_len: info.RegionSize })
     }
 
     pub(crate) const fn as_ptr(&self) -> *mut u8 {
@@ -107,9 +87,7 @@ impl MappedView {
 
 impl Drop for MappedView {
     fn drop(&mut self) {
-        let address = MEMORY_MAPPED_VIEW_ADDRESS {
-            Value: self.ptr.as_ptr().cast(),
-        };
+        let address = MEMORY_MAPPED_VIEW_ADDRESS { Value: self.ptr.as_ptr().cast() };
         // SAFETY: `address` is the base returned by `MapViewOfFile` and this
         // owner unmaps it exactly once before its mapping handle is dropped.
         unsafe {
@@ -128,10 +106,7 @@ impl MutexGuard {
         // SAFETY: `handle` is a live mutex handle with synchronization access.
         let result = unsafe { WaitForSingleObject(handle, INFINITE) };
         match result {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self {
-                handle,
-                acquired: true,
-            }),
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self { handle, acquired: true }),
             WAIT_FAILED => Err(last_error(operation)),
             _ => Err(Error::Protocol {
                 backend: crate::CameraType::UnityCapture,

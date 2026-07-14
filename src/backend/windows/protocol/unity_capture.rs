@@ -1,6 +1,5 @@
-use std::ffi::CString;
-
 use core::mem::{align_of, offset_of, size_of};
+use std::ffi::CString;
 
 use crate::{CameraType, Error, Result, UnityCaptureOptions};
 

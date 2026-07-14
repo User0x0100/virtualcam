@@ -2,14 +2,13 @@ mod obs;
 mod protocol;
 mod unity_capture;
 
-use crate::{
-    CameraType, Error, Result, WriteStatus,
-    config::{ValidatedObsOptions, ValidatedUnityCaptureOptions},
-    platform::windows::registry_key_exists,
-};
-
-use self::protocol::{obs::VIDEO_NAME, unity_capture::ObjectNames};
-use self::{obs::ObsBackend, unity_capture::UnityCaptureBackend};
+use self::obs::ObsBackend;
+use self::protocol::obs::VIDEO_NAME;
+use self::protocol::unity_capture::ObjectNames;
+use self::unity_capture::UnityCaptureBackend;
+use crate::config::{ValidatedObsOptions, ValidatedUnityCaptureOptions};
+use crate::platform::windows::registry_key_exists;
+use crate::{CameraType, Error, Result, WriteStatus};
 #[cfg(feature = "cuda")]
 use crate::{CudaStream, cuda};
 
@@ -43,21 +42,10 @@ impl FrameSource<'_> {
                 Ok(())
             }
             #[cfg(feature = "cuda")]
-            Self::Cuda {
-                device_pointer,
-                byte_len,
-                stream,
-            } => {
+            Self::Cuda { device_pointer, byte_len, stream } => {
                 // SAFETY: Constructed only by write_cuda_frame after the public
                 // caller accepted the device-pointer and stream contract.
-                unsafe {
-                    cuda::copy_device_to_shared_memory(
-                        destination,
-                        device_pointer,
-                        byte_len,
-                        stream,
-                    )
-                }
+                unsafe { cuda::copy_device_to_shared_memory(destination, device_pointer, byte_len, stream) }
             }
         }
     }
@@ -80,8 +68,7 @@ impl Backend {
         if !registry_key_exists(&unity_capture::unity_clsid_key(options.capture_number)) {
             return Err(Error::BackendUnavailable(CameraType::UnityCapture));
         }
-        UnityCaptureBackend::open(options, ObjectNames::for_capture(options.capture_number)?)
-            .map(Self::UnityCapture)
+        UnityCaptureBackend::open(options, ObjectNames::for_capture(options.capture_number)?).map(Self::UnityCapture)
     }
 
     pub(crate) fn is_ready(&mut self) -> Result<bool> {
@@ -99,12 +86,7 @@ impl Backend {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) unsafe fn write_cuda_frame(
-        &mut self,
-        device_source: *const core::ffi::c_void,
-        byte_len: usize,
-        stream: Option<CudaStream>,
-    ) -> Result<WriteStatus> {
+    pub(crate) unsafe fn write_cuda_frame(&mut self, device_source: *const core::ffi::c_void, byte_len: usize, stream: Option<CudaStream>) -> Result<WriteStatus> {
         let frame = FrameSource::Cuda {
             device_pointer: device_source,
             byte_len,

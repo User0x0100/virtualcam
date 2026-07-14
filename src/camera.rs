@@ -1,11 +1,11 @@
-use std::{marker::PhantomData, rc::Rc};
+use std::marker::PhantomData;
+use std::rc::Rc;
 
 #[cfg(windows)]
 use crate::backend::Backend;
-use crate::{CameraType, Error, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
-
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaStream;
+use crate::{CameraType, Error, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
 
 /// Unified producer facade for a selected virtual-camera backend.
 ///
@@ -191,12 +191,7 @@ impl VirtualCamera {
     /// must remain usable only until this method returns; `close` performs no CUDA
     /// operation.
     #[cfg(feature = "cuda")]
-    pub unsafe fn write_cuda(
-        &mut self,
-        device_ptr: *const core::ffi::c_void,
-        byte_len: usize,
-        stream: Option<CudaStream>,
-    ) -> Result<WriteStatus> {
+    pub unsafe fn write_cuda(&mut self, device_ptr: *const core::ffi::c_void, byte_len: usize, stream: Option<CudaStream>) -> Result<WriteStatus> {
         if self.closed {
             return Err(Error::AlreadyClosed);
         }

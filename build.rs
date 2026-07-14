@@ -1,11 +1,10 @@
-use std::{env, path::PathBuf};
+use std::env;
+use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
-    if env::var_os("CARGO_FEATURE_CUDA").is_none()
-        || env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
-    {
+    if env::var_os("CARGO_FEATURE_CUDA").is_none() || env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
 
