@@ -37,6 +37,17 @@ impl Backend {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    pub(crate) fn write_frame_with(
+        &mut self,
+        write_frame: impl FnOnce(*mut u8, usize) -> Result<()>,
+    ) -> Result<WriteStatus> {
+        match self {
+            Self::Obs(backend) => backend.write_frame_with(write_frame),
+            Self::UnityCapture(backend) => backend.write_frame_with(write_frame),
+        }
+    }
+
     pub(crate) fn close(&mut self) -> Result<()> {
         match self {
             Self::Obs(backend) => backend.close(),

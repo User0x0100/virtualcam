@@ -93,6 +93,27 @@ impl UnityCaptureBackend {
     }
 
     pub(crate) fn write_host_frame(&mut self, frame: &[u8]) -> Result<WriteStatus> {
+        if frame.len() != self.frame_size as usize {
+            return Err(Error::FrameSizeMismatch {
+                expected: self.frame_size as usize,
+                actual: frame.len(),
+            });
+        }
+
+        self.write_frame_with(|destination, frame_size| {
+            // SAFETY: The backend holds the protocol mutex and provides the
+            // complete writable data range checked against `frame.len()` above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(frame.as_ptr(), destination, frame_size);
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn write_frame_with(
+        &mut self,
+        write_frame: impl FnOnce(*mut u8, usize) -> Result<()>,
+    ) -> Result<WriteStatus> {
         if !self.open {
             return Err(Error::AlreadyClosed);
         }
@@ -113,7 +134,7 @@ impl UnityCaptureBackend {
             });
         }
         let required = DATA_OFFSET
-            .checked_add(frame.len())
+            .checked_add(self.frame_size as usize)
             .ok_or(Error::FrameSizeOverflow)?;
         if view.accessible_len() < required {
             return Err(Error::Protocol {
@@ -126,8 +147,8 @@ impl UnityCaptureBackend {
         let guard = MutexGuard::acquire(mutex, "WaitForSingleObject(UnityCapture_Mutx)")?;
         // SAFETY: The mapped view is writable through FILE_MAP_WRITE and contains
         // `required` bytes. The current thread owns the protocol mutex. Each field
-        // is naturally aligned and uses the exact C ABI type. `frame` is a distinct
-        // tightly packed source of exactly `self.frame_size` bytes.
+        // is naturally aligned and uses the exact C ABI type. The callback must
+        // finish the complete frame write before returning.
         unsafe {
             core::ptr::write(core::ptr::addr_of_mut!((*header).width), self.width);
             core::ptr::write(core::ptr::addr_of_mut!((*header).height), self.height);
@@ -145,12 +166,11 @@ impl UnityCaptureBackend {
                 self.mirror_mode,
             );
             core::ptr::write(core::ptr::addr_of_mut!((*header).timeout), self.timeout_ms);
-            core::ptr::copy_nonoverlapping(
-                frame.as_ptr(),
-                view.as_ptr().add(DATA_OFFSET),
-                frame.len(),
-            );
         }
+        // SAFETY: `required` validation proves the full data range is writable,
+        // and `guard` keeps the receiver out until the callback has completed.
+        let destination = unsafe { view.as_ptr().add(DATA_OFFSET) };
+        write_frame(destination, self.frame_size as usize)?;
         guard.release("ReleaseMutex(UnityCapture_Mutx)")?;
 
         let sent = self
@@ -526,7 +546,30 @@ mod tests {
         // SAFETY: Receiver opened want with EVENT_MODIFY_STATE.
         assert_ne!(unsafe { SetEvent(want.raw()) }, 0);
         let frame = [7_u8; 48];
-        assert_eq!(sender.write_host_frame(&frame), Ok(WriteStatus::Written));
+        // SAFETY: The connected sender view contains its complete data field.
+        let expected_destination = unsafe {
+            sender
+                .view
+                .as_ref()
+                .expect("sender view remains connected")
+                .as_ptr()
+                .add(DATA_OFFSET)
+        };
+        let mut direct_destination = core::ptr::null_mut();
+        assert_eq!(
+            sender.write_frame_with(|destination, frame_size| {
+                direct_destination = destination;
+                assert_eq!(frame_size, frame.len());
+                // SAFETY: Sender owns the protocol mutex and supplied the complete
+                // writable data field to this callback.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(frame.as_ptr(), destination, frame_size);
+                }
+                Ok(())
+            }),
+            Ok(WriteStatus::Written)
+        );
+        assert_eq!(direct_destination, expected_destination);
         // SAFETY: Receiver owns a live waitable sent-event handle.
         assert_eq!(unsafe { WaitForSingleObject(sent.raw(), 0) }, WAIT_OBJECT_0);
 
@@ -563,6 +606,20 @@ mod tests {
         // data is still copied and Sent is still signaled by the protocol.
         // SAFETY: Receiver owns a live waitable Sent event handle.
         assert_eq!(unsafe { WaitForSingleObject(sent.raw(), 0) }, WAIT_OBJECT_0);
+
+        let copy_error = Error::Cuda {
+            operation: "cudaStreamSynchronize",
+            code: 29,
+            message: None,
+        };
+        assert_eq!(
+            sender.write_frame_with(|_, _| Err(copy_error.clone())),
+            Err(copy_error)
+        );
+        // A failed direct writer releases the mutex through its guard and does
+        // not signal Sent or poll Want as if a complete frame had been published.
+        // SAFETY: Receiver owns a live waitable Sent event handle.
+        assert_eq!(unsafe { WaitForSingleObject(sent.raw(), 0) }, WAIT_TIMEOUT);
 
         // A receiver capacity regression is rejected without signaling Sent.
         // SAFETY: Receiver view contains the aligned header and stays mapped.

@@ -81,6 +81,11 @@ Rust coverage: `src/backend/windows/unity_capture.rs` and `src/backend/windows/p
 - Failed mutex waits/releases and event operations become errors with their exact Win32 code instead of being ignored.
 - The OBS application also writes `obs-virtualcam.txt` as a last-format fallback. This library owns only transfer/protocol resources and does not write application configuration files; a live queue carries its current dimensions and interval.
 - Unity's D3D11 texture readback and optional double-buffering are outside `SharedImageMemory::Send`; host/CUDA callers already provide an accessible buffer, so those plugin-only controls are not fabricated by this crate.
+- CUDA writes replace only the upstream CPU data-copy step: one Runtime D2H copy
+  targets the selected OBS slot or Unity data field directly, and that stream is
+  synchronized before OBS publication fields or Unity's mutex/event publication.
+  The mapped destination is contiguous virtual memory but is not registered or
+  page-locked by this crate.
 
 ## Upgrade checklist
 

@@ -1,13 +1,8 @@
-use std::{
-    ffi::{CStr, c_char, c_void},
-    ptr::NonNull,
-};
+use core::ffi::c_void;
 
-use crate::{Error, Result};
+use crate::Result;
 
-const CUDA_SUCCESS: i32 = 0;
-const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
-const CUDA_HOST_ALLOC_DEFAULT: u32 = 0;
+use cuda_runtime_api::{CUDA_MEMCPY_DEVICE_TO_HOST, cudaError_t};
 
 /// An opaque CUDA Runtime stream handle borrowed from the caller.
 #[repr(transparent)]
@@ -19,11 +14,10 @@ impl CudaStream {
     ///
     /// # Safety
     ///
-    /// `raw` must be a live CUDA Runtime stream compatible with the device
-    /// pointer and current context used for every call that receives this value.
-    /// The caller keeps the stream alive and destroys it only after outstanding
-    /// camera writes finish. A null value is accepted, but `None` more clearly
-    /// selects the CUDA default stream.
+    /// `raw` must be null, a live CUDA Runtime stream, or a CUDA-defined special
+    /// stream handle. It must be compatible with the device pointer and current
+    /// context used for every call that receives this value. The caller retains
+    /// ownership and must not destroy a live stream until the write returns.
     pub const unsafe fn from_raw(raw: *mut c_void) -> Self {
         Self(raw)
     }
@@ -34,674 +28,255 @@ impl CudaStream {
     }
 }
 
-#[derive(Clone, Copy)]
-struct CudaApi {
-    host_alloc: unsafe fn(*mut *mut c_void, usize, u32) -> i32,
-    free_host: unsafe fn(*mut c_void) -> i32,
-    memcpy_async: unsafe fn(*mut c_void, *const c_void, usize, i32, *mut c_void) -> i32,
-    stream_synchronize: unsafe fn(*mut c_void) -> i32,
-    error_string: unsafe fn(i32) -> *const c_char,
-}
-
-impl CudaApi {
-    const SYSTEM: Self = Self {
-        host_alloc: system_host_alloc,
-        free_host: system_free_host,
-        memcpy_async: system_memcpy_async,
-        stream_synchronize: system_stream_synchronize,
-        error_string: system_error_string,
-    };
-}
-
-pub(crate) struct CudaStaging {
-    pointer: Option<NonNull<u8>>,
-    len: usize,
-    api: CudaApi,
-}
-
-impl CudaStaging {
-    fn allocate(len: usize, api: CudaApi) -> Result<Self> {
-        let mut raw = std::ptr::null_mut();
-        // SAFETY: `raw` is writable pointer storage, `len` is the validated frame
-        // length, and default flags request a portable host-only staging allocation.
-        let code = unsafe { (api.host_alloc)(&mut raw, len, CUDA_HOST_ALLOC_DEFAULT) };
-        if code != CUDA_SUCCESS {
-            return Err(cuda_error(api, "cudaHostAlloc", code));
-        }
-        let Some(pointer) = NonNull::new(raw.cast::<u8>()) else {
-            return Err(Error::Cuda {
-                operation: "cudaHostAlloc",
-                code: CUDA_SUCCESS,
-                message: Some("CUDA reported success but returned a null pointer".to_owned()),
-            });
-        };
-        trace_debug!(len, "allocated CUDA pinned staging buffer");
-        Ok(Self {
-            pointer: Some(pointer),
-            len,
-            api,
-        })
-    }
-
-    unsafe fn copy_from_device(
-        &mut self,
-        device_pointer: *const c_void,
-        stream: Option<CudaStream>,
-    ) -> Result<&[u8]> {
-        let destination = self.pointer.ok_or(Error::Cuda {
-            operation: "cudaMemcpyAsync",
-            code: -1,
-            message: Some("pinned staging buffer was already released".to_owned()),
-        })?;
-        let raw_stream = stream.map_or(std::ptr::null_mut(), CudaStream::as_raw);
-        // SAFETY: The caller guarantees `device_pointer` is readable for
-        // `self.len` bytes on `raw_stream`; destination is our live pinned
-        // allocation of exactly that length. D2H kind is CUDA's enum value 2.
-        let copy_code = unsafe {
-            (self.api.memcpy_async)(
-                destination.as_ptr().cast(),
-                device_pointer,
-                self.len,
-                CUDA_MEMCPY_DEVICE_TO_HOST,
-                raw_stream,
-            )
-        };
-        if copy_code != CUDA_SUCCESS {
-            return Err(cuda_error(self.api, "cudaMemcpyAsync", copy_code));
-        }
-
-        // SAFETY: `raw_stream` is either the caller's live stream or null for the
-        // CUDA default stream. Waiting only this stream completes the preceding D2H.
-        let sync_code = unsafe { (self.api.stream_synchronize)(raw_stream) };
-        if sync_code != CUDA_SUCCESS {
-            return Err(cuda_error(self.api, "cudaStreamSynchronize", sync_code));
-        }
-
-        // SAFETY: Synchronization completed the full D2H into our allocation,
-        // which remains live and immutable through the returned shared slice.
-        Ok(unsafe { core::slice::from_raw_parts(destination.as_ptr(), self.len) })
-    }
-
-    pub(crate) fn release(&mut self) -> Result<()> {
-        let Some(pointer) = self.pointer.take() else {
-            return Ok(());
-        };
-        // SAFETY: Pointer came from this API table's successful cudaHostAlloc and
-        // is consumed exactly once. It is cleared even if a broken runtime cannot
-        // complete the release, preventing a panic or repeated invalid call.
-        let code = unsafe { (self.api.free_host)(pointer.as_ptr().cast()) };
-        if code == CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(cuda_error(self.api, "cudaFreeHost", code))
-        }
-    }
-}
-
-impl Drop for CudaStaging {
-    fn drop(&mut self) {
-        let _ = self.release();
-    }
-}
-
-pub(crate) unsafe fn transfer_then_publish<T>(
-    staging: &mut Option<CudaStaging>,
-    frame_size: usize,
-    device_pointer: *const c_void,
+/// Copies one contiguous device byte range directly into a backend-owned shared
+/// memory frame slot and waits for that stream before the backend publishes it.
+pub(crate) unsafe fn copy_device_to_shared_memory(
+    host_destination: *mut u8,
+    device_source: *const c_void,
+    byte_len: usize,
     stream: Option<CudaStream>,
-    publish: impl FnOnce(&[u8]) -> Result<T>,
-) -> Result<T> {
-    // SAFETY: Forwarded from VirtualCamera::write_cuda after exact byte-length
-    // validation; SYSTEM uses the declared CUDA Runtime entry points.
+) -> Result<()> {
+    let stream = stream.map_or(core::ptr::null_mut(), CudaStream::as_raw);
+    let memcpy_async = |destination, source, count, kind, stream| unsafe {
+        cuda_runtime_api::cudaMemcpyAsync(destination, source, count, kind, stream)
+    };
+    let stream_synchronize = |stream| unsafe { cuda_runtime_api::cudaStreamSynchronize(stream) };
+
+    // The closures keep the production FFI calls visible and direct while the
+    // small generic helper makes ordering and failure behavior testable without
+    // introducing a runtime API table or owning any CUDA resources.
     unsafe {
-        transfer_then_publish_with_api(
-            staging,
-            frame_size,
-            device_pointer,
+        copy_device_to_shared_memory_with(
+            host_destination,
+            device_source,
+            byte_len,
             stream,
-            CudaApi::SYSTEM,
-            publish,
+            memcpy_async,
+            stream_synchronize,
         )
     }
 }
 
-unsafe fn transfer_then_publish_with_api<T>(
-    staging: &mut Option<CudaStaging>,
-    frame_size: usize,
-    device_pointer: *const c_void,
-    stream: Option<CudaStream>,
-    api: CudaApi,
-    publish: impl FnOnce(&[u8]) -> Result<T>,
-) -> Result<T> {
-    if staging.is_none() {
-        *staging = Some(CudaStaging::allocate(frame_size, api)?);
-    }
-    let staging = staging.as_mut().ok_or(Error::Cuda {
-        operation: "cudaHostAlloc",
-        code: -1,
-        message: Some("staging allocation was not retained".to_owned()),
-    })?;
-    if staging.len != frame_size {
-        return Err(Error::FrameSizeMismatch {
-            expected: staging.len,
-            actual: frame_size,
-        });
-    }
-    // SAFETY: The caller provides the CUDA pointer/stream validity contract;
-    // allocation and stream synchronization are completed before publication.
-    let host_frame = unsafe { staging.copy_from_device(device_pointer, stream)? };
-    publish(host_frame)
-}
-
-fn cuda_error(api: CudaApi, operation: &'static str, code: i32) -> Error {
-    // SAFETY: CUDA accepts every cudaError_t value and returns a static string or
-    // null. The pointer, when non-null, remains valid for this immediate copy.
-    let message_pointer = unsafe { (api.error_string)(code) };
-    let message = if message_pointer.is_null() {
-        None
-    } else {
-        // SAFETY: A non-null cudaGetErrorString result is a NUL-terminated static
-        // C string owned by the CUDA Runtime.
-        Some(
-            unsafe { CStr::from_ptr(message_pointer) }
-                .to_string_lossy()
-                .into_owned(),
-        )
-    };
-    trace_warn!(operation, code, message = ?message, "CUDA Runtime operation failed");
-    Error::Cuda {
-        operation,
-        code,
-        message,
-    }
-}
-
-unsafe fn system_host_alloc(pointer: *mut *mut c_void, len: usize, flags: u32) -> i32 {
-    // SAFETY: Preconditions are supplied by CudaStaging::allocate.
-    unsafe { ffi::cuda_host_alloc(pointer, len, flags) }
-}
-
-unsafe fn system_free_host(pointer: *mut c_void) -> i32 {
-    // SAFETY: Preconditions are supplied by CudaStaging::release.
-    unsafe { ffi::cuda_free_host(pointer) }
-}
-
-unsafe fn system_memcpy_async(
-    destination: *mut c_void,
-    source: *const c_void,
-    len: usize,
-    kind: i32,
+unsafe fn copy_device_to_shared_memory_with<Memcpy, Synchronize>(
+    host_destination: *mut u8,
+    device_source: *const c_void,
+    byte_len: usize,
     stream: *mut c_void,
-) -> i32 {
-    // SAFETY: Preconditions are supplied by CudaStaging::copy_from_device.
-    unsafe { ffi::cuda_memcpy_async(destination, source, len, kind, stream) }
+    mut memcpy_async: Memcpy,
+    mut stream_synchronize: Synchronize,
+) -> Result<()>
+where
+    Memcpy: FnMut(*mut c_void, *const c_void, usize, i32, *mut c_void) -> cudaError_t,
+    Synchronize: FnMut(*mut c_void) -> cudaError_t,
+{
+    debug_assert!(!host_destination.is_null());
+    debug_assert!(!device_source.is_null());
+    debug_assert_ne!(byte_len, 0);
+
+    // SAFETY: The backend keeps this writable shared-memory slot reserved for
+    // `byte_len` bytes until synchronization. The public caller guarantees that
+    // `device_source` is a compatible readable CUDA range and `stream` is valid.
+    memcpy_async(
+        host_destination.cast(),
+        device_source,
+        byte_len,
+        CUDA_MEMCPY_DEVICE_TO_HOST,
+        stream,
+    )
+    .check("cudaMemcpyAsync")?;
+
+    // SAFETY: `stream` is the exact handle used for the preceding D2H copy. The
+    // backend cannot publish or release its slot until this wait succeeds.
+    stream_synchronize(stream).check("cudaStreamSynchronize")
 }
 
-unsafe fn system_stream_synchronize(stream: *mut c_void) -> i32 {
-    // SAFETY: Preconditions are supplied by CudaStaging::copy_from_device.
-    unsafe { ffi::cuda_stream_synchronize(stream) }
-}
+mod cuda_runtime_api {
+    use core::ffi::c_void;
 
-unsafe fn system_error_string(code: i32) -> *const c_char {
-    // SAFETY: CUDA defines this operation for cudaError_t values.
-    unsafe { ffi::cuda_get_error_string(code) }
-}
+    use crate::{Error, Result};
 
-mod ffi {
-    use super::{c_char, c_void};
+    pub(super) const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 
-    #[cfg(windows)]
-    #[cfg_attr(not(test), link(name = "cudart"))]
-    unsafe extern "system" {
-        #[link_name = "cudaHostAlloc"]
-        pub(super) fn cuda_host_alloc(pointer: *mut *mut c_void, size: usize, flags: u32) -> i32;
-        #[link_name = "cudaFreeHost"]
-        pub(super) fn cuda_free_host(pointer: *mut c_void) -> i32;
-        #[link_name = "cudaMemcpyAsync"]
-        pub(super) fn cuda_memcpy_async(
-            destination: *mut c_void,
-            source: *const c_void,
-            count: usize,
-            kind: i32,
-            stream: *mut c_void,
-        ) -> i32;
-        #[link_name = "cudaStreamSynchronize"]
-        pub(super) fn cuda_stream_synchronize(stream: *mut c_void) -> i32;
-        #[link_name = "cudaGetErrorString"]
-        pub(super) fn cuda_get_error_string(error: i32) -> *const c_char;
+    /// ABI-compatible representation of CUDA Runtime's `cudaError_t` enum.
+    #[allow(non_camel_case_types)]
+    #[repr(transparent)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct cudaError_t(pub(super) i32);
+
+    impl cudaError_t {
+        pub(super) fn check(self, operation: &'static str) -> Result<()> {
+            if self.0 == 0 {
+                Ok(())
+            } else {
+                trace_warn!(operation, code = self.0, "CUDA Runtime operation failed");
+                Err(Error::Cuda {
+                    operation,
+                    code: self.0,
+                    message: None,
+                })
+            }
+        }
     }
 
-    #[cfg(not(windows))]
-    #[cfg_attr(not(test), link(name = "cudart"))]
-    unsafe extern "C" {
-        #[link_name = "cudaHostAlloc"]
-        pub(super) fn cuda_host_alloc(pointer: *mut *mut c_void, size: usize, flags: u32) -> i32;
-        #[link_name = "cudaFreeHost"]
-        pub(super) fn cuda_free_host(pointer: *mut c_void) -> i32;
-        #[link_name = "cudaMemcpyAsync"]
-        pub(super) fn cuda_memcpy_async(
+    // CUDA's CUDARTAPI is __stdcall under MSVC. Rust's `system` ABI selects that
+    // convention on 32-bit Windows and the platform C ABI on 64-bit Windows.
+    #[link(name = "cudart")]
+    unsafe extern "system" {
+        pub(super) fn cudaMemcpyAsync(
             destination: *mut c_void,
             source: *const c_void,
             count: usize,
             kind: i32,
             stream: *mut c_void,
-        ) -> i32;
-        #[link_name = "cudaStreamSynchronize"]
-        pub(super) fn cuda_stream_synchronize(stream: *mut c_void) -> i32;
-        #[link_name = "cudaGetErrorString"]
-        pub(super) fn cuda_get_error_string(error: i32) -> *const c_char;
+        ) -> cudaError_t;
+        pub(super) fn cudaStreamSynchronize(stream: *mut c_void) -> cudaError_t;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::cell::RefCell;
 
     use super::*;
+    use crate::Error;
+
+    #[link(name = "cudart")]
+    unsafe extern "system" {
+        fn cudaMalloc(device_pointer: *mut *mut c_void, size: usize) -> cudaError_t;
+        fn cudaFree(device_pointer: *mut c_void) -> cudaError_t;
+        fn cudaMemcpy(
+            destination: *mut c_void,
+            source: *const c_void,
+            count: usize,
+            kind: i32,
+        ) -> cudaError_t;
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Call {
-        HostAlloc,
-        Memcpy { stream: usize },
-        Synchronize { stream: usize },
-        Publish,
-        FreeHost,
+        Copy {
+            destination: usize,
+            source: usize,
+            count: usize,
+            kind: i32,
+            stream: usize,
+        },
+        Synchronize {
+            stream: usize,
+        },
     }
-
-    struct MockState {
-        calls: Vec<Call>,
-        allocation: Option<Box<[u8]>>,
-        host_alloc_error: i32,
-        free_error: i32,
-        memcpy_error: i32,
-        sync_error: i32,
-        null_allocation: bool,
-        null_error_string: bool,
-        host_alloc_args: Option<(usize, u32)>,
-        memcpy_args: Vec<(usize, i32)>,
-    }
-
-    impl MockState {
-        const fn new() -> Self {
-            Self {
-                calls: Vec::new(),
-                allocation: None,
-                host_alloc_error: 0,
-                free_error: 0,
-                memcpy_error: 0,
-                sync_error: 0,
-                null_allocation: false,
-                null_error_string: false,
-                host_alloc_args: None,
-                memcpy_args: Vec::new(),
-            }
-        }
-    }
-
-    static SERIAL: Mutex<()> = Mutex::new(());
-    static STATE: Mutex<MockState> = Mutex::new(MockState::new());
-
-    fn reset() {
-        *STATE.lock().expect("mock state lock") = MockState::new();
-    }
-
-    unsafe fn host_alloc(pointer: *mut *mut c_void, len: usize, flags: u32) -> i32 {
-        let mut state = STATE.lock().expect("mock state lock");
-        state.calls.push(Call::HostAlloc);
-        state.host_alloc_args = Some((len, flags));
-        if state.host_alloc_error != 0 {
-            return state.host_alloc_error;
-        }
-        if state.null_allocation {
-            return 0;
-        }
-        let mut allocation = vec![0_u8; len].into_boxed_slice();
-        let raw = allocation.as_mut_ptr();
-        state.allocation = Some(allocation);
-        // SAFETY: Test passes writable pointer storage to this mock API.
-        unsafe { pointer.write(raw.cast()) };
-        0
-    }
-
-    unsafe fn free_host(_pointer: *mut c_void) -> i32 {
-        let mut state = STATE.lock().expect("mock state lock");
-        state.calls.push(Call::FreeHost);
-        state.allocation = None;
-        state.free_error
-    }
-
-    unsafe fn memcpy_async(
-        destination: *mut c_void,
-        source: *const c_void,
-        len: usize,
-        kind: i32,
-        stream: *mut c_void,
-    ) -> i32 {
-        let mut state = STATE.lock().expect("mock state lock");
-        state.calls.push(Call::Memcpy {
-            stream: stream as usize,
-        });
-        state.memcpy_args.push((len, kind));
-        if state.memcpy_error != 0 {
-            return state.memcpy_error;
-        }
-        drop(state);
-        // SAFETY: Test source and mock allocation each contain `len` bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(source.cast::<u8>(), destination.cast::<u8>(), len)
-        };
-        0
-    }
-
-    unsafe fn synchronize(stream: *mut c_void) -> i32 {
-        let mut state = STATE.lock().expect("mock state lock");
-        state.calls.push(Call::Synchronize {
-            stream: stream as usize,
-        });
-        state.sync_error
-    }
-
-    unsafe fn error_string(_code: i32) -> *const c_char {
-        if STATE.lock().expect("mock state lock").null_error_string {
-            std::ptr::null()
-        } else {
-            c"mock CUDA error".as_ptr()
-        }
-    }
-
-    const MOCK_API: CudaApi = CudaApi {
-        host_alloc,
-        free_host,
-        memcpy_async,
-        stream_synchronize: synchronize,
-        error_string,
-    };
 
     #[test]
-    fn default_and_supplied_streams_are_forwarded_and_staging_is_reused() {
-        let _serial = SERIAL.lock().expect("serial test lock");
-        reset();
+    fn copies_directly_to_supplied_shared_pointer_then_synchronizes_same_stream() {
+        let calls = RefCell::new(Vec::new());
         let source = [1_u8, 2, 3, 4];
-        let mut staging = None;
+        let mut shared_slot = [0_u8; 4];
+        let stream = 0x1234_usize as *mut c_void;
 
-        // SAFETY: Mock treats this host array as readable device memory.
+        // SAFETY: This test mock treats a host array as device-readable memory and
+        // copies only within the two live four-byte arrays.
         unsafe {
-            transfer_then_publish_with_api(
-                &mut staging,
-                source.len(),
+            copy_device_to_shared_memory_with(
+                shared_slot.as_mut_ptr(),
                 source.as_ptr().cast(),
-                None,
-                MOCK_API,
-                |frame| {
-                    assert_eq!(frame, source);
-                    STATE
-                        .lock()
-                        .expect("mock state lock")
-                        .calls
-                        .push(Call::Publish);
-                    Ok(())
+                source.len(),
+                stream,
+                |destination, source, count, kind, stream| {
+                    calls.borrow_mut().push(Call::Copy {
+                        destination: destination as usize,
+                        source: source as usize,
+                        count,
+                        kind,
+                        stream: stream as usize,
+                    });
+                    core::ptr::copy_nonoverlapping(
+                        source.cast::<u8>(),
+                        destination.cast::<u8>(),
+                        count,
+                    );
+                    cudaError_t(0)
+                },
+                |stream| {
+                    calls.borrow_mut().push(Call::Synchronize {
+                        stream: stream as usize,
+                    });
+                    cudaError_t(0)
                 },
             )
-            .expect("default stream transfer");
-        }
-        let stream_pointer = 0x1234_usize as *mut c_void;
-        // SAFETY: Mock accepts the sentinel stream and host source pointer.
-        unsafe {
-            transfer_then_publish_with_api(
-                &mut staging,
-                source.len(),
-                source.as_ptr().cast(),
-                Some(CudaStream::from_raw(stream_pointer)),
-                MOCK_API,
-                |_| {
-                    STATE
-                        .lock()
-                        .expect("mock state lock")
-                        .calls
-                        .push(Call::Publish);
-                    Ok(())
-                },
-            )
-            .expect("supplied stream transfer");
+            .expect("direct D2H succeeds");
         }
 
-        let calls = STATE.lock().expect("mock state lock").calls.clone();
+        assert_eq!(shared_slot, source);
         assert_eq!(
-            calls,
+            *calls.borrow(),
             vec![
-                Call::HostAlloc,
-                Call::Memcpy { stream: 0 },
-                Call::Synchronize { stream: 0 },
-                Call::Publish,
-                Call::Memcpy {
-                    stream: stream_pointer as usize
+                Call::Copy {
+                    destination: shared_slot.as_mut_ptr() as usize,
+                    source: source.as_ptr() as usize,
+                    count: source.len(),
+                    kind: CUDA_MEMCPY_DEVICE_TO_HOST,
+                    stream: stream as usize,
                 },
                 Call::Synchronize {
-                    stream: stream_pointer as usize
+                    stream: stream as usize,
                 },
-                Call::Publish,
-            ]
-        );
-        let state = STATE.lock().expect("mock state lock");
-        assert_eq!(state.host_alloc_args, Some((source.len(), 0)));
-        assert_eq!(state.memcpy_args, vec![(source.len(), 2); 2]);
-        drop(state);
-        staging
-            .as_mut()
-            .expect("staging allocated")
-            .release()
-            .expect("free staging");
-    }
-
-    #[test]
-    fn memcpy_failure_does_not_synchronize_or_publish() {
-        let _serial = SERIAL.lock().expect("serial test lock");
-        reset();
-        STATE.lock().expect("mock state lock").memcpy_error = 17;
-        let source = [0_u8; 4];
-        let mut staging = None;
-        // SAFETY: Mock accepts the host pointer as device memory.
-        let error = unsafe {
-            transfer_then_publish_with_api(
-                &mut staging,
-                source.len(),
-                source.as_ptr().cast(),
-                None,
-                MOCK_API,
-                |_| {
-                    STATE
-                        .lock()
-                        .expect("mock state lock")
-                        .calls
-                        .push(Call::Publish);
-                    Ok(())
-                },
-            )
-        }
-        .expect_err("copy must fail");
-        assert!(matches!(
-            error,
-            Error::Cuda {
-                operation: "cudaMemcpyAsync",
-                code: 17,
-                ..
-            }
-        ));
-        let calls = STATE.lock().expect("mock state lock").calls.clone();
-        assert_eq!(calls, vec![Call::HostAlloc, Call::Memcpy { stream: 0 }]);
-    }
-
-    #[test]
-    fn synchronize_failure_does_not_publish() {
-        let _serial = SERIAL.lock().expect("serial test lock");
-        reset();
-        STATE.lock().expect("mock state lock").sync_error = 29;
-        let source = [0_u8; 4];
-        let mut staging = None;
-        // SAFETY: Mock accepts the host pointer as device memory.
-        let error = unsafe {
-            transfer_then_publish_with_api(
-                &mut staging,
-                source.len(),
-                source.as_ptr().cast(),
-                None,
-                MOCK_API,
-                |_| {
-                    STATE
-                        .lock()
-                        .expect("mock state lock")
-                        .calls
-                        .push(Call::Publish);
-                    Ok(())
-                },
-            )
-        }
-        .expect_err("sync must fail");
-        assert!(matches!(
-            error,
-            Error::Cuda {
-                operation: "cudaStreamSynchronize",
-                code: 29,
-                ..
-            }
-        ));
-        let calls = STATE.lock().expect("mock state lock").calls.clone();
-        assert_eq!(
-            calls,
-            vec![
-                Call::HostAlloc,
-                Call::Memcpy { stream: 0 },
-                Call::Synchronize { stream: 0 },
             ]
         );
     }
 
     #[test]
-    fn allocation_failures_do_not_retain_staging() {
-        let _serial = SERIAL.lock().expect("serial test lock");
-        reset();
-        STATE.lock().expect("mock state lock").host_alloc_error = 7;
-        let source = [0_u8; 4];
-        let mut staging = None;
-        // SAFETY: Mock accepts the host pointer as device memory.
-        let error = unsafe {
-            transfer_then_publish_with_api(
-                &mut staging,
-                source.len(),
-                source.as_ptr().cast(),
-                None,
-                MOCK_API,
-                |_| Ok(()),
-            )
-        }
-        .expect_err("allocation must fail");
-        assert!(matches!(
-            error,
-            Error::Cuda {
-                operation: "cudaHostAlloc",
-                code: 7,
-                message: Some(message),
-            } if message == "mock CUDA error"
-        ));
-        assert!(staging.is_none());
-        assert_eq!(
-            STATE.lock().expect("mock state lock").calls,
-            vec![Call::HostAlloc]
-        );
-    }
+    fn null_stream_is_forwarded_unchanged() {
+        let source = [1_u8];
+        let mut destination = [0_u8];
 
-    #[test]
-    fn successful_null_allocation_is_reported_without_staging() {
-        let _serial = SERIAL.lock().expect("serial test lock");
-        reset();
-        STATE.lock().expect("mock state lock").null_allocation = true;
-        let source = [0_u8; 4];
-        let mut staging = None;
-        // SAFETY: Mock accepts the host pointer as device memory.
-        let error = unsafe {
-            transfer_then_publish_with_api(
-                &mut staging,
-                source.len(),
-                source.as_ptr().cast(),
-                None,
-                MOCK_API,
-                |_| Ok(()),
-            )
-        }
-        .expect_err("null allocation must fail");
-        assert!(matches!(
-            error,
-            Error::Cuda {
-                operation: "cudaHostAlloc",
-                code: 0,
-                message: Some(message),
-            } if message.contains("null pointer")
-        ));
-        assert!(staging.is_none());
-    }
-
-    #[test]
-    fn free_failure_is_returned_once_and_release_remains_idempotent() {
-        let _serial = SERIAL.lock().expect("serial test lock");
-        reset();
-        let source = [1_u8; 4];
-        let mut staging = None;
-        // SAFETY: Mock treats this host array as readable device memory.
+        // SAFETY: Mock pointers each cover the requested one byte.
         unsafe {
-            transfer_then_publish_with_api(
-                &mut staging,
-                source.len(),
+            copy_device_to_shared_memory_with(
+                destination.as_mut_ptr(),
                 source.as_ptr().cast(),
-                None,
-                MOCK_API,
-                |_| Ok(()),
+                1,
+                core::ptr::null_mut(),
+                |destination, source, count, _, stream| {
+                    assert!(stream.is_null());
+                    core::ptr::copy_nonoverlapping(
+                        source.cast::<u8>(),
+                        destination.cast::<u8>(),
+                        count,
+                    );
+                    cudaError_t(0)
+                },
+                |stream| {
+                    assert!(stream.is_null());
+                    cudaError_t(0)
+                },
             )
-            .expect("allocate staging");
+            .expect("null stream transfer succeeds");
         }
-        STATE.lock().expect("mock state lock").free_error = 41;
-        let buffer = staging.as_mut().expect("staging allocated");
-        assert!(matches!(
-            buffer.release(),
-            Err(Error::Cuda {
-                operation: "cudaFreeHost",
-                code: 41,
-                ..
-            })
-        ));
-        assert_eq!(buffer.release(), Ok(()));
-        let free_calls = STATE
-            .lock()
-            .expect("mock state lock")
-            .calls
-            .iter()
-            .filter(|call| **call == Call::FreeHost)
-            .count();
-        assert_eq!(free_calls, 1);
     }
 
     #[test]
-    fn null_cuda_error_string_is_preserved_as_absent() {
-        let _serial = SERIAL.lock().expect("serial test lock");
-        reset();
-        {
-            let mut state = STATE.lock().expect("mock state lock");
-            state.memcpy_error = 17;
-            state.null_error_string = true;
-        }
-        let source = [0_u8; 4];
-        let mut staging = None;
-        // SAFETY: Mock accepts the host pointer as device memory.
+    fn copy_failure_does_not_synchronize() {
+        let source = [0_u8];
+        let mut destination = [0_u8];
+        let synchronized = core::cell::Cell::new(false);
+
+        // SAFETY: The failing mock does not dereference either pointer.
         let error = unsafe {
-            transfer_then_publish_with_api(
-                &mut staging,
-                source.len(),
+            copy_device_to_shared_memory_with(
+                destination.as_mut_ptr(),
                 source.as_ptr().cast(),
-                None,
-                MOCK_API,
-                |_| Ok(()),
+                1,
+                core::ptr::null_mut(),
+                |_, _, _, _, _| cudaError_t(17),
+                |_| {
+                    synchronized.set(true);
+                    cudaError_t(0)
+                },
             )
         }
         .expect_err("copy must fail");
+
+        assert!(!synchronized.get());
         assert_eq!(
             error,
             Error::Cuda {
@@ -713,74 +288,122 @@ mod tests {
     }
 
     #[test]
-    fn publication_error_is_propagated_after_synchronization() {
-        let _serial = SERIAL.lock().expect("serial test lock");
-        reset();
-        let source = [0_u8; 4];
-        let mut staging = None;
-        let publish_error = Error::Protocol {
-            backend: crate::CameraType::Obs,
-            detail: "test publication failure",
-        };
-        // SAFETY: Mock accepts the host pointer as device memory.
+    fn synchronization_failure_is_returned_after_copy() {
+        let source = [9_u8];
+        let mut destination = [0_u8];
+
+        // SAFETY: Mock pointers each cover the requested one byte.
         let error = unsafe {
-            transfer_then_publish_with_api(
-                &mut staging,
-                source.len(),
+            copy_device_to_shared_memory_with(
+                destination.as_mut_ptr(),
                 source.as_ptr().cast(),
-                None,
-                MOCK_API,
-                |_| {
-                    STATE
-                        .lock()
-                        .expect("mock state lock")
-                        .calls
-                        .push(Call::Publish);
-                    Err::<(), _>(publish_error.clone())
+                1,
+                core::ptr::null_mut(),
+                |destination, source, count, _, _| {
+                    core::ptr::copy_nonoverlapping(
+                        source.cast::<u8>(),
+                        destination.cast::<u8>(),
+                        count,
+                    );
+                    cudaError_t(0)
                 },
+                |_| cudaError_t(29),
             )
         }
-        .expect_err("publication must fail");
-        assert_eq!(error, publish_error);
+        .expect_err("synchronization must fail");
+
+        assert_eq!(destination, source);
         assert_eq!(
-            STATE.lock().expect("mock state lock").calls,
-            vec![
-                Call::HostAlloc,
-                Call::Memcpy { stream: 0 },
-                Call::Synchronize { stream: 0 },
-                Call::Publish,
-            ]
+            error,
+            Error::Cuda {
+                operation: "cudaStreamSynchronize",
+                code: 29,
+                message: None,
+            }
         );
     }
 
     #[test]
-    fn retained_staging_rejects_a_different_frame_size_before_copy() {
-        let _serial = SERIAL.lock().expect("serial test lock");
-        reset();
-        let source = [0_u8; 8];
-        let mut staging = Some(CudaStaging::allocate(4, MOCK_API).expect("allocate staging"));
-        // SAFETY: Size mismatch is detected before the mock reads the pointer.
-        let error = unsafe {
-            transfer_then_publish_with_api(
-                &mut staging,
-                source.len(),
-                source.as_ptr().cast(),
-                None,
-                MOCK_API,
-                |_| Ok(()),
+    #[ignore = "requires a CUDA-capable device and Runtime"]
+    fn real_cuda_d2h_writes_directly_to_a_windows_shared_mapping() {
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            System::Memory::{CreateFileMappingW, FILE_MAP_ALL_ACCESS, PAGE_READWRITE},
+        };
+
+        use crate::platform::windows::{MappedView, OwnedHandle};
+
+        const MAPPING_SIZE: u32 = 4096;
+        const DESTINATION_OFFSET: usize = 32;
+        const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+
+        // SAFETY: An unnamed page-file-backed mapping with read/write protection.
+        let raw_mapping = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                core::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                MAPPING_SIZE,
+                core::ptr::null(),
+            )
+        };
+        assert!(!raw_mapping.is_null(), "CreateFileMappingW failed");
+        // SAFETY: Successful creation returned one uniquely owned handle.
+        let mapping = unsafe { OwnedHandle::from_raw(raw_mapping) };
+        let view = MappedView::map(
+            mapping.raw(),
+            FILE_MAP_ALL_ACCESS,
+            "MapViewOfFile(real CUDA test)",
+        )
+        .expect("map CUDA test shared memory");
+
+        let expected = [
+            0x10_u8, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0,
+        ];
+        let mut device_pointer = core::ptr::null_mut();
+        // SAFETY: Writable pointer storage receives an allocation of exact size.
+        unsafe { cudaMalloc(&mut device_pointer, expected.len()) }
+            .check("cudaMalloc")
+            .expect("allocate real CUDA test source");
+        assert!(!device_pointer.is_null());
+
+        // SAFETY: The destination allocation and source array each contain the
+        // requested bytes, and kind 1 is cudaMemcpyHostToDevice.
+        unsafe {
+            cudaMemcpy(
+                device_pointer,
+                expected.as_ptr().cast(),
+                expected.len(),
+                CUDA_MEMCPY_HOST_TO_DEVICE,
             )
         }
-        .expect_err("size mismatch must fail");
+        .check("cudaMemcpy")
+        .expect("initialize real CUDA test source");
+
+        // SAFETY: The mapped destination contains this entire range; the CUDA
+        // allocation is contiguous and readable until the synchronized call ends.
+        unsafe {
+            copy_device_to_shared_memory(
+                view.as_ptr().add(DESTINATION_OFFSET),
+                device_pointer,
+                expected.len(),
+                None,
+            )
+        }
+        .expect("copy CUDA data directly to shared mapping");
+
+        // SAFETY: Synchronization completed and the mapped range is still live.
         assert_eq!(
-            error,
-            Error::FrameSizeMismatch {
-                expected: 4,
-                actual: 8,
-            }
+            unsafe {
+                core::slice::from_raw_parts(view.as_ptr().add(DESTINATION_OFFSET), expected.len())
+            },
+            expected
         );
-        assert_eq!(
-            STATE.lock().expect("mock state lock").calls,
-            vec![Call::HostAlloc]
-        );
+
+        // SAFETY: Pointer came from the successful cudaMalloc above and is freed once.
+        unsafe { cudaFree(device_pointer) }
+            .check("cudaFree")
+            .expect("release real CUDA test source");
     }
 }

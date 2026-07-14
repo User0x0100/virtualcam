@@ -10,11 +10,11 @@
 //! the backend-specific open methods return [`Error::UnsupportedPlatform`] there.
 //!
 //! Host frames are published with [`VirtualCamera::write_host`]. With the `cuda`
-//! feature, `VirtualCamera::write_cuda` copies device memory into one reusable
-//! pinned host buffer, synchronizes only the supplied CUDA stream (or the CUDA
-//! default stream for `None`), and then uses the same host publication path. The
-//! caller remains responsible for CUDA device, context, stream, and runtime
-//! lifetime management.
+//! feature, `VirtualCamera::write_cuda` copies one contiguous device byte range
+//! directly into the backend's Windows shared-memory frame slot, synchronizes the
+//! supplied CUDA stream (or the null stream for `None`), and only then publishes
+//! it. The crate allocates no intermediate buffer; the caller remains responsible
+//! for CUDA device, context, stream, and runtime lifetime management.
 //!
 //! `force_open` is an OBS-only recovery escape hatch. It does not identify or
 //! stop another writer. Concurrent writers race on the protocol and produce
@@ -22,7 +22,7 @@
 //!
 //! # Features
 //!
-//! - `cuda`: direct CUDA Runtime FFI and pinned host staging.
+//! - `cuda`: direct CUDA Runtime D2H FFI with no crate-owned staging allocation.
 //! - `tracing`: emits diagnostic `tracing` events; no subscriber is installed.
 //!
 //! # Example

@@ -20,7 +20,7 @@ pub enum Error {
     InvalidFrameRate,
     /// A frame or shared-memory layout size overflowed its target integer type.
     FrameSizeOverflow,
-    /// A host or CUDA frame length did not match the configured tightly packed size.
+    /// A host or CUDA frame length did not match the configured contiguous layout.
     FrameSizeMismatch {
         /// Required byte length.
         expected: usize,
@@ -53,7 +53,9 @@ pub enum Error {
         operation: &'static str,
         /// Exact `cudaError_t` value.
         code: i32,
-        /// Runtime-provided error string, when available.
+        /// Optional runtime-provided error string. The direct CUDA binding in
+        /// this release preserves `operation` and the exact code and leaves this
+        /// field as `None` rather than calling another diagnostic FFI function.
         message: Option<String>,
     },
     /// Shared protocol state was incompatible with a safe publication.

@@ -129,13 +129,68 @@ unsafe {
 # }
 ```
 
-`None` passes a null `cudaStream_t` to the CUDA Runtime. `Some(CudaStream)` is forwarded unchanged. Each camera lazily owns one reusable pinned staging buffer:
+### Required contiguous layout
+
+`write_cuda` requires one contiguous, linear device-memory byte range. The range
+must start at `device_ptr`, remain readable through `device_ptr + byte_len`, and
+`byte_len` must equal `camera.frame_size()` exactly. The API performs one 1D copy;
+it does not accept separate plane pointers, CUDA arrays, textures, surfaces, or a
+source pitch argument.
+
+- OBS: the source is tightly packed NV12: `width * height` Y bytes immediately
+  followed by `width * height / 2` interleaved UV bytes. There is no row or
+  plane padding. A pitched CUDA allocation whose pitch differs from `width`
+  cannot be passed directly.
+- Unity Capture: the source is one contiguous sequence of
+  `stride_pixels * height * bytes_per_pixel` bytes. Row padding is allowed only
+  when the same `stride_pixels` is configured in `UnityCaptureOptions`; the
+  padding bytes are included in `frame_size()` and copied too. A CUDA pitch must
+  be divisible by the format's bytes per pixel before it can be represented by
+  `stride_pixels`.
+
+Host writes have the same layout requirement, although Rust's `&[u8]` already
+guarantees a contiguous byte range.
+
+### Direct shared-memory D2H behavior
+
+`None` passes a null `cudaStream_t`; `Some(CudaStream)` is forwarded unchanged.
+The frame-producing work must already be ordered before this copy in that stream,
+or be synchronized by the caller. The implementation performs exactly this
+crate-visible transfer sequence:
 
 ```text
-device memory -> pinned host staging -> backend shared memory
+cudaMemcpyAsync(camera shared-memory slot, device_ptr, frame_size,
+                cudaMemcpyDeviceToHost, stream)
+cudaStreamSynchronize(stream)
+publish the completed slot to the virtual-camera consumer
 ```
 
-The call submits `cudaMemcpyAsync`, waits only with `cudaStreamSynchronize(stream)`, and publishes after D2H completion. There are two copies per frame. The crate never calls `cudaSetDevice`, device/context initialization or switching APIs, `cudaDeviceSynchronize`, stream creation/destruction, `cudaHostRegister`, or `cudaHostUnregister`. The caller must keep the CUDA Runtime usable until `close`/drop releases the pinned allocation.
+There is no crate-owned CUDA allocation, pinned staging buffer, or second CPU
+copy. For OBS the selected queue slot is reserved until synchronization succeeds;
+for Unity the receiver mutex remains held through D2H and synchronization. A CUDA
+error prevents the slot/event from being published as a completed frame.
+
+The Windows shared-memory destination is one contiguous virtual address range,
+but it is an ordinary, unregistered mapping—not memory allocated by
+`cudaHostAlloc`, and this crate does not call `cudaHostRegister`. Consequently,
+CUDA may treat it as pageable memory: `cudaMemcpyAsync` can behave synchronously
+with respect to the host, and the CUDA driver may use internal staging. The crate
+guarantees that it allocates no intermediate frame buffer; it cannot guarantee
+that the CUDA Runtime/driver performs no internal allocation or staging, nor can
+it promise copy/compute overlap. See NVIDIA's
+[API synchronization behavior](https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html)
+and [`cudaMemcpyAsync` contract](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html).
+
+The call is synchronous from the crate user's perspective. On success the D2H
+copy is complete, the source may be reused, and the frame has been published.
+CUDA Runtime calls can also surface errors from earlier asynchronous work. The
+caller must initialize CUDA, select the correct device/current context, keep the
+source and stream valid until return, and maintain any required thread/context
+affinity. The crate never calls `cudaSetDevice`, context APIs,
+`cudaDeviceSynchronize`, stream creation/destruction, `cudaHostRegister`, or
+`cudaHostUnregister`. `close` and `Drop` make no CUDA calls. CUDA failures retain
+the failing operation and exact numeric `cudaError_t`; `Error::Cuda::message` is
+`None` because the minimal binding does not call `cudaGetErrorString`.
 
 On Windows, linking uses `cudart`; `build.rs` adds `%CUDA_PATH%\lib\x64` (or `Win32`) when that environment variable is present. The default build never compiles or links CUDA code.
 
@@ -164,10 +219,19 @@ See [UPSTREAM.md](UPSTREAM.md) for pinned protocol sources, exact ABI details, a
 The default suite uses real Win32 mappings, mutexes, and events under unique
 test-only names. It covers protocol layout, queue publication and wraparound,
 Unity's inactive/partial/active handshakes, resource cleanup, public API
-validation, and injected CUDA allocation/copy/synchronization/release failures:
+validation, direct shared-slot callbacks, and injected CUDA
+copy/synchronization failures:
 
 ```powershell
 cargo test --all-features
+```
+
+One ignored test performs real `cudaMalloc`/H2D followed by the library's D2H
+directly into an ordinary Windows shared mapping and verifies the bytes in that
+mapping. Run it on a CUDA-capable host with:
+
+```powershell
+cargo test --all-features cuda::tests::real_cuda_d2h_writes_directly_to_a_windows_shared_mapping -- --ignored --exact
 ```
 
 Two ignored tests exercise the globally named objects of the drivers installed

@@ -10,9 +10,10 @@ impl CudaStream {
     ///
     /// # Safety
     ///
-    /// `raw` must be a live CUDA Runtime stream compatible with the pointer and
-    /// current context used by the caller. Non-Windows virtual-camera operations
-    /// still return `UnsupportedPlatform`.
+    /// `raw` must be null, a live CUDA Runtime stream, or a CUDA-defined special
+    /// stream handle compatible with the pointer and current context used by the
+    /// caller. The caller retains ownership. Non-Windows virtual-camera
+    /// operations still return `UnsupportedPlatform`.
     pub const unsafe fn from_raw(raw: *mut c_void) -> Self {
         Self(raw)
     }

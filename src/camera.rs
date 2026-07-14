@@ -4,10 +4,10 @@ use std::{marker::PhantomData, rc::Rc};
 use crate::backend::Backend;
 use crate::{CameraType, Error, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
 
+#[cfg(all(feature = "cuda", windows))]
+use crate::cuda;
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaStream;
-#[cfg(all(feature = "cuda", windows))]
-use crate::cuda::{self, CudaStaging};
 
 /// Unified producer facade for a selected virtual-camera backend.
 ///
@@ -20,8 +20,6 @@ pub struct VirtualCamera {
     closed: bool,
     #[cfg(windows)]
     backend: Backend,
-    #[cfg(all(feature = "cuda", windows))]
-    cuda_staging: Option<CudaStaging>,
     not_send_or_sync: PhantomData<Rc<()>>,
 }
 
@@ -55,8 +53,6 @@ impl VirtualCamera {
                 frame_size: validated.frame_size,
                 closed: false,
                 backend,
-                #[cfg(all(feature = "cuda", windows))]
-                cuda_staging: None,
                 not_send_or_sync: PhantomData,
             })
         }
@@ -92,8 +88,6 @@ impl VirtualCamera {
                 frame_size: validated.frame_size,
                 closed: false,
                 backend,
-                #[cfg(all(feature = "cuda", windows))]
-                cuda_staging: None,
                 not_send_or_sync: PhantomData,
             })
         }
@@ -169,23 +163,35 @@ impl VirtualCamera {
         }
     }
 
-    /// Copies one device frame to reusable pinned host memory and publishes it.
+    /// Copies one contiguous device frame directly into virtual-camera shared
+    /// memory and publishes it after the copy stream has synchronized.
     ///
-    /// `None` passes a null `cudaStream_t` and therefore uses the caller's CUDA
-    /// default-stream mode. `Some(stream)` is passed through unchanged. This is
-    /// a synchronous publication API: success means D2H completed, the source
-    /// pointer may be reused, and the backend protocol has published the frame.
+    /// The crate allocates no CUDA or host staging buffer and performs no second
+    /// CPU copy. `None` passes a null `cudaStream_t`; `Some(stream)` is forwarded
+    /// unchanged. This remains a synchronous publication API: success means the
+    /// D2H operation and `cudaStreamSynchronize` completed, the source can be
+    /// reused, and the backend protocol published the frame.
+    ///
+    /// The destination is an unregistered Windows shared-memory mapping. It is a
+    /// contiguous virtual byte range, but the crate does not page-lock it. CUDA
+    /// may therefore apply its pageable-memory synchronization or internal
+    /// staging behavior; callers must not assume transfer/compute overlap.
     ///
     /// # Safety
     ///
-    /// `device_ptr` must remain readable for `byte_len` bytes until this method
-    /// returns and must belong to the CUDA device/context current on this thread.
-    /// `byte_len` must equal [`Self::frame_size`]. A supplied stream must be a
-    /// live `cudaStream_t` compatible with that pointer and context. The caller
-    /// must initialize the CUDA Runtime, select the device, establish/switch any
-    /// context, and keep both runtime and stream alive. This crate does none of
-    /// those operations and the runtime must remain usable until the camera is
-    /// closed so its pinned allocation can be freed.
+    /// `device_ptr..device_ptr + byte_len` must be one readable, contiguous CUDA
+    /// device-memory region until this method returns. It must already contain
+    /// exactly the backend's byte layout, including all planes and configured row
+    /// padding; CUDA arrays, textures, surfaces, and discontiguous planes are not
+    /// accepted by this pointer API. `byte_len` must equal [`Self::frame_size`].
+    ///
+    /// The pointer must belong to the CUDA device/context current on this thread.
+    /// A supplied stream must be a live compatible `cudaStream_t`, and all work
+    /// producing the frame must precede the D2H copy in that stream (or already be
+    /// synchronized). The caller initializes the Runtime, selects the device,
+    /// manages context switching, and owns the stream. The Runtime and stream
+    /// must remain usable only until this method returns; `close` performs no CUDA
+    /// operation.
     #[cfg(feature = "cuda")]
     pub unsafe fn write_cuda(
         &mut self,
@@ -217,25 +223,27 @@ impl VirtualCamera {
         #[cfg(windows)]
         {
             let backend = &mut self.backend;
-            // SAFETY: The caller upholds the device-pointer, current-context, and
-            // stream contracts documented above; `byte_len` was checked against
-            // the allocation size passed to CUDA and the backend frame size.
-            unsafe {
-                cuda::transfer_then_publish(
-                    &mut self.cuda_staging,
-                    self.frame_size,
-                    device_ptr,
-                    stream,
-                    |host_frame| backend.write_host_frame(host_frame),
-                )
-            }
+            backend.write_frame_with(|host_destination, destination_len| {
+                debug_assert_eq!(destination_len, byte_len);
+                // SAFETY: The caller upholds the source/context/stream contract;
+                // the backend keeps this exact shared-memory destination reserved
+                // and unpublished until this closure returns after synchronization.
+                unsafe {
+                    cuda::copy_device_to_shared_memory(
+                        host_destination,
+                        device_ptr,
+                        destination_len,
+                        stream,
+                    )
+                }
+            })
         }
     }
 
     /// Closes all resources owned by this instance.
     ///
-    /// Closing an already closed camera succeeds. CUDA deallocation errors are
-    /// returned but never panic; backend resources are still closed.
+    /// Closing an already closed camera succeeds. No CUDA API is called because
+    /// the camera owns no CUDA allocation, registration, context, or stream.
     pub fn close(&mut self) -> Result<()> {
         if self.closed {
             return Ok(());
@@ -247,19 +255,8 @@ impl VirtualCamera {
         #[cfg(not(windows))]
         let backend_result: Result<()> = Ok(());
 
-        #[cfg(all(feature = "cuda", windows))]
-        let cuda_result = if let Some(staging) = self.cuda_staging.as_mut() {
-            let result = staging.release();
-            self.cuda_staging = None;
-            result
-        } else {
-            Ok(())
-        };
-        #[cfg(not(all(feature = "cuda", windows)))]
-        let cuda_result: Result<()> = Ok(());
-
         trace_debug!(camera_type = ?self.camera_type, "virtual camera closed");
-        backend_result.and(cuda_result)
+        backend_result
     }
 }
 
