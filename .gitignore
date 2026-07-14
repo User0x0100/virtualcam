@@ -1,5 +1,6 @@
 /target
 /.upstream
+/.vscode
 *.pdb
 *.ilk
 *.exp
