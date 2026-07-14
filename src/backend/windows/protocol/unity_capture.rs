@@ -111,4 +111,25 @@ mod tests {
         let names = ObjectNames::for_capture(MAX_CAPTURE_NUMBER).expect("maximum capture number");
         assert_eq!(names.mutex.to_bytes(), b"UnityCapture_Mutxz");
     }
+
+    #[test]
+    fn rejects_capture_number_above_protocol_maximum() {
+        assert!(matches!(
+            ObjectNames::for_capture(MAX_CAPTURE_NUMBER + 1),
+            Err(Error::Protocol {
+                backend: CameraType::UnityCapture,
+                detail: "capture number exceeds Unity Capture protocol maximum",
+            })
+        ));
+    }
+
+    #[test]
+    fn protocol_constants_match_unity_capture_contract() {
+        assert_eq!(MAX_CAPTURE_NUMBER, 74);
+        assert_eq!(MAX_SHARED_IMAGE_SIZE, 66_355_200);
+        assert_eq!(FORMAT_UINT8, 0);
+        assert_eq!(RESIZE_MODE_DISABLED, 0);
+        assert_eq!(MIRROR_MODE_DISABLED, 0);
+        assert_eq!(DEFAULT_TIMEOUT_MS, 1000);
+    }
 }

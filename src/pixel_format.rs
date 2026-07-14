@@ -47,4 +47,26 @@ mod tests {
         assert_eq!(PixelFormat::Nv12.frame_size(1920, 1080), Ok(3_110_400));
         assert_eq!(PixelFormat::Rgba8.frame_size(1920, 1080), Ok(8_294_400));
     }
+
+    #[test]
+    fn rejects_zero_and_odd_nv12_dimensions() {
+        for (width, height) in [(0, 2), (2, 0), (3, 2), (2, 3)] {
+            assert_eq!(
+                PixelFormat::Nv12.frame_size(width, height),
+                Err(Error::InvalidDimensions)
+            );
+        }
+        assert_eq!(
+            PixelFormat::Rgba8.frame_size(0, 2),
+            Err(Error::InvalidDimensions)
+        );
+    }
+
+    #[test]
+    fn detects_rgba_size_overflow() {
+        assert_eq!(
+            PixelFormat::Rgba8.frame_size(u32::MAX, u32::MAX),
+            Err(Error::FrameSizeOverflow)
+        );
+    }
 }

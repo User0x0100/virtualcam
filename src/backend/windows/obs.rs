@@ -329,16 +329,33 @@ mod tests {
         );
 
         let frame = [1_u8, 2, 3, 4, 5, 6];
+        assert!(matches!(
+            forced.write_host_frame(&frame[..5]),
+            Err(Error::FrameSizeMismatch {
+                expected: 6,
+                actual: 5,
+            })
+        ));
+        // A rejected frame must not advance or publish queue state.
+        // SAFETY: `header` remains a live initialized queue header.
+        unsafe {
+            assert_eq!(core::ptr::read_volatile(addr_of!((*header).write_idx)), 0);
+            assert_eq!(core::ptr::read_volatile(addr_of!((*header).read_idx)), 0);
+            assert_eq!(core::ptr::read_volatile(addr_of!((*header).state)), 1);
+
+            // Exercise the backend's real volatile increment at u32 wraparound.
+            core::ptr::write_volatile(addr_of_mut!((*header).write_idx), u32::MAX);
+        }
         assert_eq!(forced.write_host_frame(&frame), Ok(WriteStatus::Written));
         // SAFETY: All fields and the selected slot are in the observer's live view.
         unsafe {
-            assert_eq!(core::ptr::read_volatile(addr_of!((*header).write_idx)), 1);
-            assert_eq!(core::ptr::read_volatile(addr_of!((*header).read_idx)), 1);
+            assert_eq!(core::ptr::read_volatile(addr_of!((*header).write_idx)), 0);
+            assert_eq!(core::ptr::read_volatile(addr_of!((*header).read_idx)), 0);
             assert_eq!(
                 core::ptr::read_volatile(addr_of!((*header).state)),
                 STATE_READY
             );
-            let slot = (*header).offsets[1] as usize;
+            let slot = (*header).offsets[0] as usize;
             assert!(core::ptr::read(observer.as_ptr().add(slot).cast::<u64>()) > 0);
             assert_eq!(
                 core::slice::from_raw_parts(observer.as_ptr().add(slot + 32), frame.len()),

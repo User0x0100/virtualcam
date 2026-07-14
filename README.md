@@ -83,3 +83,22 @@ The caller guarantees there is no other active producer. `force_open` cannot est
 - `tracing`: emits open/close, recovery, inactive-consumer, skip, and error events. The crate does not install a subscriber. Without this feature there is no `tracing` dependency or log formatting.
 
 See [UPSTREAM.md](UPSTREAM.md) for pinned protocol sources, exact ABI details, and intentional differences.
+
+## Testing
+
+The default suite uses real Win32 mappings, mutexes, and events under unique
+test-only names. It covers protocol layout, queue publication and wraparound,
+Unity's inactive/partial/active handshakes, resource cleanup, public API
+validation, and injected CUDA allocation/copy/synchronization/release failures:
+
+```powershell
+cargo test --all-features
+```
+
+Two ignored tests exercise the globally named objects of the drivers installed
+on the current Windows host. Close any OBS producer before running them; a Unity
+consumer may be open or closed because both states are valid and checked:
+
+```powershell
+cargo test --all-features --test windows_installed -- --ignored --test-threads=1
+```

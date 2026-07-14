@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn validates_frame_rate() {
-        for fps in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        for fps in [0.0, -1.0, f64::NAN, f64::INFINITY, 10_000_001.0, 1.0e-20] {
             let config = CameraConfig {
                 width: 2,
                 height: 2,
@@ -137,5 +137,31 @@ mod tests {
                 Err(Error::InvalidFrameRate)
             ));
         }
+    }
+
+    #[test]
+    fn rejects_zero_and_unrepresentable_unity_dimensions() {
+        for (width, height) in [(0, 2), (2, 0), (i32::MAX as u32 + 1, 2)] {
+            let config = CameraConfig {
+                width,
+                height,
+                fps: 30.0,
+            };
+            assert!(matches!(
+                config.validate(CameraType::UnityCapture),
+                Err(Error::InvalidDimensions)
+            ));
+        }
+    }
+
+    #[test]
+    fn obs_interval_uses_protocol_truncation() {
+        let config = CameraConfig {
+            width: 2,
+            height: 2,
+            fps: 30.0,
+        };
+        let validated = config.validate(CameraType::Obs).expect("valid config");
+        assert_eq!(validated.obs_interval_100ns, 333_333);
     }
 }

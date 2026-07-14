@@ -134,6 +134,35 @@ mod tests {
     }
 
     #[test]
+    fn tiny_layout_has_exact_protocol_offsets() {
+        let layout = QueueLayout::calculate(1).expect("valid layout");
+        assert_eq!(layout.offsets, [96, 160, 224]);
+        assert_eq!(layout.total_size, 288);
+        assert_eq!(layout.frame_size, 1);
+    }
+
+    #[test]
+    fn layout_rejects_size_overflow() {
+        assert_eq!(
+            QueueLayout::calculate(usize::MAX),
+            Err(Error::FrameSizeOverflow)
+        );
+    }
+
+    #[test]
+    fn new_header_initializes_protocol_state() {
+        let header = QueueHeader::new(640, 480, 333_333, [96, 128, 160]);
+        assert_eq!(header.write_idx, 0);
+        assert_eq!(header.read_idx, 0);
+        assert_eq!(header.state, STATE_STARTING);
+        assert_eq!(header.offsets, [96, 128, 160]);
+        assert_eq!(header.queue_type, 0);
+        assert_eq!((header.cx, header.cy), (640, 480));
+        assert_eq!(header.interval, 333_333);
+        assert_eq!(header.reserved, [0; 8]);
+    }
+
+    #[test]
     fn index_wraparound_matches_unsigned_long_modulo() {
         let wrapped = u32::MAX.wrapping_add(1);
         assert_eq!(wrapped, 0);

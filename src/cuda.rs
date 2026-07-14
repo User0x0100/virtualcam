@@ -311,8 +311,14 @@ mod tests {
     struct MockState {
         calls: Vec<Call>,
         allocation: Option<Box<[u8]>>,
+        host_alloc_error: i32,
+        free_error: i32,
         memcpy_error: i32,
         sync_error: i32,
+        null_allocation: bool,
+        null_error_string: bool,
+        host_alloc_args: Option<(usize, u32)>,
+        memcpy_args: Vec<(usize, i32)>,
     }
 
     impl MockState {
@@ -320,8 +326,14 @@ mod tests {
             Self {
                 calls: Vec::new(),
                 allocation: None,
+                host_alloc_error: 0,
+                free_error: 0,
                 memcpy_error: 0,
                 sync_error: 0,
+                null_allocation: false,
+                null_error_string: false,
+                host_alloc_args: None,
+                memcpy_args: Vec::new(),
             }
         }
     }
@@ -333,11 +345,18 @@ mod tests {
         *STATE.lock().expect("mock state lock") = MockState::new();
     }
 
-    unsafe fn host_alloc(pointer: *mut *mut c_void, len: usize, _flags: u32) -> i32 {
-        let mut allocation = vec![0_u8; len].into_boxed_slice();
-        let raw = allocation.as_mut_ptr();
+    unsafe fn host_alloc(pointer: *mut *mut c_void, len: usize, flags: u32) -> i32 {
         let mut state = STATE.lock().expect("mock state lock");
         state.calls.push(Call::HostAlloc);
+        state.host_alloc_args = Some((len, flags));
+        if state.host_alloc_error != 0 {
+            return state.host_alloc_error;
+        }
+        if state.null_allocation {
+            return 0;
+        }
+        let mut allocation = vec![0_u8; len].into_boxed_slice();
+        let raw = allocation.as_mut_ptr();
         state.allocation = Some(allocation);
         // SAFETY: Test passes writable pointer storage to this mock API.
         unsafe { pointer.write(raw.cast()) };
@@ -348,20 +367,21 @@ mod tests {
         let mut state = STATE.lock().expect("mock state lock");
         state.calls.push(Call::FreeHost);
         state.allocation = None;
-        0
+        state.free_error
     }
 
     unsafe fn memcpy_async(
         destination: *mut c_void,
         source: *const c_void,
         len: usize,
-        _kind: i32,
+        kind: i32,
         stream: *mut c_void,
     ) -> i32 {
         let mut state = STATE.lock().expect("mock state lock");
         state.calls.push(Call::Memcpy {
             stream: stream as usize,
         });
+        state.memcpy_args.push((len, kind));
         if state.memcpy_error != 0 {
             return state.memcpy_error;
         }
@@ -382,7 +402,11 @@ mod tests {
     }
 
     unsafe fn error_string(_code: i32) -> *const c_char {
-        c"mock CUDA error".as_ptr()
+        if STATE.lock().expect("mock state lock").null_error_string {
+            std::ptr::null()
+        } else {
+            c"mock CUDA error".as_ptr()
+        }
     }
 
     const MOCK_API: CudaApi = CudaApi {
@@ -458,6 +482,10 @@ mod tests {
                 Call::Publish,
             ]
         );
+        let state = STATE.lock().expect("mock state lock");
+        assert_eq!(state.host_alloc_args, Some((source.len(), 0)));
+        assert_eq!(state.memcpy_args, vec![(source.len(), 2); 2]);
+        drop(state);
         staging
             .as_mut()
             .expect("staging allocated")
@@ -545,6 +573,214 @@ mod tests {
                 Call::Memcpy { stream: 0 },
                 Call::Synchronize { stream: 0 },
             ]
+        );
+    }
+
+    #[test]
+    fn allocation_failures_do_not_retain_staging() {
+        let _serial = SERIAL.lock().expect("serial test lock");
+        reset();
+        STATE.lock().expect("mock state lock").host_alloc_error = 7;
+        let source = [0_u8; 4];
+        let mut staging = None;
+        // SAFETY: Mock accepts the host pointer as device memory.
+        let error = unsafe {
+            transfer_then_publish_with_api(
+                &mut staging,
+                source.len(),
+                source.as_ptr().cast(),
+                None,
+                MOCK_API,
+                |_| Ok(()),
+            )
+        }
+        .expect_err("allocation must fail");
+        assert!(matches!(
+            error,
+            Error::Cuda {
+                operation: "cudaHostAlloc",
+                code: 7,
+                message: Some(message),
+            } if message == "mock CUDA error"
+        ));
+        assert!(staging.is_none());
+        assert_eq!(
+            STATE.lock().expect("mock state lock").calls,
+            vec![Call::HostAlloc]
+        );
+    }
+
+    #[test]
+    fn successful_null_allocation_is_reported_without_staging() {
+        let _serial = SERIAL.lock().expect("serial test lock");
+        reset();
+        STATE.lock().expect("mock state lock").null_allocation = true;
+        let source = [0_u8; 4];
+        let mut staging = None;
+        // SAFETY: Mock accepts the host pointer as device memory.
+        let error = unsafe {
+            transfer_then_publish_with_api(
+                &mut staging,
+                source.len(),
+                source.as_ptr().cast(),
+                None,
+                MOCK_API,
+                |_| Ok(()),
+            )
+        }
+        .expect_err("null allocation must fail");
+        assert!(matches!(
+            error,
+            Error::Cuda {
+                operation: "cudaHostAlloc",
+                code: 0,
+                message: Some(message),
+            } if message.contains("null pointer")
+        ));
+        assert!(staging.is_none());
+    }
+
+    #[test]
+    fn free_failure_is_returned_once_and_release_remains_idempotent() {
+        let _serial = SERIAL.lock().expect("serial test lock");
+        reset();
+        let source = [1_u8; 4];
+        let mut staging = None;
+        // SAFETY: Mock treats this host array as readable device memory.
+        unsafe {
+            transfer_then_publish_with_api(
+                &mut staging,
+                source.len(),
+                source.as_ptr().cast(),
+                None,
+                MOCK_API,
+                |_| Ok(()),
+            )
+            .expect("allocate staging");
+        }
+        STATE.lock().expect("mock state lock").free_error = 41;
+        let buffer = staging.as_mut().expect("staging allocated");
+        assert!(matches!(
+            buffer.release(),
+            Err(Error::Cuda {
+                operation: "cudaFreeHost",
+                code: 41,
+                ..
+            })
+        ));
+        assert_eq!(buffer.release(), Ok(()));
+        let free_calls = STATE
+            .lock()
+            .expect("mock state lock")
+            .calls
+            .iter()
+            .filter(|call| **call == Call::FreeHost)
+            .count();
+        assert_eq!(free_calls, 1);
+    }
+
+    #[test]
+    fn null_cuda_error_string_is_preserved_as_absent() {
+        let _serial = SERIAL.lock().expect("serial test lock");
+        reset();
+        {
+            let mut state = STATE.lock().expect("mock state lock");
+            state.memcpy_error = 17;
+            state.null_error_string = true;
+        }
+        let source = [0_u8; 4];
+        let mut staging = None;
+        // SAFETY: Mock accepts the host pointer as device memory.
+        let error = unsafe {
+            transfer_then_publish_with_api(
+                &mut staging,
+                source.len(),
+                source.as_ptr().cast(),
+                None,
+                MOCK_API,
+                |_| Ok(()),
+            )
+        }
+        .expect_err("copy must fail");
+        assert_eq!(
+            error,
+            Error::Cuda {
+                operation: "cudaMemcpyAsync",
+                code: 17,
+                message: None,
+            }
+        );
+    }
+
+    #[test]
+    fn publication_error_is_propagated_after_synchronization() {
+        let _serial = SERIAL.lock().expect("serial test lock");
+        reset();
+        let source = [0_u8; 4];
+        let mut staging = None;
+        let publish_error = Error::Protocol {
+            backend: crate::CameraType::Obs,
+            detail: "test publication failure",
+        };
+        // SAFETY: Mock accepts the host pointer as device memory.
+        let error = unsafe {
+            transfer_then_publish_with_api(
+                &mut staging,
+                source.len(),
+                source.as_ptr().cast(),
+                None,
+                MOCK_API,
+                |_| {
+                    STATE
+                        .lock()
+                        .expect("mock state lock")
+                        .calls
+                        .push(Call::Publish);
+                    Err::<(), _>(publish_error.clone())
+                },
+            )
+        }
+        .expect_err("publication must fail");
+        assert_eq!(error, publish_error);
+        assert_eq!(
+            STATE.lock().expect("mock state lock").calls,
+            vec![
+                Call::HostAlloc,
+                Call::Memcpy { stream: 0 },
+                Call::Synchronize { stream: 0 },
+                Call::Publish,
+            ]
+        );
+    }
+
+    #[test]
+    fn retained_staging_rejects_a_different_frame_size_before_copy() {
+        let _serial = SERIAL.lock().expect("serial test lock");
+        reset();
+        let source = [0_u8; 8];
+        let mut staging = Some(CudaStaging::allocate(4, MOCK_API).expect("allocate staging"));
+        // SAFETY: Size mismatch is detected before the mock reads the pointer.
+        let error = unsafe {
+            transfer_then_publish_with_api(
+                &mut staging,
+                source.len(),
+                source.as_ptr().cast(),
+                None,
+                MOCK_API,
+                |_| Ok(()),
+            )
+        }
+        .expect_err("size mismatch must fail");
+        assert_eq!(
+            error,
+            Error::FrameSizeMismatch {
+                expected: 4,
+                actual: 8,
+            }
+        );
+        assert_eq!(
+            STATE.lock().expect("mock state lock").calls,
+            vec![Call::HostAlloc]
         );
     }
 }
