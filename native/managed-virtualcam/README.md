@@ -55,8 +55,11 @@ Registration is system-wide and therefore normally requires elevation. Before
 any register/rename/unregister mutation, the DLL resolves its own canonical path
 and requires it to be beneath the canonical Program Files directory; this prevents
 a machine-wide `InprocServer32` registration from pointing at a user-writable
-development directory. Copy the built DLL to a stable Program Files installation
-directory before registering cameras.
+development directory. The canonical `\\?\...` form is used only for this
+security comparison. The value persisted to `InprocServer32` is converted back to
+a normal DOS/UNC full path so COM/DirectShow activation does not depend on
+extended-length path handling. Copy the built DLL to a stable Program Files
+installation directory before registering cameras.
 
 Management mutations are serialized with a global named mutex. Rename and
 unregister use ordered rollback so a failing FilterMapper/COM/registry step keeps

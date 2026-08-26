@@ -155,6 +155,30 @@ bool PathIsWithin(const std::wstring &path, const std::wstring &directory)
     return directory.back() == L'\\' || boundary == L'\\';
 }
 
+HRESULT RegistryPathFromFinalPath(const std::wstring &final_path, std::wstring *out)
+{
+    if (!out) return E_POINTER;
+    constexpr wchar_t kExtendedPrefix[] = L"\\\\?\\";
+    constexpr wchar_t kExtendedUncPrefix[] = L"\\\\?\\UNC\\";
+    if (final_path.rfind(kExtendedUncPrefix, 0) == 0) {
+        *out = L"\\\\" + final_path.substr(std::size(kExtendedUncPrefix) - 1);
+        return S_OK;
+    }
+    if (final_path.rfind(kExtendedPrefix, 0) == 0) {
+        const std::wstring normal = final_path.substr(std::size(kExtendedPrefix) - 1);
+        // VOLUME_NAME_DOS normally yields a drive-letter path here. Do not
+        // persist volume-GUID/device syntax into COM registration if Windows
+        // cannot express the final module as an ordinary DOS path.
+        if (normal.size() < 3 || normal[1] != L':' || normal[2] != L'\\') {
+            return HRESULT_FROM_WIN32(ERROR_BAD_PATHNAME);
+        }
+        *out = normal;
+        return S_OK;
+    }
+    *out = final_path;
+    return S_OK;
+}
+
 HRESULT SecureModulePath(std::wstring *out)
 {
     if (!out) return E_POINTER;
@@ -163,23 +187,26 @@ HRESULT SecureModulePath(std::wstring *out)
     if (module_len == 0) return HRESULT_FROM_WIN32(GetLastError());
     if (module_len >= module_buffer.size() - 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
 
-    std::wstring module_path;
-    HRESULT hr = FinalPath(module_buffer.data(), &module_path);
+    std::wstring module_final_path;
+    HRESULT hr = FinalPath(module_buffer.data(), &module_final_path);
     if (FAILED(hr)) return hr;
 
     PWSTR program_files_raw = nullptr;
     hr = SHGetKnownFolderPath(FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, nullptr, &program_files_raw);
     if (FAILED(hr)) return hr;
-    std::wstring program_files;
-    hr = FinalPath(program_files_raw, &program_files);
+    std::wstring program_files_final_path;
+    hr = FinalPath(program_files_raw, &program_files_final_path);
     CoTaskMemFree(program_files_raw);
     if (FAILED(hr)) return hr;
 
-    if (!PathIsWithin(module_path, program_files)) {
+    if (!PathIsWithin(module_final_path, program_files_final_path)) {
         return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
     }
-    *out = std::move(module_path);
-    return S_OK;
+
+    // The canonical extended-length path is used only for the security check.
+    // COM registration receives an ordinary DOS/UNC full path because some
+    // activation paths do not reliably accept the \\?\ namespace form.
+    return RegistryPathFromFinalPath(module_final_path, out);
 }
 
 std::wstring GuidString(REFGUID guid)

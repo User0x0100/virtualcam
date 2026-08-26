@@ -1,12 +1,15 @@
 #![cfg(windows)]
 
+use std::ffi::OsString;
 use std::fs;
+use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
 use virtualcam::{CameraType, Error, FrameRate, ManagedCameraConfig, ManagedCameraId, ManagedCameraManager, ManagedStreamConfig, PixelFormat, VirtualCamera, WriteStatus};
+use windows_sys::Win32::System::Registry::{HKEY, HKEY_CLASSES_ROOT, KEY_READ, REG_SZ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW};
 
 struct RegistrationGuard {
     manager: ManagedCameraManager,
@@ -48,6 +51,34 @@ fn stream(width: u32, height: u32, fps: u32) -> ManagedStreamConfig {
         height,
         frame_rate: FrameRate { numerator: fps, denominator: 1 },
     }
+}
+
+fn registered_inproc_server(id: ManagedCameraId) -> PathBuf {
+    let mut key_path: Vec<u16> = format!("CLSID\\{id}\\InprocServer32").encode_utf16().collect();
+    key_path.push(0);
+    let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: `key_path` is NUL-terminated and `key` points to writable storage.
+    let status = unsafe { RegOpenKeyExW(HKEY_CLASSES_ROOT, key_path.as_ptr(), 0, KEY_READ, &mut key) };
+    assert_eq!(status, 0, "open managed InprocServer32");
+
+    let mut value_type = 0_u32;
+    let mut bytes = 0_u32;
+    // SAFETY: A null value name queries the default value; this call requests size only.
+    let status = unsafe { RegQueryValueExW(key, std::ptr::null(), std::ptr::null(), &mut value_type, std::ptr::null_mut(), &mut bytes) };
+    assert_eq!(status, 0, "query managed InprocServer32 size");
+    assert_eq!(value_type, REG_SZ);
+    assert!(bytes >= 2 && bytes.is_multiple_of(2));
+
+    let mut buffer = vec![0_u16; bytes as usize / 2];
+    // SAFETY: `buffer` has the byte capacity reported by the preceding registry query.
+    let status = unsafe { RegQueryValueExW(key, std::ptr::null(), std::ptr::null(), &mut value_type, buffer.as_mut_ptr().cast::<u8>(), &mut bytes) };
+    // SAFETY: Successful RegOpenKeyExW returned one owned registry key handle.
+    unsafe { RegCloseKey(key) };
+    assert_eq!(status, 0, "read managed InprocServer32");
+    assert_eq!(value_type, REG_SZ);
+
+    let end = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+    PathBuf::from(OsString::from_wide(&buffer[..end]))
 }
 
 fn capture_with_ffmpeg(name: &str, width: u32, height: u32, fps: u32, camera: &mut VirtualCamera) {
@@ -123,6 +154,10 @@ fn managed_driver_registers_enumerates_and_streams_runtime_formats() {
     let name = format!("VirtualCam NV12 Integration {}", std::process::id());
     let info = manager.register(ManagedCameraConfig { name: name.clone() }).expect("register managed camera");
     let guard = RegistrationGuard { manager: manager.clone(), id: info.id };
+    let registered_driver = registered_inproc_server(info.id);
+    let registered_text = registered_driver.to_string_lossy();
+    assert!(!registered_text.starts_with(r"\\?\"), "InprocServer32 must use a normal DOS path, got {registered_text}");
+    assert_eq!(registered_driver, installed_driver, "InprocServer32 should persist the stable Program Files DLL path");
 
     // `open` must validate the DLL that COM will actually load, not merely the
     // manager's own DLL path. Temporarily hide InprocServer32's target while a
