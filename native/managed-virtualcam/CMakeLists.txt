@@ -16,7 +16,7 @@ add_library(virtualcam-managed SHARED
 target_compile_features(virtualcam-managed PRIVATE cxx_std_17)
 target_compile_definitions(virtualcam-managed PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(virtualcam-managed PRIVATE /W4 /permissive- /EHsc)
-target_link_libraries(virtualcam-managed PRIVATE ole32 oleaut32 advapi32 shell32 strmiids)
+target_link_libraries(virtualcam-managed PRIVATE ole32 oleaut32 advapi32 strmiids)
 
 set_target_properties(virtualcam-managed PROPERTIES
     OUTPUT_NAME "virtualcam-managed"

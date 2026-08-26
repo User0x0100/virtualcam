@@ -57,14 +57,15 @@ The resulting DLL is:
 The Rust API loads this DLL only for management calls. DirectShow applications
 later load the same DLL through the COM registration written for each camera.
 Registration is system-wide and therefore normally requires elevation. Before
-any register/rename/unregister mutation, the DLL resolves its own canonical path
-and requires it to be beneath the canonical Program Files directory; this prevents
-a machine-wide `InprocServer32` registration from pointing at a user-writable
-development directory. The canonical `\\?\...` form is used only for this
-security comparison. The value persisted to `InprocServer32` is converted back to
-a normal DOS/UNC full path so COM/DirectShow activation does not depend on
-extended-length path handling. Copy the built DLL to a stable Program Files
-installation directory before registering cameras.
+any register/rename/unregister mutation, the DLL resolves its own path through a
+file handle and persists that canonical module as a normal local DOS full path in
+`InprocServer32`; COM/DirectShow activation therefore does not depend on relative,
+junction-alias, or extended-length path spelling. The DLL may live beside a
+portable application on a local drive and no longer requires a Program Files deployment. UNC/network modules are rejected. Keep the
+registered application directory stable, or explicitly unregister/re-register
+after moving it. Because machine-wide COM consumers will load the registered
+module path, applications that choose a user-writable app-local directory are
+responsible for that directory's trust and update policy.
 
 Management mutations are serialized with a global named mutex. Rename and
 unregister use ordered rollback so a failing FilterMapper/COM/registry step keeps

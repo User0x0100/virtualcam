@@ -165,34 +165,25 @@ fn capture_with_ffmpeg(name: &str, width: u32, height: u32, fps: u32, camera: &m
 #[ignore = "requires elevation, a built virtualcam-managed.dll, and ffmpeg"]
 fn managed_driver_registers_enumerates_and_streams_runtime_formats() {
     let source_driver = PathBuf::from(std::env::var_os("VIRTUALCAM_MANAGED_DRIVER").expect("set VIRTUALCAM_MANAGED_DRIVER to virtualcam-managed.dll"));
-    let program_files = PathBuf::from(std::env::var_os("ProgramFiles").expect("ProgramFiles must be defined"));
-    let canonical_source = source_driver.canonicalize().expect("canonicalize source managed driver");
-    let canonical_program_files = program_files.canonicalize().expect("canonicalize Program Files");
 
-    if !canonical_source.starts_with(&canonical_program_files) {
-        let unsafe_manager = ManagedCameraManager::new(&source_driver);
-        let error = unsafe_manager
-            .register(ManagedCameraConfig {
-                name: format!("VirtualCam Security Probe {}", std::process::id()),
-            })
-            .expect_err("machine-wide COM registration must reject a user-writable driver location");
-        assert!(matches!(error, Error::Hresult { code, .. } if code as u32 == 0x8007_0005));
-    }
-
-    let install_directory = program_files.join(format!("VirtualCamRs-Integration-{}", std::process::id()));
-    fs::create_dir_all(&install_directory).expect("create protected integration driver directory");
+    // Stage the driver in an ordinary app-local directory outside Program Files.
+    // Managed cameras intentionally support portable applications: registration
+    // must persist the canonical DLL beside the owning app rather than require a
+    // machine-wide installation directory.
+    let install_directory = std::env::temp_dir().join(format!("VirtualCamRs-Integration-{}", std::process::id()));
+    fs::create_dir_all(&install_directory).expect("create app-local integration driver directory");
     let _install_guard = InstalledDriverGuard { directory: install_directory.clone() };
     let installed_driver = install_directory.join("virtualcam-managed.dll");
-    fs::copy(&source_driver, &installed_driver).expect("stage managed driver under Program Files");
+    fs::copy(&source_driver, &installed_driver).expect("stage app-local managed driver");
     let manager = ManagedCameraManager::new(&installed_driver);
 
     let name = format!("VirtualCam NV12 Integration {}", std::process::id());
-    let info = manager.register(ManagedCameraConfig { name: name.clone() }).expect("register managed camera");
+    let info = manager.register(ManagedCameraConfig { name: name.clone() }).expect("register app-local managed camera");
     let guard = RegistrationGuard { manager: manager.clone(), id: info.id };
     let registered_driver = registered_inproc_server(info.id);
     let registered_text = registered_driver.to_string_lossy();
     assert!(!registered_text.starts_with(r"\\?\"), "InprocServer32 must use a normal DOS path, got {registered_text}");
-    assert_eq!(registered_driver, installed_driver, "InprocServer32 should persist the stable Program Files DLL path");
+    assert_eq!(registered_driver, installed_driver, "InprocServer32 should persist the app-local DLL path");
 
     // `open` must validate the DLL that COM will actually load, not merely the
     // manager's own DLL path. Temporarily hide InprocServer32's target while a

@@ -20,12 +20,12 @@ The Rust producer path does no scaling, pixel conversion, or color conversion. M
 
 Width, height, and frame rate are not part of registration. `ManagedCameraManager::open` creates that camera's queue with the requested runtime format and a per-camera ready event. The queue header is initialized in an unpublished state, then `STARTING` is published with the final volatile state store before the ready event is signaled. The DirectShow DLL waits for that event before reading the header, so a consumer racing producer startup cannot observe a partially initialized format. The same CLSID can therefore be reopened later with another even NV12 resolution or frame rate without unregistering the device.
 
-Build the x64 DLL first, then install it under `%ProgramFiles%` from an elevated shell. Machine-wide COM registration intentionally rejects DLLs loaded from user-writable locations.
+Build the x64 DLL first, then keep it at the stable application-local path that will own the managed cameras. Machine-wide COM registration mutations still require an elevated process.
 
 ```powershell
 cmake -S native/managed-virtualcam -B native/managed-virtualcam/build -G "Visual Studio 18 2026" -A x64
 cmake --build native/managed-virtualcam/build --config Release
-$driverDir = Join-Path $env:ProgramFiles 'VirtualCamRs'
+$driverDir = Join-Path $PWD 'my-app'
 New-Item -ItemType Directory -Force $driverDir | Out-Null
 Copy-Item native/managed-virtualcam/build/Release/virtualcam-managed.dll $driverDir/virtualcam-managed.dll -Force
 ```
@@ -40,7 +40,7 @@ use virtualcam::{
 
 # fn run() -> Result<(), virtualcam::Error> {
 let manager = ManagedCameraManager::new(
-    r"C:\Program Files\VirtualCamRs\virtualcam-managed.dll",
+    r"C:\path\to\my-app\virtualcam-managed.dll",
 );
 let info = manager.register(ManagedCameraConfig {
     name: "FaceSwap Output".into(),
@@ -76,7 +76,7 @@ manager.unregister(info.id)?;
 # }
 ```
 
-`register`, `unregister`, `rename`, `get`, and `list` are persistent management operations. Registration uses DirectShow's filter mapper and writes system COM registration, so register/rename/unregister normally require elevation; read/open operations do not. `open` creates the per-camera runtime queue and selects that producer session's format. Before creating the queue it also resolves the camera's actual `HKCR\\CLSID\\{id}\\InprocServer32` target and verifies that the DLL COM will load implements managed-driver ABI v2; the manager's own DLL path is not treated as authoritative for an existing registration. A registered camera can now be opened by DirectShow/OpenCV before any producer exists: the native filter advertises an idle `640x480@30` NV12 mode and emits black frames. When a live queue already exists, its runtime format is used instead. A format remains fixed for one connected DirectShow graph, so a consumer that opened first keeps the `640x480@30` fallback and can consume a later producer without reconnecting only when that producer uses the same mode; otherwise reopen the consumer to negotiate the producer's live format. Mutating operations are serialized across processes and the native DLL must resolve beneath the canonical Program Files directory before any machine-wide registration is changed. Canonical extended-length paths are used only for that security check; `InprocServer32` is persisted as a normal DOS/UNC full path rather than a `\\?\...` path so COM/DirectShow activation is not exposed to extended-path compatibility quirks. Keep that installed DLL at a stable absolute location for as long as any registration exists, because COM records the loaded module path. Existing OBS Virtual Camera registration is untouched. The first native build target is x64; supporting 32-bit DirectShow consumers requires a corresponding x86 DLL/registry view.
+`register`, `unregister`, `rename`, `get`, and `list` are persistent management operations. Registration uses DirectShow's filter mapper and writes system COM registration, so register/rename/unregister normally require elevation; read/open operations do not. `open` creates the per-camera runtime queue and selects that producer session's format. Before creating the queue it also resolves the camera's actual `HKCR\\CLSID\\{id}\\InprocServer32` target and verifies that the DLL COM will load implements managed-driver ABI v2; the manager's own DLL path is not treated as authoritative for an existing registration. A registered camera can now be opened by DirectShow/OpenCV before any producer exists: the native filter advertises an idle `640x480@30` NV12 mode and emits black frames. When a live queue already exists, its runtime format is used instead. A format remains fixed for one connected DirectShow graph, so a consumer that opened first keeps the `640x480@30` fallback and can consume a later producer without reconnecting only when that producer uses the same mode; otherwise reopen the consumer to negotiate the producer's live format. Mutating operations are serialized across processes. The native DLL resolves its loaded module through a file handle and persists `InprocServer32` as a normal canonical local DOS full path rather than a `\\?\...` spelling, so COM/DirectShow activation is not exposed to relative-path, junction-alias, or extended-path compatibility quirks. The DLL may be app-local on a local drive instead of living under Program Files; UNC/network module paths are rejected; keep that application directory stable for as long as a registration exists, or unregister/re-register after moving it. Because the registration is machine-wide, the application is responsible for the trust and update policy of the directory containing the registered DLL. Existing OBS Virtual Camera registration is untouched. The first native build target is x64; supporting 32-bit DirectShow consumers requires a corresponding x86 DLL/registry view.
 
 ## Independent backend controls
 

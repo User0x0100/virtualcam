@@ -18,7 +18,6 @@
 #include <thread>
 #include <vector>
 
-#include <shlobj.h>
 #include <strsafe.h>
 
 using namespace DShow;
@@ -155,15 +154,6 @@ HRESULT FinalPath(const wchar_t *path, std::wstring *out)
     return S_OK;
 }
 
-bool PathIsWithin(const std::wstring &path, const std::wstring &directory)
-{
-    if (path.size() <= directory.size() || _wcsnicmp(path.c_str(), directory.c_str(), directory.size()) != 0) {
-        return false;
-    }
-    const wchar_t boundary = path[directory.size()];
-    return directory.back() == L'\\' || boundary == L'\\';
-}
-
 HRESULT RegistryPathFromFinalPath(const std::wstring &final_path, std::wstring *out)
 {
     if (!out) return E_POINTER;
@@ -188,7 +178,7 @@ HRESULT RegistryPathFromFinalPath(const std::wstring &final_path, std::wstring *
     return S_OK;
 }
 
-HRESULT SecureModulePath(std::wstring *out)
+HRESULT ModuleRegistryPath(std::wstring *out)
 {
     if (!out) return E_POINTER;
     std::vector<wchar_t> module_buffer(32768);
@@ -196,24 +186,26 @@ HRESULT SecureModulePath(std::wstring *out)
     if (module_len == 0) return HRESULT_FROM_WIN32(GetLastError());
     if (module_len >= module_buffer.size() - 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
 
+    // Resolve the loaded module through a file handle before persisting it. This
+    // removes relative paths, junction aliases and extended-length spelling from
+    // the registration while allowing the managed DLL to live beside a portable
+    // application instead of requiring a Program Files deployment.
     std::wstring module_final_path;
     HRESULT hr = FinalPath(module_buffer.data(), &module_final_path);
     if (FAILED(hr)) return hr;
 
-    PWSTR program_files_raw = nullptr;
-    hr = SHGetKnownFolderPath(FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, nullptr, &program_files_raw);
-    if (FAILED(hr)) return hr;
-    std::wstring program_files_final_path;
-    hr = FinalPath(program_files_raw, &program_files_final_path);
-    CoTaskMemFree(program_files_raw);
-    if (FAILED(hr)) return hr;
-
-    if (!PathIsWithin(module_final_path, program_files_final_path)) {
-        return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+    // Machine-wide COM registration may be app-local, but never point at a
+    // network share. A mutable remote DLL is not an acceptable in-process COM
+    // server target. VOLUME_NAME_DOS resolves network files as \\?\UNC\... .
+    constexpr wchar_t kExtendedPrefix[] = L"\\\\?\\";
+    constexpr wchar_t kExtendedUncPrefix[] = L"\\\\?\\UNC\\";
+    const bool extended_unc = module_final_path.rfind(kExtendedUncPrefix, 0) == 0;
+    const bool plain_unc = module_final_path.rfind(kExtendedPrefix, 0) != 0 && module_final_path.rfind(L"\\\\", 0) == 0;
+    if (extended_unc || plain_unc) {
+        return HRESULT_FROM_WIN32(ERROR_BAD_NETPATH);
     }
 
-    // The canonical extended-length path is used only for the security check.
-    // COM registration receives an ordinary DOS/UNC full path because some
+    // COM registration receives an ordinary local DOS full path because some
     // activation paths do not reliably accept the \\?\ namespace form.
     return RegistryPathFromFinalPath(module_final_path, out);
 }
@@ -353,7 +345,7 @@ HRESULT DeleteConfig(REFGUID clsid)
 HRESULT RegisterComServer(REFGUID clsid, const std::wstring &name)
 {
     std::wstring file;
-    HRESULT hr = SecureModulePath(&file);
+    HRESULT hr = ModuleRegistryPath(&file);
     if (FAILED(hr)) return hr;
     const auto guid_string = GuidString(clsid);
     if (guid_string.empty()) {
@@ -834,7 +826,7 @@ extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamRegister(const wchar_t
         return HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH);
     }
     std::wstring secure_module;
-    HRESULT hr = SecureModulePath(&secure_module);
+    HRESULT hr = ModuleRegistryPath(&secure_module);
     if (FAILED(hr)) return hr;
     ManagementLock lock;
     if (FAILED(lock.status())) return lock.status();
@@ -882,7 +874,7 @@ extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamUnregister(const GUID 
 {
     if (!clsid) return E_POINTER;
     std::wstring secure_module;
-    HRESULT hr = SecureModulePath(&secure_module);
+    HRESULT hr = ModuleRegistryPath(&secure_module);
     if (FAILED(hr)) return hr;
     ManagementLock lock;
     if (FAILED(lock.status())) return lock.status();
@@ -914,7 +906,7 @@ extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamRename(const GUID *cls
 {
     if (!clsid || !name || name[0] == L'\0' || wcslen(name) > kMaxCameraName) return E_INVALIDARG;
     std::wstring secure_module;
-    HRESULT hr = SecureModulePath(&secure_module);
+    HRESULT hr = ModuleRegistryPath(&secure_module);
     if (FAILED(hr)) return hr;
     ManagementLock lock;
     if (FAILED(lock.status())) return lock.status();
