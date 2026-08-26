@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.24)
 project(virtualcam_managed LANGUAGES CXX)
 
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 add_library(virtualcam-managed SHARED
     managed-virtualcam.cpp
     third_party/libdshowcapture/source/output-filter.cpp
