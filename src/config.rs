@@ -18,18 +18,23 @@ pub enum CameraType {
 /// The upstream producer computes its 100-nanosecond interval as
 /// `denominator * 10_000_000 / numerator`, using integer truncation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ObsFrameRate {
+pub struct FrameRate {
     /// Frames in one rate period; must be non-zero.
     pub numerator: u32,
     /// Seconds represented by one rate period; must be non-zero.
     pub denominator: u32,
 }
 
-impl Default for ObsFrameRate {
+impl Default for FrameRate {
     fn default() -> Self {
         Self { numerator: 30, denominator: 1 }
     }
 }
+
+/// Compatibility alias for existing OBS API callers.
+///
+/// New backend-neutral code should use [`FrameRate`].
+pub type ObsFrameRate = FrameRate;
 
 /// Complete producer controls for OBS Virtual Camera.
 ///
@@ -43,7 +48,7 @@ pub struct ObsOptions {
     /// NV12 source height in pixels; must be non-zero and even.
     pub height: u32,
     /// Exact rational rate used to calculate the queue interval.
-    pub frame_rate: ObsFrameRate,
+    pub frame_rate: FrameRate,
     /// Bypasses OBS's conservative existing-mapping occupancy check.
     ///
     /// This does not verify whether another writer is active, terminate a
@@ -58,7 +63,7 @@ impl Default for ObsOptions {
         Self {
             width: 1920,
             height: 1080,
-            frame_rate: ObsFrameRate::default(),
+            frame_rate: FrameRate::default(),
             force_open: false,
         }
     }
@@ -271,7 +276,7 @@ mod tests {
             ObsOptions {
                 width: 1920,
                 height: 1080,
-                frame_rate: ObsFrameRate { numerator: 30, denominator: 1 },
+                frame_rate: FrameRate { numerator: 30, denominator: 1 },
                 force_open: false,
             }
         );
@@ -295,16 +300,12 @@ mod tests {
         let options = ObsOptions {
             width: 2,
             height: 2,
-            frame_rate: ObsFrameRate { numerator: 30_000, denominator: 1001 },
+            frame_rate: FrameRate { numerator: 30_000, denominator: 1001 },
             force_open: false,
         };
         assert_eq!(options.validate().expect("valid rate").interval_100ns, 333_666);
 
-        for frame_rate in [
-            ObsFrameRate { numerator: 0, denominator: 1 },
-            ObsFrameRate { numerator: 1, denominator: 0 },
-            ObsFrameRate { numerator: u32::MAX, denominator: 1 },
-        ] {
+        for frame_rate in [FrameRate { numerator: 0, denominator: 1 }, FrameRate { numerator: 1, denominator: 0 }, FrameRate { numerator: u32::MAX, denominator: 1 }] {
             assert!(matches!(ObsOptions { frame_rate, ..options }.validate(), Err(Error::InvalidFrameRate)));
         }
     }

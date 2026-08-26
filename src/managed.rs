@@ -2,7 +2,7 @@ use core::fmt;
 use core::str::FromStr;
 use std::path::{Path, PathBuf};
 
-use crate::{Error, ObsFrameRate, Result, VirtualCamera};
+use crate::{Error, FrameRate, Result, VirtualCamera};
 
 /// Stable identifier of one managed DirectShow virtual-camera registration.
 ///
@@ -101,7 +101,7 @@ pub struct ManagedStreamConfig {
     /// NV12 height. Must be non-zero and even.
     pub height: u32,
     /// Frame rate advertised for this producer session.
-    pub frame_rate: ObsFrameRate,
+    pub frame_rate: FrameRate,
 }
 
 impl Default for ManagedStreamConfig {
@@ -109,7 +109,7 @@ impl Default for ManagedStreamConfig {
         Self {
             width: 1920,
             height: 1080,
-            frame_rate: ObsFrameRate::default(),
+            frame_rate: FrameRate::default(),
         }
     }
 }
@@ -528,7 +528,7 @@ mod tests {
     fn managed_stream_defaults_to_nv12_friendly_dimensions() {
         let stream = ManagedStreamConfig::default();
         assert_eq!((stream.width, stream.height), (1920, 1080));
-        assert_eq!(stream.frame_rate, ObsFrameRate::default());
+        assert_eq!(stream.frame_rate, FrameRate::default());
     }
 
     #[cfg(windows)]
@@ -540,7 +540,7 @@ mod tests {
         assert_eq!(validate_stream(&ManagedStreamConfig { width: 65_536, height: 65_536, ..stream }), Err(Error::InvalidDimensions));
         assert_eq!(
             validate_stream(&ManagedStreamConfig {
-                frame_rate: ObsFrameRate { numerator: 0, denominator: 1 },
+                frame_rate: FrameRate { numerator: 0, denominator: 1 },
                 ..stream
             }),
             Err(Error::InvalidFrameRate)

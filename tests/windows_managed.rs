@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use virtualcam::{CameraType, Error, ManagedCameraConfig, ManagedCameraId, ManagedCameraManager, ManagedStreamConfig, ObsFrameRate, PixelFormat, VirtualCamera, WriteStatus};
+use virtualcam::{CameraType, Error, FrameRate, ManagedCameraConfig, ManagedCameraId, ManagedCameraManager, ManagedStreamConfig, PixelFormat, VirtualCamera, WriteStatus};
 
 struct RegistrationGuard {
     manager: ManagedCameraManager,
@@ -46,7 +46,7 @@ fn stream(width: u32, height: u32, fps: u32) -> ManagedStreamConfig {
     ManagedStreamConfig {
         width,
         height,
-        frame_rate: ObsFrameRate { numerator: fps, denominator: 1 },
+        frame_rate: FrameRate { numerator: fps, denominator: 1 },
     }
 }
 
