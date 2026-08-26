@@ -18,16 +18,21 @@ For each producer session:
   the OBS-compatible queue header while its state is unpublished;
 - after all header fields are initialized, Rust publishes `STARTING` and signals
   the manual-reset ready event;
-- `IClassFactory::CreateInstance` waits for that event before reading the live
-  queue header and constructs one DirectShow output mode for that connection;
+- `IClassFactory::CreateInstance` uses the live queue format when it is available;
+  otherwise it creates an idle `640x480@30` NV12 filter that emits black frames;
 - a later producer session may use another valid even NV12 resolution or frame
   rate without changing the registered CLSID.
 
-The producer must be open before the DirectShow consumer creates the filter. A
-format is fixed for one connected DirectShow graph; in-place hot format changes
-are intentionally unsupported. If a producer disappears after the filter has
-already been created, the filter keeps its negotiated format and emits black NV12
-frames until a matching queue is readable again.
+A registered camera is therefore activatable by DirectShow/OpenCV even when no
+producer is running. A format is still fixed for one connected DirectShow graph:
+if the consumer opened first, its graph remains `640x480@30`, and a producer that
+appears later is readable without reconnecting only when it uses that same mode.
+A producer using another runtime format requires the consumer to reopen the camera
+so a new graph can negotiate that live format. While a graph is waiting on no
+producer or an incompatible producer session, queue discovery is throttled to a
+500 ms retry cadence instead of reopening the named mapping every output frame.
+If a matching producer disappears, the existing filter keeps its negotiated format
+and emits black NV12 frames until a matching queue becomes readable again.
 
 No RGB conversion, I420/YUY2 conversion, or scaling is performed in this DLL.
 `QueryAccept`, `Connect`, and `IAMStreamConfig::SetFormat` reject media types that
@@ -82,8 +87,9 @@ The Rust wrapper requires ABI version 2 and uses these C ABI exports:
 COM uses `DllGetClassObject` and `DllCanUnloadNow`. ABI v2 keeps the original
 `VirtualCamRegister` parameter layout and `CameraInfoAbi` size for defensive
 binary compatibility, but the four legacy format arguments must all be zero;
-nonzero values are rejected with `ERROR_REVISION_MISMATCH`. Runtime format is
-carried only by the live queue header.
+nonzero values are rejected with `ERROR_REVISION_MISMATCH`. A producer's runtime
+format is carried only by the live queue header; when no usable queue exists the
+native filter falls back to `640x480@30` NV12.
 
 ## Third-party code and license
 

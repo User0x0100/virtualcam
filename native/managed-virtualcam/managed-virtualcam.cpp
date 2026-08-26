@@ -34,6 +34,10 @@ constexpr size_t kMaxCameraName = 255;
 constexpr size_t kFrameHeaderSize = 32;
 constexpr size_t kSlotCount = 3;
 constexpr DWORD kRuntimeReadyTimeoutMs = 5000;
+constexpr uint32_t kQueueRetryDelayMs = 500;
+constexpr uint32_t kFallbackWidth = 640;
+constexpr uint32_t kFallbackHeight = 480;
+constexpr uint64_t kFallbackInterval100ns = 10000000ULL / 30ULL;
 
 HINSTANCE g_module = nullptr;
 std::atomic<long> g_locks{0};
@@ -60,6 +64,11 @@ struct RuntimeFormat {
     uint32_t height = 0;
     uint64_t interval_100ns = 0;
 };
+
+RuntimeFormat FallbackRuntimeFormat()
+{
+    return RuntimeFormat{kFallbackWidth, kFallbackHeight, kFallbackInterval100ns};
+}
 
 #pragma pack(push, 8)
 struct QueueHeader {
@@ -525,18 +534,31 @@ public:
 
     bool Read(uint8_t *destination)
     {
-        if (!header_ && !Open()) {
-            return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (!header_) {
+            if (now < retry_after_) {
+                return false;
+            }
+            if (!Open()) {
+                ScheduleRetry(now);
+                return false;
+            }
         }
         if (header_->state == kQueueStateStopping) {
             Close();
+            ScheduleRetry(now);
             return false;
         }
         if (header_->state != kQueueStateReady) {
             return false;
         }
         if (header_->cx != width_ || header_->cy != height_ || header_->interval != interval_) {
+            // A connected DirectShow graph cannot change mode in place. Release
+            // the incompatible producer mapping, then poll at a low frequency so
+            // a consumer-first fallback graph does not churn kernel objects every
+            // frame while waiting for a new matching producer session.
             Close();
+            ScheduleRetry(now);
             return false;
         }
 
@@ -546,6 +568,7 @@ public:
         const size_t offset = header_->offsets[slot];
         if (offset > view_size_ || kFrameHeaderSize > view_size_ - offset || frame_size_ > view_size_ - offset - kFrameHeaderSize) {
             Close();
+            ScheduleRetry(now);
             return false;
         }
         std::memcpy(destination, view_ + offset + kFrameHeaderSize, frame_size_);
@@ -553,6 +576,11 @@ public:
     }
 
 private:
+    void ScheduleRetry(std::chrono::steady_clock::time_point now)
+    {
+        retry_after_ = now + std::chrono::milliseconds(kQueueRetryDelayMs);
+    }
+
     bool Open()
     {
         mapping_ = OpenFileMappingW(FILE_MAP_READ, FALSE, name_.c_str());
@@ -597,6 +625,7 @@ private:
     uint8_t *view_ = nullptr;
     QueueHeader *header_ = nullptr;
     size_t view_size_ = 0;
+    std::chrono::steady_clock::time_point retry_after_{};
 };
 
 class ManagedFilter final : public OutputFilter {
@@ -761,9 +790,12 @@ public:
         *out = nullptr;
         if (outer) return CLASS_E_NOAGGREGATION;
 
-        RuntimeFormat format{};
-        const HRESULT format_hr = LoadRuntimeFormat(config_, &format);
-        if (FAILED(format_hr)) return format_hr;
+        RuntimeFormat format = FallbackRuntimeFormat();
+        // A registered camera remains activatable even when no producer exists.
+        // If a producer is live, its queue header replaces the conservative
+        // fallback before the graph negotiates its one fixed session format.
+        // Any unavailable/unreadable runtime queue leaves the fallback intact.
+        LoadRuntimeFormat(config_, &format);
 
         auto *filter = new (std::nothrow) ManagedFilter(config_, format);
         if (!filter) return E_OUTOFMEMORY;

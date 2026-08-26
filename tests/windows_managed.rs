@@ -81,6 +81,41 @@ fn registered_inproc_server(id: ManagedCameraId) -> PathBuf {
     PathBuf::from(OsString::from_wide(&buffer[..end]))
 }
 
+fn capture_without_producer(name: &str, width: u32, height: u32, fps: u32) {
+    let output = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("warning")
+        .arg("-f")
+        .arg("dshow")
+        .arg("-video_size")
+        .arg(format!("{width}x{height}"))
+        .arg("-framerate")
+        .arg(fps.to_string())
+        .arg("-i")
+        .arg(format!("video={name}"))
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-pix_fmt")
+        .arg("nv12")
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("capture managed fallback frame without producer");
+    assert!(
+        output.status.success(),
+        "ffmpeg could not open idle managed camera at {width}x{height}@{fps}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let y_size = width as usize * height as usize;
+    assert_eq!(output.stdout.len(), y_size * 3 / 2, "fallback NV12 frame size");
+    assert!(output.stdout[..y_size].iter().all(|value| *value == 16), "fallback Y plane must be limited-range black");
+    assert!(output.stdout[y_size..].iter().all(|value| *value == 128), "fallback UV plane must be neutral chroma");
+}
+
 fn capture_with_ffmpeg(name: &str, width: u32, height: u32, fps: u32, camera: &mut VirtualCamera) {
     let mut child = Command::new("ffmpeg")
         .arg("-hide_banner")
@@ -193,6 +228,11 @@ fn managed_driver_registers_enumerates_and_streams_runtime_formats() {
     let renamed = format!("{name} Renamed");
     manager.rename(info.id, &renamed).expect("rename managed camera");
     assert_eq!(manager.get(info.id).expect("get renamed registration").name, renamed);
+
+    // A registered camera must remain a usable DirectShow capture device even
+    // with no Rust producer. The native filter advertises the conservative
+    // 640x480@30 NV12 fallback and emits black frames in this state.
+    capture_without_producer(&renamed, 640, 480, 30);
 
     let listed = manager.list().expect("list registrations");
     assert!(listed.iter().any(|camera| camera.id == info.id));
