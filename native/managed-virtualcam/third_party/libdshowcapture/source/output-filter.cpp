@@ -795,9 +795,9 @@ STDMETHODIMP OutputFilter::Pause()
 {
 	PrintFunc(L"OutputFilter::Pause");
 
-	OutputPin *pin = GetPin();
-	if (!!pin->allocator && state == State_Stopped) {
-		pin->allocator->Commit();
+	OutputPin *outputPin = GetPin();
+	if (!!outputPin->allocator && state == State_Stopped) {
+		outputPin->allocator->Commit();
 	}
 
 	state = State_Paused;

@@ -1,8 +1,8 @@
-//! Windows virtual-camera producers plus an independently managed NV12 DirectShow driver.
+//! Windows virtual-camera producers plus an independently managed NV12 `DirectShow` driver.
 //!
 //! `virtualcam` writes frames to the shared-memory protocols used by OBS Virtual
 //! Camera and Unity Capture, and [`ManagedCameraManager`] manages this repository's
-//! independent NV12 DirectShow camera DLL. Managed and OBS cameras accept
+//! independent NV12 `DirectShow` camera DLL. Managed and OBS cameras accept
 //! [`PixelFormat::Nv12`]; Unity Capture accepts RGBA8 and the upstream gamma/linear
 //! RGBA binary16 formats. The Rust producer path never scales or converts frames.
 //!

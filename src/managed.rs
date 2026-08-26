@@ -2,7 +2,9 @@ use core::fmt;
 use core::str::FromStr;
 use std::path::{Path, PathBuf};
 
-use crate::{Error, FrameRate, Result, VirtualCamera};
+#[cfg(windows)]
+use crate::config::ValidatedObsOptions;
+use crate::{Error, FrameRate, ObsOptions, Result, VirtualCamera};
 
 /// Stable identifier of one managed DirectShow virtual-camera registration.
 ///
@@ -89,11 +91,12 @@ impl Default for ManagedCameraConfig {
     }
 }
 
-/// Runtime format selected before a DirectShow consumer connects.
+/// Runtime format selected for one managed producer session.
 ///
-/// One producer session exposes exactly one NV12 media type. A later session
-/// may reopen the same registered CLSID with a different format. Changing the
-/// format of an already connected DirectShow graph is intentionally unsupported.
+/// A DirectShow graph keeps the media type it negotiated when it opened. If that
+/// graph opened before any producer, it uses the idle `640x480@30` fallback and
+/// can attach without reconnecting only to a later producer using the same mode.
+/// Reopening the consumer while a producer is live selects that session's format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ManagedStreamConfig {
     /// NV12 width. Must be non-zero and even.
@@ -147,8 +150,8 @@ impl ManagedCameraManager {
 
     /// Registers a new independent NV12 camera and returns its generated CLSID.
     ///
-    /// No stream format is persisted. The format is selected by [`Self::open`]
-    /// before a DirectShow consumer connects.
+    /// No stream format is persisted. [`Self::open`] publishes each producer
+    /// session's runtime format without changing the registered device identity.
     pub fn register(&self, config: ManagedCameraConfig) -> Result<ManagedCameraInfo> {
         validate_name(&config.name)?;
         platform::register(&self.driver_path, &config)
@@ -179,47 +182,65 @@ impl ManagedCameraManager {
 
     /// Opens one producer session with the runtime NV12 format to advertise.
     ///
-    /// The queue header is the runtime format declaration consumed by the
-    /// DirectShow DLL. Open the producer before the receiving application opens
-    /// the camera. Reopen after the previous session ends to use another format
-    /// with the same CLSID.
+    /// Managed ABI v3 publishes the format through a fixed control mapping and
+    /// writes frames to a format-specific OBS-compatible queue. A consumer that
+    /// is already connected keeps its negotiated mode; reopen that consumer to
+    /// select a different live producer format. Later sessions may use another
+    /// format with the same CLSID even while an old graph retains its prior data
+    /// mapping.
     pub fn open(&self, id: ManagedCameraId, stream: ManagedStreamConfig) -> Result<VirtualCamera> {
         #[cfg(windows)]
         {
-            validate_stream(&stream)?;
+            let validated = validate_stream(&stream)?;
             self.get(id)?;
             platform::validate_registered_driver(id)?;
+            VirtualCamera::open_managed_validated(id, validated)
         }
         #[cfg(not(windows))]
-        self.get(id)?;
-        VirtualCamera::open_managed(id, stream)
+        {
+            self.get(id)?;
+            VirtualCamera::open_managed(id, stream)
+        }
     }
 }
 
 fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.encode_utf16().count() > 255 || name.encode_utf16().any(|unit| unit == 0) {
+    if name.is_empty() {
         return Err(Error::InvalidCameraName);
+    }
+    let mut units = 0_usize;
+    for unit in name.encode_utf16() {
+        if unit == 0 {
+            return Err(Error::InvalidCameraName);
+        }
+        units += 1;
+        if units > 255 {
+            return Err(Error::InvalidCameraName);
+        }
     }
     Ok(())
 }
 
 #[cfg(windows)]
-fn validate_stream(stream: &ManagedStreamConfig) -> Result<()> {
-    if stream.width == 0 || stream.height == 0 || !stream.width.is_multiple_of(2) || !stream.height.is_multiple_of(2) || stream.width > i32::MAX as u32 || stream.height > i32::MAX as u32 {
+fn validate_stream(stream: &ManagedStreamConfig) -> Result<ValidatedObsOptions> {
+    let validated = ObsOptions {
+        width: stream.width,
+        height: stream.height,
+        frame_rate: stream.frame_rate,
+        force_open: false,
+    }
+    .validate()?;
+    if stream.width > i32::MAX as u32 || stream.height > i32::MAX as u32 {
         return Err(Error::InvalidDimensions);
     }
     let pixels = u64::from(stream.width) * u64::from(stream.height);
     if pixels > (i32::MAX as u64) / 12 {
         return Err(Error::InvalidDimensions);
     }
-    if stream.frame_rate.numerator == 0 || stream.frame_rate.denominator == 0 {
+    if validated.interval_100ns > i64::MAX as u64 || validated.interval_100ns > u64::MAX / 100 {
         return Err(Error::InvalidFrameRate);
     }
-    let interval = u128::from(stream.frame_rate.denominator) * 10_000_000 / u128::from(stream.frame_rate.numerator);
-    if interval == 0 || interval > i64::MAX as u128 {
-        return Err(Error::InvalidFrameRate);
-    }
-    Ok(())
+    Ok(validated)
 }
 
 #[cfg(windows)]
@@ -238,7 +259,7 @@ mod platform {
     use crate::{Error, Result};
 
     const NAME_CAPACITY: usize = 256;
-    const ABI_VERSION: u32 = 2;
+    const ABI_VERSION: u32 = 3;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -536,14 +557,14 @@ mod tests {
     fn managed_stream_validation_matches_native_fixed_mode_limits() {
         let stream = ManagedStreamConfig::default();
         assert!(validate_stream(&stream).is_ok());
-        assert_eq!(validate_stream(&ManagedStreamConfig { width: 1919, ..stream }), Err(Error::InvalidDimensions));
-        assert_eq!(validate_stream(&ManagedStreamConfig { width: 65_536, height: 65_536, ..stream }), Err(Error::InvalidDimensions));
-        assert_eq!(
+        assert!(matches!(validate_stream(&ManagedStreamConfig { width: 1919, ..stream }), Err(Error::InvalidDimensions)));
+        assert!(matches!(validate_stream(&ManagedStreamConfig { width: 65_536, height: 65_536, ..stream }), Err(Error::InvalidDimensions)));
+        assert!(matches!(
             validate_stream(&ManagedStreamConfig {
                 frame_rate: FrameRate { numerator: 0, denominator: 1 },
                 ..stream
             }),
             Err(Error::InvalidFrameRate)
-        );
+        ));
     }
 }

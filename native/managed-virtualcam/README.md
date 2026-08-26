@@ -2,7 +2,7 @@
 
 `virtualcam-managed.dll` is the native receiver used by `ManagedCameraManager`.
 It is independent of OBS Virtual Camera: every registered camera gets its own
-COM CLSID and its own `Local\\VirtualCamRs-{CLSID}` shared-memory queue.
+COM CLSID and its own `Local\\VirtualCamRs-{CLSID}` runtime-object namespace.
 
 ## Format contract
 
@@ -10,18 +10,25 @@ Registration stores only persistent device identity: CLSID, friendly name, and
 the deterministic instance queue name. Width, height, and frame rate are runtime
 producer state rather than registry state.
 
-For each producer session:
+For each producer session (managed runtime ABI v3):
 
 - subtype is always `MEDIASUBTYPE_NV12`;
-- the Rust producer first creates `Local\\VirtualCamRs-{CLSID}-Ready`, then creates
-  `Local\\VirtualCamRs-{CLSID}` and writes width, height, and frame interval into
-  the OBS-compatible queue header while its state is unpublished;
-- after all header fields are initialized, Rust publishes `STARTING` and signals
-  the manual-reset ready event;
-- `IClassFactory::CreateInstance` uses the live queue format when it is available;
-  otherwise it creates an idle `640x480@30` NV12 filter that emits black frames;
-- a later producer session may use another valid even NV12 resolution or frame
-  rate without changing the registered CLSID.
+- `Local\\VirtualCamRs-{CLSID}-Producer` is the single-writer lease. It exists
+  immediately to reserve ownership but is signaled only after the session is
+  fully published;
+- `Local\\VirtualCamRs-{CLSID}-Ready` is a reusable manual-reset publication
+  event and may remain alive because an old DirectShow consumer still owns a
+  handle;
+- `Local\\VirtualCamRs-{CLSID}-Control` is a fixed 32-byte control header carrying
+  magic/version, state, width, height, and frame interval;
+- the OBS-compatible three-slot frame queue is format-specific:
+  `Local\\VirtualCamRs-{CLSID}-Data-{width}x{height}-{interval}`;
+- `IClassFactory::CreateInstance` waits for the signaled producer lease and Ready
+  event, validates the control header, and uses that live format. With no producer
+  lease it creates an idle `640x480@30` NV12 filter that emits black frames;
+- a later producer may use another valid even NV12 resolution or frame rate while
+  an old consumer still retains its old data mapping, because different formats
+  no longer share one fixed-capacity section.
 
 A registered camera is therefore activatable by DirectShow/OpenCV even when no
 producer is running. A format is still fixed for one connected DirectShow graph:
@@ -30,9 +37,11 @@ appears later is readable without reconnecting only when it uses that same mode.
 A producer using another runtime format requires the consumer to reopen the camera
 so a new graph can negotiate that live format. While a graph is waiting on no
 producer or an incompatible producer session, queue discovery is throttled to a
-500 ms retry cadence instead of reopening the named mapping every output frame.
-If a matching producer disappears, the existing filter keeps its negotiated format
-and emits black NV12 frames until a matching queue becomes readable again.
+500 ms retry cadence instead of reopening named objects every output frame. If
+frame publication stops advancing, the receiver periodically checks both the
+producer lease and control-plane format. A crashed/killed producer therefore
+releases the stale data mapping and returns to black frames instead of freezing
+its final frame indefinitely. A later matching producer can attach to that graph.
 
 No RGB conversion, I420/YUY2 conversion, or scaling is performed in this DLL.
 `QueryAccept`, `Connect`, and `IAMStreamConfig::SetFormat` reject media types that
@@ -68,15 +77,16 @@ module path, applications that choose a user-writable app-local directory are
 responsible for that directory's trust and update policy.
 
 Management mutations are serialized with a global named mutex. Rename and
-unregister use ordered rollback so a failing FilterMapper/COM/registry step keeps
-enough metadata to retry instead of intentionally deleting the remaining state.
-Before Rust opens a runtime producer queue, it resolves that CLSID's actual
-`InprocServer32` target and loads it to verify ABI v2. This prevents a separate
-manager DLL from hiding an obsolete or missing COM driver registration.
+unregister snapshot the original `InprocServer32` module path and use it during
+ordered rollback, so a compatible manager DLL loaded from another app directory
+cannot silently replace the camera's original COM module identity after a failed
+mutation. Before Rust opens a runtime producer session, it resolves that CLSID's
+actual `InprocServer32` target and loads it to verify ABI v3. This prevents a
+separate manager DLL from hiding an obsolete or missing COM driver registration.
 
 ## Native exports
 
-The Rust wrapper requires ABI version 2 and uses these C ABI exports:
+The Rust wrapper requires ABI version 3 and uses these C ABI exports:
 
 - `VirtualCamGetAbiVersion`
 - `VirtualCamRegister`
@@ -85,12 +95,14 @@ The Rust wrapper requires ABI version 2 and uses these C ABI exports:
 - `VirtualCamGet`
 - `VirtualCamEnumerate`
 
-COM uses `DllGetClassObject` and `DllCanUnloadNow`. ABI v2 keeps the original
+COM uses `DllGetClassObject` and `DllCanUnloadNow`. ABI v3 keeps the original
 `VirtualCamRegister` parameter layout and `CameraInfoAbi` size for defensive
 binary compatibility, but the four legacy format arguments must all be zero;
-nonzero values are rejected with `ERROR_REVISION_MISMATCH`. A producer's runtime
-format is carried only by the live queue header; when no usable queue exists the
-native filter falls back to `640x480@30` NV12.
+nonzero values are rejected with `ERROR_REVISION_MISMATCH`. ABI v3 changes the
+managed runtime transport to the fixed control mapping plus format-specific data
+mapping described above, so v2 Rust/native combinations are rejected rather than
+silently sharing incompatible queue names. With no producer lease the native
+filter falls back to `640x480@30` NV12.
 
 ## Third-party code and license
 

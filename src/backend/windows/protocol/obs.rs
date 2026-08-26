@@ -50,18 +50,18 @@ pub(crate) struct QueueHeader {
 }
 
 impl QueueHeader {
-    pub(crate) fn new(width: u32, height: u32, interval: u64, offsets: [u32; 3]) -> Self {
-        // C's `struct queue_header header = {0}` initializes the entire object
-        // representation before selected fields are assigned. Every all-zero
-        // bit pattern is valid for this integer-only Rust representation.
-        // SAFETY: All fields are integer scalars/arrays for which zero is valid.
-        let mut header = unsafe { core::mem::MaybeUninit::<Self>::zeroed().assume_init() };
-        header.state = STATE_STARTING;
-        header.offsets = offsets;
-        header.cx = width;
-        header.cy = height;
-        header.interval = interval;
-        header
+    pub(crate) const fn new(width: u32, height: u32, interval: u64, offsets: [u32; 3]) -> Self {
+        Self {
+            write_idx: 0,
+            read_idx: 0,
+            state: STATE_STARTING,
+            offsets,
+            queue_type: 0,
+            cx: width,
+            cy: height,
+            interval,
+            reserved: [0; 8],
+        }
     }
 }
 

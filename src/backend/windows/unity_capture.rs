@@ -1,3 +1,5 @@
+use core::ptr::NonNull;
+
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, OpenFileMappingA};
 use windows_sys::Win32::System::Threading::{CreateEventA, EVENT_MODIFY_STATE, OpenEventA, SetEvent, WaitForSingleObject};
@@ -18,6 +20,7 @@ const UNITY_CLSID_SUFFIX_BASE: u8 = 0x20;
 
 pub(crate) struct UnityCaptureBackend {
     view: Option<MappedView>,
+    header: Option<NonNull<SharedMemHeader>>,
     mapping: Option<OwnedHandle>,
     sent_event: Option<OwnedHandle>,
     want_event: Option<OwnedHandle>,
@@ -46,6 +49,7 @@ impl UnityCaptureBackend {
 
         Ok(Self {
             view: None,
+            header: None,
             mapping: None,
             sent_event: None,
             want_event: None,
@@ -92,7 +96,7 @@ impl UnityCaptureBackend {
         }
 
         let view = self.view.as_ref().ok_or(Error::ConsumerInactive)?;
-        let header = view.as_ptr().cast::<SharedMemHeader>();
+        let header = self.header.ok_or(Error::ConsumerInactive)?.as_ptr();
         // Upstream checks maxSize before taking the mutex.
         // SAFETY: A connected view was validated to contain the shared header;
         // `max_size` is the first aligned DWORD written by the receiver.
@@ -140,8 +144,8 @@ impl UnityCaptureBackend {
         let want = self.want_event.as_ref().ok_or(Error::ConsumerInactive)?.raw();
         // SAFETY: `want` is a live auto-reset event created by this sender. A zero
         // timeout implements upstream's non-blocking frame-skip test.
-        let wait = unsafe { WaitForSingleObject(want, 0) };
-        match wait {
+        let wait_result = unsafe { WaitForSingleObject(want, 0) };
+        match wait_result {
             WAIT_OBJECT_0 => Ok(WriteStatus::Written),
             WAIT_TIMEOUT => {
                 trace_debug!("Unity Capture consumer skipped a frame");
@@ -229,6 +233,11 @@ impl UnityCaptureBackend {
                     detail: "Unity Capture mapping does not contain SharedMemHeader",
                 });
             }
+            let header = view.ptr_at::<SharedMemHeader>(0).ok_or(Error::Protocol {
+                backend: CameraType::UnityCapture,
+                detail: "Unity Capture mapping header is misaligned or truncated",
+            })?;
+            self.header = Some(header);
             self.view = Some(view);
         }
 
@@ -243,6 +252,7 @@ impl UnityCaptureBackend {
         self.open = false;
         // Upstream's sender has no protocol-visible closing transition. Rust
         // additionally unmaps its owned view instead of leaking it until exit.
+        self.header = None;
         self.view = None;
         self.mutex = None;
         self.want_event = None;

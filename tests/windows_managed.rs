@@ -6,7 +6,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use virtualcam::{CameraType, Error, FrameRate, ManagedCameraConfig, ManagedCameraId, ManagedCameraManager, ManagedStreamConfig, PixelFormat, VirtualCamera, WriteStatus};
 use windows_sys::Win32::System::Registry::{HKEY, HKEY_CLASSES_ROOT, KEY_READ, REG_SZ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW};
@@ -116,6 +116,74 @@ fn capture_without_producer(name: &str, width: u32, height: u32, fps: u32) {
     assert!(output.stdout[y_size..].iter().all(|value| *value == 128), "fallback UV plane must be neutral chroma");
 }
 
+fn assert_consumer_recovers_to_black_after_producer_crash(name: &str, id: ManagedCameraId, driver: &PathBuf) {
+    let width = 160_u32;
+    let height = 120_u32;
+    let fps = 30_u32;
+    let frame_size = width as usize * height as usize * 3 / 2;
+    let signal = std::env::temp_dir().join(format!("VirtualCamRs-CrashReady-{}", std::process::id()));
+    let _ = fs::remove_file(&signal);
+
+    let mut producer = Command::new(std::env::current_exe().expect("current managed integration executable"))
+        .args(["--exact", "managed_crash_producer_helper", "--nocapture"])
+        .env("VIRTUALCAM_CRASH_HELPER_ID", id.to_string())
+        .env("VIRTUALCAM_CRASH_HELPER_DRIVER", driver)
+        .env("VIRTUALCAM_CRASH_HELPER_SIGNAL", &signal)
+        .spawn()
+        .expect("spawn crash producer helper");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !signal.exists() {
+        if let Some(status) = producer.try_wait().expect("poll crash producer helper") {
+            panic!("crash producer helper exited before publishing a frame: {status}");
+        }
+        assert!(Instant::now() < deadline, "crash producer helper did not become ready");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let consumer = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("warning")
+        .arg("-f")
+        .arg("dshow")
+        .arg("-video_size")
+        .arg(format!("{width}x{height}"))
+        .arg("-framerate")
+        .arg(fps.to_string())
+        .arg("-i")
+        .arg(format!("video={name}"))
+        .arg("-frames:v")
+        .arg("45")
+        .arg("-pix_fmt")
+        .arg("nv12")
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn crash-recovery DirectShow consumer");
+
+    // Let the consumer bind while the colored producer session is definitely
+    // live, then terminate the process without running VirtualCamera::close.
+    thread::sleep(Duration::from_millis(350));
+    producer.kill().expect("terminate crash producer helper");
+    let _ = producer.wait();
+    let _ = fs::remove_file(&signal);
+
+    let output = consumer.wait_with_output().expect("collect crash-recovery consumer");
+    assert!(output.status.success(), "crash-recovery ffmpeg failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout.len(), frame_size * 45, "crash-recovery raw frame count");
+
+    let first = &output.stdout[..frame_size];
+    let last = &output.stdout[output.stdout.len() - frame_size..];
+    let y_size = width as usize * height as usize;
+    assert!(first[..y_size].iter().all(|value| *value == 96), "consumer should initially see the producer's colored Y plane");
+    assert!(last[..y_size].iter().all(|value| *value == 16), "consumer should switch to black after the producer lease disappears");
+    assert!(last[y_size..].iter().all(|value| *value == 128), "crash fallback UV plane must be neutral chroma");
+}
+
 fn capture_with_ffmpeg(name: &str, width: u32, height: u32, fps: u32, camera: &mut VirtualCamera) {
     let mut child = Command::new("ffmpeg")
         .arg("-hide_banner")
@@ -162,6 +230,25 @@ fn capture_with_ffmpeg(name: &str, width: u32, height: u32, fps: u32, camera: &m
 }
 
 #[test]
+fn managed_crash_producer_helper() {
+    let Some(id) = std::env::var_os("VIRTUALCAM_CRASH_HELPER_ID") else {
+        return;
+    };
+    let driver = PathBuf::from(std::env::var_os("VIRTUALCAM_CRASH_HELPER_DRIVER").expect("crash helper driver path"));
+    let signal = PathBuf::from(std::env::var_os("VIRTUALCAM_CRASH_HELPER_SIGNAL").expect("crash helper signal path"));
+    let id: ManagedCameraId = id.to_string_lossy().parse().expect("crash helper camera id");
+    let manager = ManagedCameraManager::new(driver);
+    let mut camera = manager.open(id, stream(160, 120, 30)).expect("crash helper opens managed producer");
+    let y_size = 160 * 120;
+    let mut frame = vec![0_u8; camera.frame_size()];
+    frame[..y_size].fill(96);
+    frame[y_size..].fill(128);
+    assert_eq!(camera.write_host(&frame).expect("crash helper publishes frame"), WriteStatus::Written);
+    fs::write(signal, b"ready").expect("signal crash helper readiness");
+    thread::sleep(Duration::from_secs(60));
+}
+
+#[test]
 #[ignore = "requires elevation, a built virtualcam-managed.dll, and ffmpeg"]
 fn managed_driver_registers_enumerates_and_streams_runtime_formats() {
     let source_driver = PathBuf::from(std::env::var_os("VIRTUALCAM_MANAGED_DRIVER").expect("set VIRTUALCAM_MANAGED_DRIVER to virtualcam-managed.dll"));
@@ -187,7 +274,7 @@ fn managed_driver_registers_enumerates_and_streams_runtime_formats() {
 
     // `open` must validate the DLL that COM will actually load, not merely the
     // manager's own DLL path. Temporarily hide InprocServer32's target while a
-    // separate v2 manager remains loadable from the build directory.
+    // separate v3 manager remains loadable from the build directory.
     let moved_driver = install_directory.join("virtualcam-managed.dll.moved");
     fs::rename(&installed_driver, &moved_driver).expect("temporarily move registered driver");
     let moved_guard = MovedDriverGuard {
@@ -224,6 +311,8 @@ fn managed_driver_registers_enumerates_and_streams_runtime_formats() {
     // with no Rust producer. The native filter advertises the conservative
     // 640x480@30 NV12 fallback and emits black frames in this state.
     capture_without_producer(&renamed, 640, 480, 30);
+
+    assert_consumer_recovers_to_black_after_producer_crash(&renamed, info.id, &installed_driver);
 
     let listed = manager.list().expect("list registrations");
     assert!(listed.iter().any(|camera| camera.id == info.id));

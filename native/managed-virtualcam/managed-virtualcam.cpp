@@ -34,6 +34,12 @@ constexpr size_t kFrameHeaderSize = 32;
 constexpr size_t kSlotCount = 3;
 constexpr DWORD kRuntimeReadyTimeoutMs = 5000;
 constexpr uint32_t kQueueRetryDelayMs = 500;
+constexpr uint32_t kProducerLivenessProbeFrames = 10;
+constexpr uint32_t kControlMagic = 0x524D4356; // little-endian "VCMR"
+constexpr uint32_t kControlVersion = 1;
+constexpr uint32_t kControlStateStarting = 1;
+constexpr uint32_t kControlStateReady = 2;
+constexpr uint32_t kControlStateStopping = 3;
 constexpr uint32_t kFallbackWidth = 640;
 constexpr uint32_t kFallbackHeight = 480;
 constexpr uint64_t kFallbackInterval100ns = 10000000ULL / 30ULL;
@@ -63,6 +69,20 @@ struct RuntimeFormat {
     uint32_t height = 0;
     uint64_t interval_100ns = 0;
 };
+
+#pragma pack(push, 8)
+struct ManagedControlHeader {
+    uint32_t magic;
+    uint32_t version;
+    volatile uint32_t state;
+    uint32_t reserved;
+    uint32_t width;
+    uint32_t height;
+    uint64_t interval_100ns;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(ManagedControlHeader) == 32, "managed control ABI changed");
 
 RuntimeFormat FallbackRuntimeFormat()
 {
@@ -242,6 +262,22 @@ std::wstring ReadyEventName(const std::wstring &queue_name)
     return queue_name.empty() ? std::wstring{} : queue_name + L"-Ready";
 }
 
+std::wstring ProducerEventName(const std::wstring &queue_name)
+{
+    return queue_name.empty() ? std::wstring{} : queue_name + L"-Producer";
+}
+
+std::wstring ControlMappingName(const std::wstring &queue_name)
+{
+    return queue_name.empty() ? std::wstring{} : queue_name + L"-Control";
+}
+
+std::wstring DataMappingName(const std::wstring &queue_name, const RuntimeFormat &format)
+{
+    if (queue_name.empty()) return {};
+    return queue_name + L"-Data-" + std::to_wstring(format.width) + L"x" + std::to_wstring(format.height) + L"-" + std::to_wstring(format.interval_100ns);
+}
+
 bool ValidDimensions(uint32_t width, uint32_t height)
 {
     if (width == 0 || height == 0 || (width % 2) != 0 || (height % 2) != 0 || width > INT_MAX || height > INT_MAX) {
@@ -342,11 +378,9 @@ HRESULT DeleteConfig(REFGUID clsid)
     return HrFromWin32(status);
 }
 
-HRESULT RegisterComServer(REFGUID clsid, const std::wstring &name)
+HRESULT RegisterComServerAtPath(REFGUID clsid, const std::wstring &name, const std::wstring &file)
 {
-    std::wstring file;
-    HRESULT hr = ModuleRegistryPath(&file);
-    if (FAILED(hr)) return hr;
+    if (file.empty()) return E_INVALIDARG;
     const auto guid_string = GuidString(clsid);
     if (guid_string.empty()) {
         return E_INVALIDARG;
@@ -357,7 +391,7 @@ HRESULT RegisterComServer(REFGUID clsid, const std::wstring &name)
     if (status != ERROR_SUCCESS) {
         return HrFromWin32(status);
     }
-    hr = SetString(class_key, nullptr, name);
+    HRESULT hr = SetString(class_key, nullptr, name);
     if (SUCCEEDED(hr)) {
         HKEY server_key = nullptr;
         status = RegCreateKeyExW(class_key, L"InprocServer32", 0, nullptr, 0, KEY_READ | KEY_WRITE, nullptr, &server_key, nullptr);
@@ -370,6 +404,20 @@ HRESULT RegisterComServer(REFGUID clsid, const std::wstring &name)
         }
     }
     RegCloseKey(class_key);
+    return hr;
+}
+
+HRESULT ReadComServerPath(REFGUID clsid, std::wstring *file)
+{
+    if (!file) return E_POINTER;
+    const auto guid_string = GuidString(clsid);
+    if (guid_string.empty()) return E_INVALIDARG;
+    const std::wstring path = L"CLSID\\" + guid_string + L"\\InprocServer32";
+    HKEY key = nullptr;
+    const auto status = RegOpenKeyExW(HKEY_CLASSES_ROOT, path.c_str(), 0, KEY_READ, &key);
+    if (status != ERROR_SUCCESS) return HrFromWin32(status);
+    const HRESULT hr = QueryString(key, nullptr, file);
+    RegCloseKey(key);
     return hr;
 }
 
@@ -462,26 +510,44 @@ HRESULT LoadRuntimeFormat(const CameraConfig &config, RuntimeFormat *format)
 {
     if (!format) return E_POINTER;
 
+    const auto producer_name = ProducerEventName(config.queue_name);
+    if (producer_name.empty()) return E_INVALIDARG;
+    HANDLE producer_event = OpenEventW(SYNCHRONIZE, FALSE, producer_name.c_str());
+    if (!producer_event) {
+        const DWORD error = GetLastError();
+        return HRESULT_FROM_WIN32(error == ERROR_FILE_NOT_FOUND ? ERROR_NOT_READY : error);
+    }
+    // The event exists immediately to reserve the single producer, but is only
+    // signaled after Ready/control/data publication has completed.
+    const DWORD producer_wait = WaitForSingleObject(producer_event, kRuntimeReadyTimeoutMs);
+    if (producer_wait != WAIT_OBJECT_0) {
+        const HRESULT wait_hr = producer_wait == WAIT_TIMEOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+                                                             : producer_wait == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
+        CloseHandle(producer_event);
+        return wait_hr;
+    }
+    CloseHandle(producer_event);
+
     const auto ready_name = ReadyEventName(config.queue_name);
     if (ready_name.empty()) return E_INVALIDARG;
     HANDLE ready_event = OpenEventW(SYNCHRONIZE, FALSE, ready_name.c_str());
     if (!ready_event) {
-        const DWORD error = GetLastError();
-        return HRESULT_FROM_WIN32(error == ERROR_FILE_NOT_FOUND ? ERROR_NOT_READY : error);
+        return HRESULT_FROM_WIN32(GetLastError());
     }
-    const DWORD wait = WaitForSingleObject(ready_event, kRuntimeReadyTimeoutMs);
-    if (wait != WAIT_OBJECT_0) {
-        const HRESULT wait_hr = wait == WAIT_TIMEOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT)
-                                                     : wait == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
+    const DWORD ready_wait = WaitForSingleObject(ready_event, kRuntimeReadyTimeoutMs);
+    if (ready_wait != WAIT_OBJECT_0) {
+        const HRESULT wait_hr = ready_wait == WAIT_TIMEOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+                                                          : ready_wait == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
         CloseHandle(ready_event);
         return wait_hr;
     }
     CloseHandle(ready_event);
 
-    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, config.queue_name.c_str());
+    const auto control_name = ControlMappingName(config.queue_name);
+    if (control_name.empty()) return E_INVALIDARG;
+    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, control_name.c_str());
     if (!mapping) {
-        const DWORD error = GetLastError();
-        return HRESULT_FROM_WIN32(error == ERROR_FILE_NOT_FOUND ? ERROR_NOT_READY : error);
+        return HRESULT_FROM_WIN32(GetLastError());
     }
     auto *view = static_cast<uint8_t *>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
     if (!view) {
@@ -492,18 +558,20 @@ HRESULT LoadRuntimeFormat(const CameraConfig &config, RuntimeFormat *format)
 
     MEMORY_BASIC_INFORMATION info{};
     HRESULT hr = S_OK;
-    if (VirtualQuery(view, &info, sizeof(info)) == 0 || info.RegionSize < sizeof(QueueHeader)) {
+    if (VirtualQuery(view, &info, sizeof(info)) == 0 || info.RegionSize < sizeof(ManagedControlHeader)) {
         hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
     } else {
-        auto *header = reinterpret_cast<QueueHeader *>(view);
+        auto *control = reinterpret_cast<ManagedControlHeader *>(view);
         MemoryBarrier();
-        const uint32_t state = header->state;
+        const uint32_t state = control->state;
         RuntimeFormat value{};
-        value.width = header->cx;
-        value.height = header->cy;
-        value.interval_100ns = header->interval;
-        if ((state != kQueueStateStarting && state != kQueueStateReady) || !ValidDimensions(value.width, value.height) || value.interval_100ns == 0 ||
-            value.interval_100ns > static_cast<uint64_t>((std::numeric_limits<long long>::max)())) {
+        value.width = control->width;
+        value.height = control->height;
+        value.interval_100ns = control->interval_100ns;
+        if (control->magic != kControlMagic || control->version != kControlVersion ||
+            (state != kControlStateStarting && state != kControlStateReady) || !ValidDimensions(value.width, value.height) ||
+            value.interval_100ns == 0 || value.interval_100ns > static_cast<uint64_t>((std::numeric_limits<long long>::max)()) ||
+            value.interval_100ns > (std::numeric_limits<uint64_t>::max)() / 100ULL) {
             hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
         } else {
             *format = value;
@@ -518,16 +586,18 @@ HRESULT LoadRuntimeFormat(const CameraConfig &config, RuntimeFormat *format)
 class QueueReader {
 public:
     QueueReader(std::wstring name, uint32_t width, uint32_t height, uint64_t interval)
-        : name_(std::move(name)), width_(width), height_(height), interval_(interval), frame_size_(static_cast<size_t>(width) * height * 3 / 2)
+        : name_(std::move(name)), producer_name_(ProducerEventName(name_)), control_name_(ControlMappingName(name_)), width_(width), height_(height), interval_(interval),
+          frame_size_(static_cast<size_t>(width) * height * 3 / 2)
     {
+        data_name_ = DataMappingName(name_, RuntimeFormat{width_, height_, interval_});
     }
 
     ~QueueReader() { Close(); }
 
     bool Read(uint8_t *destination)
     {
-        const auto now = std::chrono::steady_clock::now();
         if (!header_) {
+            const auto now = std::chrono::steady_clock::now();
             if (now < retry_after_) {
                 return false;
             }
@@ -537,11 +607,11 @@ public:
             }
         }
         if (header_->state == kQueueStateStopping) {
-            Close();
-            ScheduleRetry(now);
+            CloseAndRetry();
             return false;
         }
         if (header_->state != kQueueStateReady) {
+            ProbeProducerLiveness();
             return false;
         }
         if (header_->cx != width_ || header_->cy != height_ || header_->interval != interval_) {
@@ -549,18 +619,24 @@ public:
             // the incompatible producer mapping, then poll at a low frequency so
             // a consumer-first fallback graph does not churn kernel objects every
             // frame while waiting for a new matching producer session.
-            Close();
-            ScheduleRetry(now);
+            CloseAndRetry();
             return false;
         }
 
         MemoryBarrier();
         const uint32_t increment = header_->read_idx;
+        if (!has_last_increment_ || increment != last_increment_) {
+            has_last_increment_ = true;
+            last_increment_ = increment;
+            stagnant_frames_ = 0;
+        } else if (!ProbeProducerLiveness()) {
+            return false;
+        }
+
         const size_t slot = increment % kSlotCount;
         const size_t offset = header_->offsets[slot];
         if (offset > view_size_ || kFrameHeaderSize > view_size_ - offset || frame_size_ > view_size_ - offset - kFrameHeaderSize) {
-            Close();
-            ScheduleRetry(now);
+            CloseAndRetry();
             return false;
         }
         std::memcpy(destination, view_ + offset + kFrameHeaderSize, frame_size_);
@@ -573,9 +649,73 @@ private:
         retry_after_ = now + std::chrono::milliseconds(kQueueRetryDelayMs);
     }
 
+    void CloseAndRetry()
+    {
+        Close();
+        ScheduleRetry(std::chrono::steady_clock::now());
+    }
+
+    bool ProducerAlive() const
+    {
+        if (producer_name_.empty()) return false;
+        HANDLE producer = OpenEventW(SYNCHRONIZE, FALSE, producer_name_.c_str());
+        if (!producer) {
+            // Missing means the producer lease disappeared. For other lookup
+            // errors, avoid a false death signal caused by transient ACL/system
+            // failures.
+            return GetLastError() != ERROR_FILE_NOT_FOUND;
+        }
+        const DWORD wait = WaitForSingleObject(producer, 0);
+        CloseHandle(producer);
+        if (wait == WAIT_OBJECT_0) return true;
+        if (wait == WAIT_TIMEOUT) return false;
+        return true;
+    }
+
+    bool CurrentProducerMatchesFormat() const
+    {
+        if (control_name_.empty()) return false;
+        HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, control_name_.c_str());
+        if (!mapping) return false;
+        auto *view = static_cast<uint8_t *>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
+        if (!view) {
+            CloseHandle(mapping);
+            return false;
+        }
+        MEMORY_BASIC_INFORMATION info{};
+        bool matches = false;
+        if (VirtualQuery(view, &info, sizeof(info)) != 0 && info.RegionSize >= sizeof(ManagedControlHeader)) {
+            auto *control = reinterpret_cast<ManagedControlHeader *>(view);
+            MemoryBarrier();
+            const uint32_t state = control->state;
+            matches = control->magic == kControlMagic && control->version == kControlVersion &&
+                      (state == kControlStateStarting || state == kControlStateReady) && control->width == width_ &&
+                      control->height == height_ && control->interval_100ns == interval_;
+        }
+        UnmapViewOfFile(view);
+        CloseHandle(mapping);
+        return matches;
+    }
+
+    bool ProbeProducerLiveness()
+    {
+        if (++stagnant_frames_ < kProducerLivenessProbeFrames) {
+            return true;
+        }
+        stagnant_frames_ = 0;
+        if (ProducerAlive() && CurrentProducerMatchesFormat()) {
+            return true;
+        }
+        CloseAndRetry();
+        return false;
+    }
+
     bool Open()
     {
-        mapping_ = OpenFileMappingW(FILE_MAP_READ, FALSE, name_.c_str());
+        if (!ProducerAlive() || !CurrentProducerMatchesFormat() || data_name_.empty()) {
+            return false;
+        }
+        mapping_ = OpenFileMappingW(FILE_MAP_READ, FALSE, data_name_.c_str());
         if (!mapping_) {
             return false;
         }
@@ -598,6 +738,9 @@ private:
     {
         header_ = nullptr;
         view_size_ = 0;
+        has_last_increment_ = false;
+        last_increment_ = 0;
+        stagnant_frames_ = 0;
         if (view_) {
             UnmapViewOfFile(view_);
             view_ = nullptr;
@@ -609,6 +752,9 @@ private:
     }
 
     std::wstring name_;
+    std::wstring producer_name_;
+    std::wstring control_name_;
+    std::wstring data_name_;
     uint32_t width_;
     uint32_t height_;
     uint64_t interval_;
@@ -617,6 +763,9 @@ private:
     uint8_t *view_ = nullptr;
     QueueHeader *header_ = nullptr;
     size_t view_size_ = 0;
+    bool has_last_increment_ = false;
+    uint32_t last_increment_ = 0;
+    uint32_t stagnant_frames_ = 0;
     std::chrono::steady_clock::time_point retry_after_{};
 };
 
@@ -688,7 +837,7 @@ private:
     {
         if (clock) {
             REFERENCE_TIME value = 0;
-            if (SUCCEEDED(clock->GetTime(&value))) {
+            if (SUCCEEDED(clock->GetTime(&value)) && value >= 0) {
                 return static_cast<uint64_t>(value);
             }
         }
@@ -707,13 +856,23 @@ private:
 
             uint64_t sample_time = FilterTime100ns();
             auto next = std::chrono::steady_clock::now();
+            const auto frame_interval = std::chrono::nanoseconds(format_.interval_100ns * 100ULL);
             while (active_ && !stopping_) {
                 lock.unlock();
                 Frame(sample_time);
                 lock.lock();
 
-                sample_time += format_.interval_100ns;
-                next += std::chrono::nanoseconds(format_.interval_100ns * 100ULL);
+                const auto now = std::chrono::steady_clock::now();
+                if (now > next + frame_interval) {
+                    // A downstream stall must not turn into a burst of historical
+                    // catch-up frames. Drop missed deadlines and resume from the
+                    // current clock at the next normal frame boundary.
+                    next = now + frame_interval;
+                    sample_time = FilterTime100ns() + format_.interval_100ns;
+                } else {
+                    next += frame_interval;
+                    sample_time += format_.interval_100ns;
+                }
                 condition_.wait_until(lock, next, [&] { return stopping_ || !active_; });
             }
         }
@@ -783,11 +942,14 @@ public:
         if (outer) return CLASS_E_NOAGGREGATION;
 
         RuntimeFormat format = FallbackRuntimeFormat();
-        // A registered camera remains activatable even when no producer exists.
-        // If a producer is live, its queue header replaces the conservative
-        // fallback before the graph negotiates its one fixed session format.
-        // Any unavailable/unreadable runtime queue leaves the fallback intact.
-        LoadRuntimeFormat(config_, &format);
+        // A missing producer is the one intentional idle case. If a producer
+        // lease exists but its queue is corrupt, inaccessible, or never becomes
+        // ready, surface that real activation error instead of silently masking
+        // it as a 640x480 black fallback.
+        const HRESULT format_hr = LoadRuntimeFormat(config_, &format);
+        if (FAILED(format_hr) && format_hr != HRESULT_FROM_WIN32(ERROR_NOT_READY)) {
+            return format_hr;
+        }
 
         auto *filter = new (std::nothrow) ManagedFilter(config_, format);
         if (!filter) return E_OUTOFMEMORY;
@@ -812,7 +974,7 @@ private:
 
 extern "C" __declspec(dllexport) uint32_t WINAPI VirtualCamGetAbiVersion()
 {
-    return 2;
+    return 3;
 }
 
 extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamRegister(const wchar_t *name, uint32_t width, uint32_t height,
@@ -825,8 +987,8 @@ extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamRegister(const wchar_t
     if (width != 0 || height != 0 || fps_numerator != 0 || fps_denominator != 0) {
         return HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH);
     }
-    std::wstring secure_module;
-    HRESULT hr = ModuleRegistryPath(&secure_module);
+    std::wstring module_path;
+    HRESULT hr = ModuleRegistryPath(&module_path);
     if (FAILED(hr)) return hr;
     ManagementLock lock;
     if (FAILED(lock.status())) return lock.status();
@@ -847,7 +1009,7 @@ extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamRegister(const wchar_t
         return cleanup_hr;
     };
 
-    hr = RegisterComServer(config.clsid, config.name);
+    hr = RegisterComServerAtPath(config.clsid, config.name, module_path);
     if (FAILED(hr)) {
         const HRESULT cleanup_hr = cleanup();
         return FAILED(cleanup_hr) ? cleanup_hr : hr;
@@ -873,14 +1035,14 @@ extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamRegister(const wchar_t
 extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamUnregister(const GUID *clsid)
 {
     if (!clsid) return E_POINTER;
-    std::wstring secure_module;
-    HRESULT hr = ModuleRegistryPath(&secure_module);
-    if (FAILED(hr)) return hr;
     ManagementLock lock;
     if (FAILED(lock.status())) return lock.status();
 
     CameraConfig config{};
-    hr = LoadConfig(*clsid, &config);
+    HRESULT hr = LoadConfig(*clsid, &config);
+    if (FAILED(hr)) return hr;
+    std::wstring original_module_path;
+    hr = ReadComServerPath(*clsid, &original_module_path);
     if (FAILED(hr)) return hr;
 
     hr = UnregisterFilter(*clsid);
@@ -894,7 +1056,7 @@ extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamUnregister(const GUID 
 
     hr = DeleteConfig(*clsid);
     if (FAILED(hr)) {
-        HRESULT rollback_hr = RegisterComServer(config.clsid, config.name);
+        HRESULT rollback_hr = RegisterComServerAtPath(config.clsid, config.name, original_module_path);
         if (SUCCEEDED(rollback_hr)) rollback_hr = RegisterFilter(config.clsid, config.name);
         if (SUCCEEDED(rollback_hr)) rollback_hr = SaveConfig(config);
         return FAILED(rollback_hr) ? rollback_hr : hr;
@@ -905,21 +1067,21 @@ extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamUnregister(const GUID 
 extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamRename(const GUID *clsid, const wchar_t *name)
 {
     if (!clsid || !name || name[0] == L'\0' || wcslen(name) > kMaxCameraName) return E_INVALIDARG;
-    std::wstring secure_module;
-    HRESULT hr = ModuleRegistryPath(&secure_module);
-    if (FAILED(hr)) return hr;
     ManagementLock lock;
     if (FAILED(lock.status())) return lock.status();
 
     CameraConfig old_config{};
-    hr = LoadConfig(*clsid, &old_config);
+    HRESULT hr = LoadConfig(*clsid, &old_config);
+    if (FAILED(hr)) return hr;
+    std::wstring original_module_path;
+    hr = ReadComServerPath(*clsid, &original_module_path);
     if (FAILED(hr)) return hr;
     CameraConfig new_config = old_config;
     new_config.name = name;
 
     auto rollback = [&]() -> HRESULT {
         UnregisterFilter(old_config.clsid);
-        HRESULT rollback_hr = RegisterComServer(old_config.clsid, old_config.name);
+        HRESULT rollback_hr = RegisterComServerAtPath(old_config.clsid, old_config.name, original_module_path);
         if (SUCCEEDED(rollback_hr)) rollback_hr = RegisterFilter(old_config.clsid, old_config.name);
         if (SUCCEEDED(rollback_hr)) rollback_hr = SaveConfig(old_config);
         return rollback_hr;

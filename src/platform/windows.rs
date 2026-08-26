@@ -80,6 +80,19 @@ impl MappedView {
         self.ptr.as_ptr()
     }
 
+    pub(crate) fn ptr_at<T>(&self, offset: usize) -> Option<NonNull<T>> {
+        let end = offset.checked_add(core::mem::size_of::<T>())?;
+        if end > self.accessible_len {
+            return None;
+        }
+        // SAFETY: `offset..end` was checked to remain inside this mapped view.
+        let raw = unsafe { self.ptr.as_ptr().add(offset) };
+        if raw.align_offset(core::mem::align_of::<T>()) != 0 {
+            return None;
+        }
+        NonNull::new(raw.cast::<T>())
+    }
+
     pub(crate) const fn accessible_len(&self) -> usize {
         self.accessible_len
     }

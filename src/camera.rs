@@ -1,11 +1,15 @@
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+#[cfg(not(windows))]
+use crate::ManagedStreamConfig;
 #[cfg(windows)]
 use crate::backend::Backend;
+#[cfg(windows)]
+use crate::config::ValidatedObsOptions;
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaStream;
-use crate::{CameraType, Error, ManagedCameraId, ManagedStreamConfig, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
+use crate::{CameraType, Error, ManagedCameraId, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
 
 /// Unified producer facade for a selected virtual-camera backend.
 ///
@@ -56,41 +60,32 @@ impl VirtualCamera {
         }
     }
 
-    pub(crate) fn open_managed(id: ManagedCameraId, stream: ManagedStreamConfig) -> Result<Self> {
-        #[cfg(not(windows))]
-        {
-            let _ = (id, stream);
-            Err(Error::UnsupportedPlatform)
-        }
+    #[cfg(windows)]
+    pub(crate) fn open_managed_validated(id: ManagedCameraId, validated: ValidatedObsOptions) -> Result<Self> {
+        let queue_name = id.queue_name_wide();
+        let backend = Backend::open_managed_nv12(validated, &queue_name)?;
+        trace_debug!(
+            camera_type = ?CameraType::ManagedNv12,
+            camera_id = %id,
+            width = validated.width,
+            height = validated.height,
+            interval_100ns = validated.interval_100ns,
+            "managed virtual camera opened"
+        );
+        Ok(Self {
+            camera_type: CameraType::ManagedNv12,
+            native_format: PixelFormat::Nv12,
+            frame_size: validated.frame_size,
+            closed: false,
+            backend,
+            not_send_or_sync: PhantomData,
+        })
+    }
 
-        #[cfg(windows)]
-        {
-            let options = ObsOptions {
-                width: stream.width,
-                height: stream.height,
-                frame_rate: stream.frame_rate,
-                force_open: false,
-            };
-            let validated = options.validate()?;
-            let queue_name = id.queue_name_wide();
-            let backend = Backend::open_managed_nv12(validated, &queue_name)?;
-            trace_debug!(
-                camera_type = ?CameraType::ManagedNv12,
-                camera_id = %id,
-                width = validated.width,
-                height = validated.height,
-                interval_100ns = validated.interval_100ns,
-                "managed virtual camera opened"
-            );
-            Ok(Self {
-                camera_type: CameraType::ManagedNv12,
-                native_format: PixelFormat::Nv12,
-                frame_size: validated.frame_size,
-                closed: false,
-                backend,
-                not_send_or_sync: PhantomData,
-            })
-        }
+    #[cfg(not(windows))]
+    pub(crate) fn open_managed(id: ManagedCameraId, stream: ManagedStreamConfig) -> Result<Self> {
+        let _ = (id, stream);
+        Err(Error::UnsupportedPlatform)
     }
 
     /// Opens a Unity Capture producer with Unity-specific protocol controls.
