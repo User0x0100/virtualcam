@@ -8,7 +8,7 @@
 | OBS Virtual Camera | NV12 | tightly packed Y plane, then interleaved UV |
 | Unity Capture | RGBA8, RGBA FP16 gamma, or RGBA FP16 linear | tight or explicitly padded rows |
 
-The Rust producer path does no scaling, pixel conversion, or color conversion. Managed cameras expose one fixed NV12 mode per registration; their native DirectShow DLL owns only output pacing and copies the selected NV12 queue slot into the consumer sample. Unity's receiver can optionally scale or mirror after receiving a frame.
+The Rust producer path does no scaling, pixel conversion, or color conversion. Managed camera registration stores only persistent device identity; each producer session selects one NV12 width/height/frame-rate before a DirectShow consumer connects. The native DLL owns only output pacing and copies the selected NV12 queue slot into the consumer sample. Unity's receiver can optionally scale or mirror after receiving a frame.
 
 ## Managed independent NV12 cameras
 
@@ -16,8 +16,9 @@ The Rust producer path does no scaling, pixel conversion, or color conversion. M
 
 - a generated, independent COM CLSID;
 - an arbitrary DirectShow friendly name;
-- its own `Local\\VirtualCamRs-{CLSID}` three-slot NV12 mapping;
-- one fixed width/height/frame-rate media type.
+- its own `Local\\VirtualCamRs-{CLSID}` three-slot NV12 mapping name.
+
+Width, height, and frame rate are not part of registration. `ManagedCameraManager::open` creates that camera's queue with the requested runtime format and a per-camera ready event. The queue header is initialized in an unpublished state, then `STARTING` is published with the final volatile state store before the ready event is signaled. The DirectShow DLL waits for that event before reading the header, so a consumer racing producer startup cannot observe a partially initialized format. The same CLSID can therefore be reopened later with another even NV12 resolution or frame rate without unregistering the device.
 
 Build the x64 DLL first, then install it under `%ProgramFiles%` from an elevated shell. Machine-wide COM registration intentionally rejects DLLs loaded from user-writable locations.
 
@@ -32,7 +33,10 @@ Copy-Item native/managed-virtualcam/build/Release/virtualcam-managed.dll $driver
 Then manage devices through the public Rust API:
 
 ```rust,no_run
-use virtualcam::{ManagedCameraConfig, ManagedCameraManager, ObsFrameRate, WriteStatus};
+use virtualcam::{
+    ManagedCameraConfig, ManagedCameraManager, ManagedStreamConfig, ObsFrameRate,
+    WriteStatus,
+};
 
 # fn run() -> Result<(), virtualcam::Error> {
 let manager = ManagedCameraManager::new(
@@ -40,14 +44,30 @@ let manager = ManagedCameraManager::new(
 );
 let info = manager.register(ManagedCameraConfig {
     name: "FaceSwap Output".into(),
-    width: 1920,
-    height: 1080,
-    frame_rate: ObsFrameRate { numerator: 60, denominator: 1 },
 })?;
 
-let mut camera = manager.open(info.id)?;
+let mut camera = manager.open(
+    info.id,
+    ManagedStreamConfig {
+        width: 1080,
+        height: 1920,
+        frame_rate: ObsFrameRate { numerator: 60, denominator: 1 },
+    },
+)?;
 let nv12 = vec![0_u8; camera.frame_size()];
 assert_eq!(camera.write_host(&nv12)?, WriteStatus::Written);
+camera.close()?;
+
+// The registration and CLSID stay unchanged. A later producer session may use
+// another format before the next DirectShow consumer connects.
+let mut camera = manager.open(
+    info.id,
+    ManagedStreamConfig {
+        width: 2560,
+        height: 1440,
+        frame_rate: ObsFrameRate { numerator: 30, denominator: 1 },
+    },
+)?;
 camera.close()?;
 
 manager.rename(info.id, "FaceSwap Main")?;
@@ -56,7 +76,7 @@ manager.unregister(info.id)?;
 # }
 ```
 
-`register`, `unregister`, `rename`, `get`, and `list` are management operations. Registration uses DirectShow's filter mapper and writes system COM registration, so register/rename/unregister normally require elevation; read/open operations do not. Mutating operations are serialized across processes and the native DLL must resolve beneath the canonical Program Files directory before any machine-wide registration is changed. Keep that installed DLL at a stable absolute location for as long as any registration exists, because COM records the loaded module path. Existing OBS Virtual Camera registration is untouched. The first native build target is x64; supporting 32-bit DirectShow consumers requires a corresponding x86 DLL/registry view.
+`register`, `unregister`, `rename`, `get`, and `list` are persistent management operations. Registration uses DirectShow's filter mapper and writes system COM registration, so register/rename/unregister normally require elevation; read/open operations do not. `open` creates the per-camera runtime queue and selects that producer session's format. Before creating the queue it also resolves the camera's actual `HKCR\\CLSID\\{id}\\InprocServer32` target and verifies that the DLL COM will load implements managed-driver ABI v2; the manager's own DLL path is not treated as authoritative for an existing registration. Open the producer before the receiving application opens the camera. A format is fixed for one connected DirectShow graph; close/reopen the producer before the next consumer connection to change dimensions or frame rate. Mutating operations are serialized across processes and the native DLL must resolve beneath the canonical Program Files directory before any machine-wide registration is changed. Keep that installed DLL at a stable absolute location for as long as any registration exists, because COM records the loaded module path. Existing OBS Virtual Camera registration is untouched. The first native build target is x64; supporting 32-bit DirectShow consumers requires a corresponding x86 DLL/registry view.
 
 ## Independent backend controls
 
@@ -126,8 +146,8 @@ buffering are not shared-memory camera controls. They are intentionally absent
 because this crate receives an already accessible host or CUDA buffer instead
 of a Unity `ID3D11Texture2D`.
 
-Every frame must contain exactly `camera.frame_size()` bytes. OBS NV12 width and
-height must both be even.
+Every frame must contain exactly `camera.frame_size()` bytes. OBS and managed
+NV12 width and height must both be even.
 
 `is_ready()` follows what each upstream protocol can actually report. Unity returns `false` until its DirectShow receiver has created the required objects. OBS has no consumer-presence handshake, so its producer is ready as soon as its queue is open.
 
@@ -300,7 +320,7 @@ consumer may be open or closed because both states are valid and checked:
 cargo test --all-features --test windows_installed -- --ignored --test-threads=1
 ```
 
-A separate ignored integration test performs the full managed-camera lifecycle: it registers two independent devices, renames one, verifies both through FFmpeg's DirectShow enumeration, opens both independent NV12 producer queues, captures frames from one, and unregisters both. Run from an elevated shell after building the DLL:
+A separate ignored integration test performs the full managed-camera lifecycle: it registers two independent devices, renames one, verifies both through FFmpeg's DirectShow enumeration, opens independent NV12 producer queues, then captures the same CLSID first at `320x240@30` and later at `240x320@25` without re-registering it. It finally unregisters both devices. Run from an elevated shell after building the DLL:
 
 ```powershell
 $env:VIRTUALCAM_MANAGED_DRIVER = "$PWD\native\managed-virtualcam\build\Release\virtualcam-managed.dll"

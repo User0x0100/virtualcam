@@ -72,26 +72,41 @@ impl FromStr for ManagedCameraId {
     }
 }
 
-/// Registration-time format of one managed NV12 virtual camera.
+/// Persistent registration metadata for one managed NV12 virtual camera.
 ///
-/// Each camera intentionally exposes one fixed NV12 mode. Register another
-/// camera when an independent name or format is required.
+/// Registration creates only the stable device identity. Width, height, and
+/// frame rate are selected later for each producer session with
+/// [`ManagedStreamConfig`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagedCameraConfig {
     /// Friendly name shown by DirectShow camera enumerators.
     pub name: String,
-    /// Fixed NV12 width. Must be non-zero and even.
-    pub width: u32,
-    /// Fixed NV12 height. Must be non-zero and even.
-    pub height: u32,
-    /// Fixed frame rate advertised by the DirectShow output pin.
-    pub frame_rate: ObsFrameRate,
 }
 
 impl Default for ManagedCameraConfig {
     fn default() -> Self {
+        Self { name: "VirtualCam NV12".to_owned() }
+    }
+}
+
+/// Runtime format selected before a DirectShow consumer connects.
+///
+/// One producer session exposes exactly one NV12 media type. A later session
+/// may reopen the same registered CLSID with a different format. Changing the
+/// format of an already connected DirectShow graph is intentionally unsupported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManagedStreamConfig {
+    /// NV12 width. Must be non-zero and even.
+    pub width: u32,
+    /// NV12 height. Must be non-zero and even.
+    pub height: u32,
+    /// Frame rate advertised for this producer session.
+    pub frame_rate: ObsFrameRate,
+}
+
+impl Default for ManagedStreamConfig {
+    fn default() -> Self {
         Self {
-            name: "VirtualCam NV12".to_owned(),
             width: 1920,
             height: 1080,
             frame_rate: ObsFrameRate::default(),
@@ -99,19 +114,13 @@ impl Default for ManagedCameraConfig {
     }
 }
 
-/// Current registration metadata for one managed camera.
+/// Current persistent registration metadata for one managed camera.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagedCameraInfo {
     /// Stable COM CLSID used to address this registration.
     pub id: ManagedCameraId,
     /// Friendly name shown to camera consumers.
     pub name: String,
-    /// Fixed NV12 width.
-    pub width: u32,
-    /// Fixed NV12 height.
-    pub height: u32,
-    /// Fixed advertised frame rate.
-    pub frame_rate: ObsFrameRate,
 }
 
 /// Management facade for the native DirectShow camera DLL.
@@ -137,8 +146,11 @@ impl ManagedCameraManager {
     }
 
     /// Registers a new independent NV12 camera and returns its generated CLSID.
+    ///
+    /// No stream format is persisted. The format is selected by [`Self::open`]
+    /// before a DirectShow consumer connects.
     pub fn register(&self, config: ManagedCameraConfig) -> Result<ManagedCameraInfo> {
-        validate_config(&config)?;
+        validate_name(&config.name)?;
         platform::register(&self.driver_path, &config)
     }
 
@@ -165,10 +177,22 @@ impl ManagedCameraManager {
         platform::get(&self.driver_path, id)
     }
 
-    /// Opens the independent NV12 producer queue for one registered camera.
-    pub fn open(&self, id: ManagedCameraId) -> Result<VirtualCamera> {
-        let info = self.get(id)?;
-        VirtualCamera::open_managed(info)
+    /// Opens one producer session with the runtime NV12 format to advertise.
+    ///
+    /// The queue header is the runtime format declaration consumed by the
+    /// DirectShow DLL. Open the producer before the receiving application opens
+    /// the camera. Reopen after the previous session ends to use another format
+    /// with the same CLSID.
+    pub fn open(&self, id: ManagedCameraId, stream: ManagedStreamConfig) -> Result<VirtualCamera> {
+        #[cfg(windows)]
+        {
+            validate_stream(&stream)?;
+            self.get(id)?;
+            platform::validate_registered_driver(id)?;
+        }
+        #[cfg(not(windows))]
+        self.get(id)?;
+        VirtualCamera::open_managed(id, stream)
     }
 }
 
@@ -179,20 +203,20 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_config(config: &ManagedCameraConfig) -> Result<()> {
-    validate_name(&config.name)?;
-    if config.width == 0 || config.height == 0 || !config.width.is_multiple_of(2) || !config.height.is_multiple_of(2) || config.width > i32::MAX as u32 || config.height > i32::MAX as u32 {
+#[cfg(windows)]
+fn validate_stream(stream: &ManagedStreamConfig) -> Result<()> {
+    if stream.width == 0 || stream.height == 0 || !stream.width.is_multiple_of(2) || !stream.height.is_multiple_of(2) || stream.width > i32::MAX as u32 || stream.height > i32::MAX as u32 {
         return Err(Error::InvalidDimensions);
     }
-    let pixels = u64::from(config.width) * u64::from(config.height);
+    let pixels = u64::from(stream.width) * u64::from(stream.height);
     if pixels > (i32::MAX as u64) / 12 {
         return Err(Error::InvalidDimensions);
     }
-    if config.frame_rate.numerator == 0 || config.frame_rate.denominator == 0 {
+    if stream.frame_rate.numerator == 0 || stream.frame_rate.denominator == 0 {
         return Err(Error::InvalidFrameRate);
     }
-    let interval = u128::from(config.frame_rate.denominator) * 10_000_000 / u128::from(config.frame_rate.numerator);
-    if interval == 0 || interval > u64::MAX as u128 {
+    let interval = u128::from(stream.frame_rate.denominator) * 10_000_000 / u128::from(stream.frame_rate.numerator);
+    if interval == 0 || interval > i64::MAX as u128 {
         return Err(Error::InvalidFrameRate);
     }
     Ok(())
@@ -202,28 +226,32 @@ fn validate_config(config: &ManagedCameraConfig) -> Result<()> {
 mod platform {
     use core::ffi::c_void;
     use core::mem;
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::Path;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Path, PathBuf};
 
     use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows_sys::Win32::System::Registry::{HKEY, HKEY_CLASSES_ROOT, KEY_READ, REG_SZ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW};
 
     use super::{ManagedCameraConfig, ManagedCameraId, ManagedCameraInfo};
-    use crate::{Error, ObsFrameRate, Result};
+    use crate::{Error, Result};
 
     const NAME_CAPACITY: usize = 256;
+    const ABI_VERSION: u32 = 2;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct CameraInfoAbi {
         clsid: ManagedCameraId,
         name: [u16; NAME_CAPACITY],
-        width: u32,
-        height: u32,
-        fps_numerator: u32,
-        fps_denominator: u32,
+        reserved_width: u32,
+        reserved_height: u32,
+        reserved_fps_numerator: u32,
+        reserved_fps_denominator: u32,
     }
 
+    type AbiVersionFn = unsafe extern "system" fn() -> u32;
     type RegisterFn = unsafe extern "system" fn(*const u16, u32, u32, u32, u32, *mut CameraInfoAbi) -> i32;
     type UnregisterFn = unsafe extern "system" fn(*const ManagedCameraId) -> i32;
     type RenameFn = unsafe extern "system" fn(*const ManagedCameraId, *const u16) -> i32;
@@ -253,6 +281,10 @@ mod platform {
             // fixed by exports.def and converted only to their matching ABI.
             unsafe {
                 let result = (|| {
+                    let abi_version: AbiVersionFn = load_symbol(module, b"VirtualCamGetAbiVersion\0")?;
+                    if abi_version() != ABI_VERSION {
+                        return Err(Error::ManagedDriverAbi { symbol: "VirtualCamGetAbiVersion" });
+                    }
                     Ok(Self {
                         module,
                         register: load_symbol(module, b"VirtualCamRegister\0")?,
@@ -296,6 +328,70 @@ mod platform {
         value.encode_utf16().chain(core::iter::once(0)).collect()
     }
 
+    fn registered_driver_path(id: ManagedCameraId) -> Result<PathBuf> {
+        let key_path = wide_string(&format!("CLSID\\{id}\\InprocServer32"));
+        let mut key: HKEY = core::ptr::null_mut();
+        // SAFETY: `key_path` is NUL-terminated and `key` points to writable
+        // output storage. HKCR is a predefined non-owning root handle.
+        let status = unsafe { RegOpenKeyExW(HKEY_CLASSES_ROOT, key_path.as_ptr(), 0, KEY_READ, &mut key) };
+        if status != 0 {
+            return Err(Error::Windows {
+                operation: "RegOpenKeyExW(managed InprocServer32)",
+                code: status,
+            });
+        }
+
+        let result = (|| {
+            let mut value_type = 0_u32;
+            let mut bytes = 0_u32;
+            // SAFETY: A null value-name requests the key's default value. The
+            // first call queries only its type and byte length.
+            let status = unsafe { RegQueryValueExW(key, core::ptr::null(), core::ptr::null(), &mut value_type, core::ptr::null_mut(), &mut bytes) };
+            if status != 0 {
+                return Err(Error::Windows {
+                    operation: "RegQueryValueExW(managed InprocServer32 size)",
+                    code: status,
+                });
+            }
+            if value_type != REG_SZ || bytes < 2 || !bytes.is_multiple_of(2) {
+                return Err(Error::ManagedDriverAbi { symbol: "registered InprocServer32 path" });
+            }
+
+            let mut buffer = vec![0_u16; bytes as usize / 2];
+            // SAFETY: `buffer` has exactly the byte capacity reported by the
+            // preceding query and remains writable for the synchronous call.
+            let status = unsafe { RegQueryValueExW(key, core::ptr::null(), core::ptr::null(), &mut value_type, buffer.as_mut_ptr().cast::<u8>(), &mut bytes) };
+            if status != 0 {
+                return Err(Error::Windows {
+                    operation: "RegQueryValueExW(managed InprocServer32)",
+                    code: status,
+                });
+            }
+            if value_type != REG_SZ {
+                return Err(Error::ManagedDriverAbi { symbol: "registered InprocServer32 path" });
+            }
+            let end = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+            if end == 0 {
+                return Err(Error::ManagedDriverAbi { symbol: "registered InprocServer32 path" });
+            }
+            Ok(PathBuf::from(OsString::from_wide(&buffer[..end])))
+        })();
+
+        // SAFETY: A successful RegOpenKeyExW returned one owned key handle.
+        unsafe {
+            RegCloseKey(key);
+        }
+        result
+    }
+
+    pub(super) fn validate_registered_driver(id: ManagedCameraId) -> Result<()> {
+        let path = registered_driver_path(id)?;
+        // Loading the actual InprocServer32 target is intentional: the manager
+        // DLL path is not authoritative for an already-registered COM class.
+        let _driver = DriverApi::load(&path)?;
+        Ok(())
+    }
+
     fn check_hresult(operation: &'static str, hr: i32) -> Result<()> {
         if hr >= 0 { Ok(()) } else { Err(Error::Hresult { operation, code: hr }) }
     }
@@ -303,16 +399,7 @@ mod platform {
     fn from_abi(info: CameraInfoAbi) -> Result<ManagedCameraInfo> {
         let end = info.name.iter().position(|unit| *unit == 0).unwrap_or(NAME_CAPACITY);
         let name = String::from_utf16(&info.name[..end]).map_err(|_| Error::ManagedDriverAbi { symbol: "CameraInfoAbi.name" })?;
-        Ok(ManagedCameraInfo {
-            id: info.clsid,
-            name,
-            width: info.width,
-            height: info.height,
-            frame_rate: ObsFrameRate {
-                numerator: info.fps_numerator,
-                denominator: info.fps_denominator,
-            },
-        })
+        Ok(ManagedCameraInfo { id: info.clsid, name })
     }
 
     pub(super) fn register(path: &Path, config: &ManagedCameraConfig) -> Result<ManagedCameraInfo> {
@@ -326,14 +413,15 @@ mod platform {
                 data4: [0; 8],
             },
             name: [0; NAME_CAPACITY],
-            width: 0,
-            height: 0,
-            fps_numerator: 0,
-            fps_denominator: 0,
+            reserved_width: 0,
+            reserved_height: 0,
+            reserved_fps_numerator: 0,
+            reserved_fps_denominator: 0,
         };
         // SAFETY: pointers are valid for the synchronous native call and `info`
-        // matches the driver's fixed C ABI layout.
-        let hr = unsafe { (driver.register)(name.as_ptr(), config.width, config.height, config.frame_rate.numerator, config.frame_rate.denominator, &mut info) };
+        // matches the driver's fixed C ABI layout. Zero format arguments are the
+        // ABI-v2 marker for identity-only registration.
+        let hr = unsafe { (driver.register)(name.as_ptr(), 0, 0, 0, 0, &mut info) };
         check_hresult("VirtualCamRegister", hr)?;
         from_abi(info)
     }
@@ -356,10 +444,10 @@ mod platform {
         let mut info = CameraInfoAbi {
             clsid: id,
             name: [0; NAME_CAPACITY],
-            width: 0,
-            height: 0,
-            fps_numerator: 0,
-            fps_denominator: 0,
+            reserved_width: 0,
+            reserved_height: 0,
+            reserved_fps_numerator: 0,
+            reserved_fps_denominator: 0,
         };
         // SAFETY: `id` and `info` live for the synchronous native call.
         check_hresult("VirtualCamGet", unsafe { (driver.get)(&id, &mut info) })?;
@@ -430,10 +518,32 @@ mod tests {
     }
 
     #[test]
-    fn managed_config_is_fixed_nv12_mode() {
+    fn managed_registration_only_validates_identity() {
         let config = ManagedCameraConfig::default();
-        assert!(validate_config(&config).is_ok());
-        assert!(matches!(validate_config(&ManagedCameraConfig { width: 1919, ..config.clone() }), Err(Error::InvalidDimensions)));
-        assert!(matches!(validate_config(&ManagedCameraConfig { name: String::new(), ..config }), Err(Error::InvalidCameraName)));
+        assert!(validate_name(&config.name).is_ok());
+        assert_eq!(validate_name(""), Err(Error::InvalidCameraName));
+    }
+
+    #[test]
+    fn managed_stream_defaults_to_nv12_friendly_dimensions() {
+        let stream = ManagedStreamConfig::default();
+        assert_eq!((stream.width, stream.height), (1920, 1080));
+        assert_eq!(stream.frame_rate, ObsFrameRate::default());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_stream_validation_matches_native_fixed_mode_limits() {
+        let stream = ManagedStreamConfig::default();
+        assert!(validate_stream(&stream).is_ok());
+        assert_eq!(validate_stream(&ManagedStreamConfig { width: 1919, ..stream }), Err(Error::InvalidDimensions));
+        assert_eq!(validate_stream(&ManagedStreamConfig { width: 65_536, height: 65_536, ..stream }), Err(Error::InvalidDimensions));
+        assert_eq!(
+            validate_stream(&ManagedStreamConfig {
+                frame_rate: ObsFrameRate { numerator: 0, denominator: 1 },
+                ..stream
+            }),
+            Err(Error::InvalidFrameRate)
+        );
     }
 }

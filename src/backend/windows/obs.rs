@@ -1,22 +1,32 @@
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{Ordering, compiler_fence, fence};
 
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_ALL_ACCESS, FILE_MAP_READ, OpenFileMappingW, PAGE_READWRITE};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
 
 use super::FrameSource;
-use super::protocol::obs::{QueueHeader, QueueLayout, SLOT_COUNT, STATE_READY, STATE_STOPPING};
+use super::protocol::obs::{QueueHeader, QueueLayout, SLOT_COUNT, STATE_READY, STATE_STARTING, STATE_STOPPING};
 use crate::config::ValidatedObsOptions;
 use crate::platform::windows::{MappedView, OwnedHandle, last_error};
 use crate::{CameraType, Error, Result, WriteStatus};
 
 pub(super) const OBS_CLSID_KEY: &str = "CLSID\\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}";
 
+fn managed_ready_event_name(video_name: &[u16]) -> Vec<u16> {
+    let end = video_name.iter().position(|unit| *unit == 0).unwrap_or(video_name.len());
+    let mut name = video_name[..end].to_vec();
+    name.extend("-Ready".encode_utf16());
+    name.push(0);
+    name
+}
+
 pub(crate) struct ObsBackend {
     camera_type: CameraType,
     view: Option<MappedView>,
     mapping: Option<OwnedHandle>,
+    ready_event: Option<OwnedHandle>,
     layout: QueueLayout,
     y_plane_size: usize,
     clock_frequency: u64,
@@ -26,6 +36,27 @@ pub(crate) struct ObsBackend {
 impl ObsBackend {
     pub(crate) fn open(options: ValidatedObsOptions, video_name: &[u16], camera_type: CameraType) -> Result<Self> {
         let layout = QueueLayout::calculate(options.frame_size)?;
+        let ready_event = if camera_type == CameraType::ManagedNv12 {
+            let ready_name = managed_ready_event_name(video_name);
+            // SAFETY: `ready_name` is NUL-terminated and the event is an
+            // unnamed-security, manual-reset kernel object owned by this producer.
+            let raw_event = unsafe { CreateEventW(core::ptr::null(), 1, 0, ready_name.as_ptr()) };
+            if raw_event.is_null() {
+                return Err(last_error("CreateEventW(managed runtime ready)"));
+            }
+            // Capture thread-local last-error before wrapping the handle.
+            // SAFETY: GetLastError has no preconditions.
+            let create_status = unsafe { GetLastError() };
+            // SAFETY: Successful CreateEventW transferred one owned handle.
+            let event = unsafe { OwnedHandle::from_raw(raw_event) };
+            if create_status == ERROR_ALREADY_EXISTS {
+                return Err(Error::DeviceInUse);
+            }
+            Some(event)
+        } else {
+            None
+        };
+
         if !options.force_open {
             // Upstream performs this conservative read-only open first and treats
             // any successful handle as an occupied producer queue.
@@ -76,13 +107,23 @@ impl ObsBackend {
             });
         }
 
-        let header = QueueHeader::new(options.width, options.height, options.interval_100ns, layout.offsets);
+        let mut header = QueueHeader::new(options.width, options.height, options.interval_100ns, layout.offsets);
+        header.state = 0;
         // SAFETY: The mapped view is writable and at least `layout.total_size`
         // bytes long. Its base has allocation alignment, which exceeds the
         // QueueHeader alignment. `header` does not alias the destination.
         unsafe {
             core::ptr::copy_nonoverlapping(&header, view.as_ptr().cast::<QueueHeader>(), 1);
         }
+        fence(Ordering::SeqCst);
+        // Publish STARTING only after every format/layout field is initialized.
+        // Consumers may observe the mapping name before this store completes.
+        let mapped_header = view.as_ptr().cast::<QueueHeader>();
+        // SAFETY: `mapped_header` points to the live writable queue header.
+        unsafe {
+            core::ptr::write_volatile(addr_of_mut!((*mapped_header).state), STATE_STARTING);
+        }
+        fence(Ordering::SeqCst);
 
         let mut frequency = 0_i64;
         // SAFETY: `frequency` is valid writable storage for LARGE_INTEGER's i64
@@ -95,6 +136,16 @@ impl ObsBackend {
             detail: "performance counter frequency is not positive",
         })?;
 
+        if let Some(event) = ready_event.as_ref() {
+            // Signal only after every fallible producer initialization step has
+            // succeeded, so a waiting consumer cannot observe a session that
+            // `open` is about to reject.
+            // SAFETY: `event` is a live manual-reset event owned by this producer.
+            if unsafe { SetEvent(event.raw()) } == 0 {
+                return Err(last_error("SetEvent(managed runtime ready)"));
+            }
+        }
+
         if already_exists {
             trace_warn!(required = layout.total_size, available = view.accessible_len(), "OBS force_open reinitialized an existing mapping");
         }
@@ -103,6 +154,7 @@ impl ObsBackend {
             camera_type,
             view: Some(view),
             mapping: Some(mapping),
+            ready_event,
             layout,
             y_plane_size: usize::try_from(options.width)
                 .ok()
@@ -209,6 +261,7 @@ impl ObsBackend {
         self.open = false;
         self.view = None;
         self.mapping = None;
+        self.ready_event = None;
         Ok(())
     }
 }
@@ -226,6 +279,7 @@ fn mul_div_u64(number: u64, multiplier: u64, divisor: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
+    use windows_sys::Win32::System::Threading::CreateEventW;
 
     use super::*;
     use crate::{ObsFrameRate, ObsOptions};
@@ -249,6 +303,19 @@ mod tests {
     #[test]
     fn timestamp_conversion_matches_upstream_mul_div() {
         assert_eq!(mul_div_u64(12_345, 1_000_000_000, 10_000_000), 1_234_500);
+    }
+
+    #[test]
+    fn managed_ready_event_reserves_producer_before_mapping_exists() {
+        let name = test_name("managed_ready_reservation");
+        let ready_name = managed_ready_event_name(&name);
+        // SAFETY: unique NUL-terminated test name; the returned handle is owned.
+        let raw_event = unsafe { CreateEventW(core::ptr::null(), 1, 0, ready_name.as_ptr()) };
+        assert!(!raw_event.is_null());
+        // SAFETY: Successful CreateEventW transferred one owned handle.
+        let _event = unsafe { OwnedHandle::from_raw(raw_event) };
+
+        assert!(matches!(ObsBackend::open(validated(64, 64, false), &name, CameraType::ManagedNv12), Err(Error::DeviceInUse)));
     }
 
     #[test]

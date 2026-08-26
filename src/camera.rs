@@ -5,7 +5,7 @@ use std::rc::Rc;
 use crate::backend::Backend;
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaStream;
-use crate::{CameraType, Error, ManagedCameraInfo, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
+use crate::{CameraType, Error, ManagedCameraId, ManagedStreamConfig, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
 
 /// Unified producer facade for a selected virtual-camera backend.
 ///
@@ -56,27 +56,27 @@ impl VirtualCamera {
         }
     }
 
-    pub(crate) fn open_managed(info: ManagedCameraInfo) -> Result<Self> {
+    pub(crate) fn open_managed(id: ManagedCameraId, stream: ManagedStreamConfig) -> Result<Self> {
         #[cfg(not(windows))]
         {
-            let _ = info;
+            let _ = (id, stream);
             Err(Error::UnsupportedPlatform)
         }
 
         #[cfg(windows)]
         {
             let options = ObsOptions {
-                width: info.width,
-                height: info.height,
-                frame_rate: info.frame_rate,
+                width: stream.width,
+                height: stream.height,
+                frame_rate: stream.frame_rate,
                 force_open: false,
             };
             let validated = options.validate()?;
-            let queue_name = info.id.queue_name_wide();
+            let queue_name = id.queue_name_wide();
             let backend = Backend::open_managed_nv12(validated, &queue_name)?;
             trace_debug!(
                 camera_type = ?CameraType::ManagedNv12,
-                camera_id = %info.id,
+                camera_id = %id,
                 width = validated.width,
                 height = validated.height,
                 interval_100ns = validated.interval_100ns,

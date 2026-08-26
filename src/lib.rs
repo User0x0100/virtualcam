@@ -78,6 +78,6 @@ pub use config::{CameraType, ObsFrameRate, ObsOptions, UnityCaptureFormat, Unity
 #[cfg(feature = "cuda")]
 pub use cuda::CudaStream;
 pub use error::{Error, Result};
-pub use managed::{ManagedCameraConfig, ManagedCameraId, ManagedCameraInfo, ManagedCameraManager};
+pub use managed::{ManagedCameraConfig, ManagedCameraId, ManagedCameraInfo, ManagedCameraManager, ManagedStreamConfig};
 pub use pixel_format::PixelFormat;
 pub use status::WriteStatus;

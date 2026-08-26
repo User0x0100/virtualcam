@@ -2,6 +2,7 @@ LIBRARY virtualcam-managed
 EXPORTS
     DllCanUnloadNow PRIVATE
     DllGetClassObject PRIVATE
+    VirtualCamGetAbiVersion
     VirtualCamRegister
     VirtualCamUnregister
     VirtualCamRename

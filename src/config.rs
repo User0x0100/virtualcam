@@ -7,7 +7,7 @@ use crate::{Error, Result};
 pub enum CameraType {
     /// OBS Studio's Windows virtual-camera shared queue.
     Obs,
-    /// This crate's independently registered fixed-mode NV12 DirectShow camera.
+    /// This crate's independently registered per-session NV12 DirectShow camera.
     ManagedNv12,
     /// The Unity Capture `SharedImageMemory` protocol.
     UnityCapture,

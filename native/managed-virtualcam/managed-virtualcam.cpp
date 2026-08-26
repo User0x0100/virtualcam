@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -29,14 +30,10 @@ constexpr wchar_t kManagementMutex[] = L"Global\\VirtualCamRs-ManagedCamera-Mana
 constexpr wchar_t kThreadingModel[] = L"Both";
 constexpr wchar_t kValueName[] = L"Name";
 constexpr wchar_t kValueQueueName[] = L"QueueName";
-constexpr wchar_t kValueWidth[] = L"Width";
-constexpr wchar_t kValueHeight[] = L"Height";
-constexpr wchar_t kValueFpsNumerator[] = L"FpsNumerator";
-constexpr wchar_t kValueFpsDenominator[] = L"FpsDenominator";
-constexpr wchar_t kValueInterval[] = L"Interval100ns";
 constexpr size_t kMaxCameraName = 255;
 constexpr size_t kFrameHeaderSize = 32;
 constexpr size_t kSlotCount = 3;
+constexpr DWORD kRuntimeReadyTimeoutMs = 5000;
 
 HINSTANCE g_module = nullptr;
 std::atomic<long> g_locks{0};
@@ -44,10 +41,10 @@ std::atomic<long> g_locks{0};
 struct CameraInfoAbi {
     GUID clsid;
     wchar_t name[256];
-    uint32_t width;
-    uint32_t height;
-    uint32_t fps_numerator;
-    uint32_t fps_denominator;
+    uint32_t reserved_width;
+    uint32_t reserved_height;
+    uint32_t reserved_fps_numerator;
+    uint32_t reserved_fps_denominator;
 };
 
 using EnumCallback = BOOL(WINAPI *)(const CameraInfoAbi *info, void *context);
@@ -56,10 +53,11 @@ struct CameraConfig {
     GUID clsid{};
     std::wstring name;
     std::wstring queue_name;
+};
+
+struct RuntimeFormat {
     uint32_t width = 0;
     uint32_t height = 0;
-    uint32_t fps_numerator = 0;
-    uint32_t fps_denominator = 0;
     uint64_t interval_100ns = 0;
 };
 
@@ -79,6 +77,7 @@ struct QueueHeader {
 
 static_assert(sizeof(QueueHeader) == 80, "OBS queue header ABI changed");
 
+constexpr uint32_t kQueueStateStarting = 1;
 constexpr uint32_t kQueueStateReady = 2;
 constexpr uint32_t kQueueStateStopping = 3;
 
@@ -210,6 +209,11 @@ std::wstring QueueName(REFGUID guid)
     return std::wstring(L"Local\\VirtualCamRs-") + guid_string;
 }
 
+std::wstring ReadyEventName(const std::wstring &queue_name)
+{
+    return queue_name.empty() ? std::wstring{} : queue_name + L"-Ready";
+}
+
 bool ValidDimensions(uint32_t width, uint32_t height)
 {
     if (width == 0 || height == 0 || (width % 2) != 0 || (height % 2) != 0 || width > INT_MAX || height > INT_MAX) {
@@ -222,34 +226,10 @@ bool ValidDimensions(uint32_t width, uint32_t height)
     return pixels <= static_cast<uint64_t>(INT_MAX) / 12ULL;
 }
 
-HRESULT ComputeInterval(uint32_t numerator, uint32_t denominator, uint64_t *interval)
-{
-    if (!interval || numerator == 0 || denominator == 0) {
-        return E_INVALIDARG;
-    }
-    const unsigned __int64 scaled = static_cast<unsigned __int64>(denominator) * 10000000ULL;
-    const uint64_t value = scaled / numerator;
-    if (value == 0) {
-        return E_INVALIDARG;
-    }
-    *interval = value;
-    return S_OK;
-}
-
 HRESULT SetString(HKEY key, const wchar_t *name, const std::wstring &value)
 {
     const DWORD bytes = static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t));
     return HrFromWin32(RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE *>(value.c_str()), bytes));
-}
-
-HRESULT SetDword(HKEY key, const wchar_t *name, uint32_t value)
-{
-    return HrFromWin32(RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE *>(&value), sizeof(value)));
-}
-
-HRESULT SetQword(HKEY key, const wchar_t *name, uint64_t value)
-{
-    return HrFromWin32(RegSetValueExW(key, name, 0, REG_QWORD, reinterpret_cast<const BYTE *>(&value), sizeof(value)));
 }
 
 HRESULT QueryString(HKEY key, const wchar_t *name, std::wstring *out)
@@ -276,34 +256,6 @@ HRESULT QueryString(HKEY key, const wchar_t *name, std::wstring *out)
     return S_OK;
 }
 
-HRESULT QueryDword(HKEY key, const wchar_t *name, uint32_t *out)
-{
-    if (!out) {
-        return E_POINTER;
-    }
-    DWORD type = 0;
-    DWORD bytes = sizeof(*out);
-    auto status = RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE *>(out), &bytes);
-    if (status != ERROR_SUCCESS) {
-        return HrFromWin32(status);
-    }
-    return type == REG_DWORD && bytes == sizeof(*out) ? S_OK : HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
-}
-
-HRESULT QueryQword(HKEY key, const wchar_t *name, uint64_t *out)
-{
-    if (!out) {
-        return E_POINTER;
-    }
-    DWORD type = 0;
-    DWORD bytes = sizeof(*out);
-    auto status = RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE *>(out), &bytes);
-    if (status != ERROR_SUCCESS) {
-        return HrFromWin32(status);
-    }
-    return type == REG_QWORD && bytes == sizeof(*out) ? S_OK : HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
-}
-
 HRESULT SaveConfig(const CameraConfig &config)
 {
     const auto path = CameraRegistryPath(config.clsid);
@@ -319,11 +271,6 @@ HRESULT SaveConfig(const CameraConfig &config)
 
     HRESULT hr = SetString(key, kValueName, config.name);
     if (SUCCEEDED(hr)) hr = SetString(key, kValueQueueName, config.queue_name);
-    if (SUCCEEDED(hr)) hr = SetDword(key, kValueWidth, config.width);
-    if (SUCCEEDED(hr)) hr = SetDword(key, kValueHeight, config.height);
-    if (SUCCEEDED(hr)) hr = SetDword(key, kValueFpsNumerator, config.fps_numerator);
-    if (SUCCEEDED(hr)) hr = SetDword(key, kValueFpsDenominator, config.fps_denominator);
-    if (SUCCEEDED(hr)) hr = SetQword(key, kValueInterval, config.interval_100ns);
     RegCloseKey(key);
     return hr;
 }
@@ -347,14 +294,9 @@ HRESULT LoadConfig(REFGUID clsid, CameraConfig *config)
     value.clsid = clsid;
     HRESULT hr = QueryString(key, kValueName, &value.name);
     if (SUCCEEDED(hr)) hr = QueryString(key, kValueQueueName, &value.queue_name);
-    if (SUCCEEDED(hr)) hr = QueryDword(key, kValueWidth, &value.width);
-    if (SUCCEEDED(hr)) hr = QueryDword(key, kValueHeight, &value.height);
-    if (SUCCEEDED(hr)) hr = QueryDword(key, kValueFpsNumerator, &value.fps_numerator);
-    if (SUCCEEDED(hr)) hr = QueryDword(key, kValueFpsDenominator, &value.fps_denominator);
-    if (SUCCEEDED(hr)) hr = QueryQword(key, kValueInterval, &value.interval_100ns);
     RegCloseKey(key);
 
-    if (SUCCEEDED(hr) && (!ValidDimensions(value.width, value.height) || value.interval_100ns == 0 || value.name.empty() || value.queue_name.empty())) {
+    if (SUCCEEDED(hr) && (value.name.empty() || value.queue_name.empty())) {
         hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
     }
     if (SUCCEEDED(hr)) {
@@ -480,16 +422,69 @@ HRESULT FillInfo(const CameraConfig &config, CameraInfoAbi *info)
     }
     CameraInfoAbi value{};
     value.clsid = config.clsid;
-    value.width = config.width;
-    value.height = config.height;
-    value.fps_numerator = config.fps_numerator;
-    value.fps_denominator = config.fps_denominator;
     const HRESULT hr = StringCchCopyW(value.name, std::size(value.name), config.name.c_str());
     if (FAILED(hr)) {
         return hr;
     }
     *info = value;
     return S_OK;
+}
+
+HRESULT LoadRuntimeFormat(const CameraConfig &config, RuntimeFormat *format)
+{
+    if (!format) return E_POINTER;
+
+    const auto ready_name = ReadyEventName(config.queue_name);
+    if (ready_name.empty()) return E_INVALIDARG;
+    HANDLE ready_event = OpenEventW(SYNCHRONIZE, FALSE, ready_name.c_str());
+    if (!ready_event) {
+        const DWORD error = GetLastError();
+        return HRESULT_FROM_WIN32(error == ERROR_FILE_NOT_FOUND ? ERROR_NOT_READY : error);
+    }
+    const DWORD wait = WaitForSingleObject(ready_event, kRuntimeReadyTimeoutMs);
+    if (wait != WAIT_OBJECT_0) {
+        const HRESULT wait_hr = wait == WAIT_TIMEOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+                                                     : wait == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
+        CloseHandle(ready_event);
+        return wait_hr;
+    }
+    CloseHandle(ready_event);
+
+    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, config.queue_name.c_str());
+    if (!mapping) {
+        const DWORD error = GetLastError();
+        return HRESULT_FROM_WIN32(error == ERROR_FILE_NOT_FOUND ? ERROR_NOT_READY : error);
+    }
+    auto *view = static_cast<uint8_t *>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
+    if (!view) {
+        const HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        CloseHandle(mapping);
+        return hr;
+    }
+
+    MEMORY_BASIC_INFORMATION info{};
+    HRESULT hr = S_OK;
+    if (VirtualQuery(view, &info, sizeof(info)) == 0 || info.RegionSize < sizeof(QueueHeader)) {
+        hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    } else {
+        auto *header = reinterpret_cast<QueueHeader *>(view);
+        MemoryBarrier();
+        const uint32_t state = header->state;
+        RuntimeFormat value{};
+        value.width = header->cx;
+        value.height = header->cy;
+        value.interval_100ns = header->interval;
+        if ((state != kQueueStateStarting && state != kQueueStateReady) || !ValidDimensions(value.width, value.height) || value.interval_100ns == 0 ||
+            value.interval_100ns > static_cast<uint64_t>((std::numeric_limits<long long>::max)())) {
+            hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        } else {
+            *format = value;
+        }
+    }
+
+    UnmapViewOfFile(view);
+    CloseHandle(mapping);
+    return hr;
 }
 
 class QueueReader {
@@ -510,7 +505,11 @@ public:
             Close();
             return false;
         }
-        if (header_->state != kQueueStateReady || header_->cx != width_ || header_->cy != height_ || header_->interval != interval_) {
+        if (header_->state != kQueueStateReady) {
+            return false;
+        }
+        if (header_->cx != width_ || header_->cy != height_ || header_->interval != interval_) {
+            Close();
             return false;
         }
 
@@ -575,9 +574,9 @@ private:
 
 class ManagedFilter final : public OutputFilter {
 public:
-    explicit ManagedFilter(CameraConfig config)
-        : OutputFilter(VideoFormat::NV12, static_cast<int>(config.width), static_cast<int>(config.height), static_cast<long long>(config.interval_100ns)),
-          config_(std::move(config)), queue_(config_.queue_name, config_.width, config_.height, config_.interval_100ns)
+    ManagedFilter(CameraConfig config, RuntimeFormat format)
+        : OutputFilter(VideoFormat::NV12, static_cast<int>(format.width), static_cast<int>(format.height), static_cast<long long>(format.interval_100ns)),
+          config_(std::move(config)), format_(format), queue_(config_.queue_name, format_.width, format_.height, format_.interval_100ns)
     {
         g_locks.fetch_add(1, std::memory_order_relaxed);
         AddRef();
@@ -665,8 +664,8 @@ private:
                 Frame(sample_time);
                 lock.lock();
 
-                sample_time += config_.interval_100ns;
-                next += std::chrono::nanoseconds(config_.interval_100ns * 100ULL);
+                sample_time += format_.interval_100ns;
+                next += std::chrono::nanoseconds(format_.interval_100ns * 100ULL);
                 condition_.wait_until(lock, next, [&] { return stopping_ || !active_; });
             }
         }
@@ -679,14 +678,15 @@ private:
             return;
         }
         if (!queue_.Read(destination)) {
-            const size_t y_size = static_cast<size_t>(config_.width) * config_.height;
+            const size_t y_size = static_cast<size_t>(format_.width) * format_.height;
             std::memset(destination, 16, y_size);
             std::memset(destination + y_size, 128, y_size / 2);
         }
-        UnlockSampleData(static_cast<long long>(timestamp), static_cast<long long>(timestamp + config_.interval_100ns));
+        UnlockSampleData(static_cast<long long>(timestamp), static_cast<long long>(timestamp + format_.interval_100ns));
     }
 
     CameraConfig config_;
+    RuntimeFormat format_;
     QueueReader queue_;
     std::thread worker_;
     std::mutex mutex_;
@@ -734,7 +734,11 @@ public:
         *out = nullptr;
         if (outer) return CLASS_E_NOAGGREGATION;
 
-        auto *filter = new (std::nothrow) ManagedFilter(config_);
+        RuntimeFormat format{};
+        const HRESULT format_hr = LoadRuntimeFormat(config_, &format);
+        if (FAILED(format_hr)) return format_hr;
+
+        auto *filter = new (std::nothrow) ManagedFilter(config_, format);
         if (!filter) return E_OUTOFMEMORY;
         const HRESULT hr = filter->QueryInterface(iid, out);
         filter->Release();
@@ -755,12 +759,20 @@ private:
 
 } // namespace
 
+extern "C" __declspec(dllexport) uint32_t WINAPI VirtualCamGetAbiVersion()
+{
+    return 2;
+}
+
 extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamRegister(const wchar_t *name, uint32_t width, uint32_t height,
                                                                     uint32_t fps_numerator, uint32_t fps_denominator,
                                                                     CameraInfoAbi *out_info)
 {
-    if (!name || !out_info || name[0] == L'\0' || wcslen(name) > kMaxCameraName || !ValidDimensions(width, height)) {
+    if (!name || !out_info || name[0] == L'\0' || wcslen(name) > kMaxCameraName) {
         return E_INVALIDARG;
+    }
+    if (width != 0 || height != 0 || fps_numerator != 0 || fps_denominator != 0) {
+        return HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH);
     }
     std::wstring secure_module;
     HRESULT hr = SecureModulePath(&secure_module);
@@ -770,12 +782,6 @@ extern "C" __declspec(dllexport) HRESULT WINAPI VirtualCamRegister(const wchar_t
 
     CameraConfig config{};
     config.name = name;
-    config.width = width;
-    config.height = height;
-    config.fps_numerator = fps_numerator;
-    config.fps_denominator = fps_denominator;
-    hr = ComputeInterval(fps_numerator, fps_denominator, &config.interval_100ns);
-    if (FAILED(hr)) return hr;
     hr = CoCreateGuid(&config.clsid);
     if (FAILED(hr)) return hr;
     config.queue_name = QueueName(config.clsid);
