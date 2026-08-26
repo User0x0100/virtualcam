@@ -16,8 +16,12 @@ pub enum Error {
     /// Dimensions/stride are zero, invalid for the format, exceed Unity's
     /// shared-image capacity, or are not representable by the backend ABI.
     InvalidDimensions,
-    /// An OBS frame-rate numerator/denominator is zero or produces a zero interval.
+    /// An OBS/managed-camera frame-rate numerator/denominator is zero or produces a zero interval.
     InvalidFrameRate,
+    /// A managed camera friendly name is empty, too long, or contains an embedded NUL.
+    InvalidCameraName,
+    /// A managed camera CLSID string is malformed.
+    InvalidCameraId,
     /// A frame or shared-memory layout size overflowed its target integer type.
     FrameSizeOverflow,
     /// A host or CUDA frame length did not match the configured contiguous layout.
@@ -40,6 +44,18 @@ pub enum Error {
     ConsumerInactive,
     /// An operation other than idempotent `close` was attempted after closure.
     AlreadyClosed,
+    /// The loaded native managed-camera DLL is missing an expected ABI export.
+    ManagedDriverAbi {
+        /// Missing symbol or incompatible ABI field.
+        symbol: &'static str,
+    },
+    /// A native COM/DirectShow operation returned a failing HRESULT.
+    Hresult {
+        /// Native operation that failed.
+        operation: &'static str,
+        /// Exact signed HRESULT value.
+        code: i32,
+    },
     /// A Win32 call failed and preserved its `GetLastError` code.
     Windows {
         /// Win32 API or logical operation that failed.
@@ -72,6 +88,8 @@ impl fmt::Display for Error {
             }
             Self::InvalidDimensions => formatter.write_str("invalid frame dimensions"),
             Self::InvalidFrameRate => formatter.write_str("invalid frame rate"),
+            Self::InvalidCameraName => formatter.write_str("invalid managed camera name"),
+            Self::InvalidCameraId => formatter.write_str("invalid managed camera CLSID"),
             Self::FrameSizeOverflow => formatter.write_str("frame or shared-memory size overflow"),
             Self::FrameSizeMismatch { expected, actual } => {
                 write!(formatter, "frame size mismatch: expected {expected} bytes, got {actual}")
@@ -80,6 +98,8 @@ impl fmt::Display for Error {
             Self::ExistingMappingTooSmall { required, available } => write!(formatter, "existing mapping is too small: requires {required} accessible bytes, has {available}"),
             Self::ConsumerInactive => formatter.write_str("virtual camera consumer is inactive"),
             Self::AlreadyClosed => formatter.write_str("virtual camera is already closed"),
+            Self::ManagedDriverAbi { symbol } => write!(formatter, "managed virtual-camera driver ABI is missing or incompatible at {symbol}"),
+            Self::Hresult { operation, code } => write!(formatter, "native operation {operation} failed with HRESULT 0x{:08X}", *code as u32),
             Self::Windows { operation, code } => {
                 write!(formatter, "Win32 operation {operation} failed with code {code}")
             }

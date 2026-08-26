@@ -5,7 +5,7 @@ use std::rc::Rc;
 use crate::backend::Backend;
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaStream;
-use crate::{CameraType, Error, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
+use crate::{CameraType, Error, ManagedCameraInfo, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
 
 /// Unified producer facade for a selected virtual-camera backend.
 ///
@@ -47,6 +47,43 @@ impl VirtualCamera {
             );
             Ok(Self {
                 camera_type: CameraType::Obs,
+                native_format: PixelFormat::Nv12,
+                frame_size: validated.frame_size,
+                closed: false,
+                backend,
+                not_send_or_sync: PhantomData,
+            })
+        }
+    }
+
+    pub(crate) fn open_managed(info: ManagedCameraInfo) -> Result<Self> {
+        #[cfg(not(windows))]
+        {
+            let _ = info;
+            Err(Error::UnsupportedPlatform)
+        }
+
+        #[cfg(windows)]
+        {
+            let options = ObsOptions {
+                width: info.width,
+                height: info.height,
+                frame_rate: info.frame_rate,
+                force_open: false,
+            };
+            let validated = options.validate()?;
+            let queue_name = info.id.queue_name_wide();
+            let backend = Backend::open_managed_nv12(validated, &queue_name)?;
+            trace_debug!(
+                camera_type = ?CameraType::ManagedNv12,
+                camera_id = %info.id,
+                width = validated.width,
+                height = validated.height,
+                interval_100ns = validated.interval_100ns,
+                "managed virtual camera opened"
+            );
+            Ok(Self {
+                camera_type: CameraType::ManagedNv12,
                 native_format: PixelFormat::Nv12,
                 frame_size: validated.frame_size,
                 closed: false,

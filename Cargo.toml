@@ -2,7 +2,7 @@
 name = "virtualcam"
 version = "0.1.0"
 edition = "2024"
-description = "Write host or CUDA frames to OBS and Unity Capture virtual cameras on Windows"
+description = "Manage NV12 DirectShow cameras and write host or CUDA frames to Windows virtual cameras"
 license = "MIT"
 readme = "README.md"
 keywords = ["virtual-camera", "obs", "unity", "cuda", "windows"]
@@ -20,6 +20,7 @@ tracing = { version = "0.1.41", optional = true, default-features = false, featu
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Performance",
     "Win32_System_Registry",

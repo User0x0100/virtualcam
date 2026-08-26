@@ -53,6 +53,7 @@ impl FrameSource<'_> {
 
 pub(crate) enum Backend {
     Obs(ObsBackend),
+    ManagedNv12(ObsBackend),
     UnityCapture(UnityCaptureBackend),
 }
 
@@ -61,7 +62,11 @@ impl Backend {
         if !registry_key_exists(obs::OBS_CLSID_KEY) {
             return Err(Error::BackendUnavailable(CameraType::Obs));
         }
-        ObsBackend::open(options, VIDEO_NAME).map(Self::Obs)
+        ObsBackend::open(options, VIDEO_NAME, CameraType::Obs).map(Self::Obs)
+    }
+
+    pub(crate) fn open_managed_nv12(options: ValidatedObsOptions, video_name: &[u16]) -> Result<Self> {
+        ObsBackend::open(options, video_name, CameraType::ManagedNv12).map(Self::ManagedNv12)
     }
 
     pub(crate) fn open_unity_capture(options: ValidatedUnityCaptureOptions) -> Result<Self> {
@@ -73,14 +78,14 @@ impl Backend {
 
     pub(crate) fn is_ready(&mut self) -> Result<bool> {
         match self {
-            Self::Obs(backend) => backend.is_ready(),
+            Self::Obs(backend) | Self::ManagedNv12(backend) => backend.is_ready(),
             Self::UnityCapture(backend) => backend.is_ready(),
         }
     }
 
     pub(crate) fn write_host_frame(&mut self, frame: &[u8]) -> Result<WriteStatus> {
         match self {
-            Self::Obs(backend) => backend.write_frame(FrameSource::Host(frame)),
+            Self::Obs(backend) | Self::ManagedNv12(backend) => backend.write_frame(FrameSource::Host(frame)),
             Self::UnityCapture(backend) => backend.write_frame(FrameSource::Host(frame)),
         }
     }
@@ -93,14 +98,14 @@ impl Backend {
             stream,
         };
         match self {
-            Self::Obs(backend) => backend.write_frame(frame),
+            Self::Obs(backend) | Self::ManagedNv12(backend) => backend.write_frame(frame),
             Self::UnityCapture(backend) => backend.write_frame(frame),
         }
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {
         match self {
-            Self::Obs(backend) => backend.close(),
+            Self::Obs(backend) | Self::ManagedNv12(backend) => backend.close(),
             Self::UnityCapture(backend) => backend.close(),
         }
     }

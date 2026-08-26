@@ -14,6 +14,7 @@ use crate::{CameraType, Error, Result, WriteStatus};
 pub(super) const OBS_CLSID_KEY: &str = "CLSID\\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}";
 
 pub(crate) struct ObsBackend {
+    camera_type: CameraType,
     view: Option<MappedView>,
     mapping: Option<OwnedHandle>,
     layout: QueueLayout,
@@ -23,7 +24,7 @@ pub(crate) struct ObsBackend {
 }
 
 impl ObsBackend {
-    pub(crate) fn open(options: ValidatedObsOptions, video_name: &[u16]) -> Result<Self> {
+    pub(crate) fn open(options: ValidatedObsOptions, video_name: &[u16], camera_type: CameraType) -> Result<Self> {
         let layout = QueueLayout::calculate(options.frame_size)?;
         if !options.force_open {
             // Upstream performs this conservative read-only open first and treats
@@ -70,8 +71,8 @@ impl ObsBackend {
         }
         if view.accessible_len() < layout.total_size {
             return Err(Error::Protocol {
-                backend: CameraType::Obs,
-                detail: "new OBS mapping exposes less memory than requested",
+                backend: camera_type,
+                detail: "new NV12 queue mapping exposes less memory than requested",
             });
         }
 
@@ -90,7 +91,7 @@ impl ObsBackend {
             return Err(last_error("QueryPerformanceFrequency"));
         }
         let clock_frequency = u64::try_from(frequency).map_err(|_| Error::Protocol {
-            backend: CameraType::Obs,
+            backend: camera_type,
             detail: "performance counter frequency is not positive",
         })?;
 
@@ -99,6 +100,7 @@ impl ObsBackend {
         }
 
         Ok(Self {
+            camera_type,
             view: Some(view),
             mapping: Some(mapping),
             layout,
@@ -139,7 +141,7 @@ impl ObsBackend {
         let uv_size = y_size / 2;
         if y_size.checked_add(uv_size) != Some(self.layout.frame_size) {
             return Err(Error::Protocol {
-                backend: CameraType::Obs,
+                backend: self.camera_type,
                 detail: "configured NV12 plane sizes do not match the frame size",
             });
         }
@@ -185,7 +187,7 @@ impl ObsBackend {
             return Err(last_error("QueryPerformanceCounter"));
         }
         let counter = u64::try_from(counter).map_err(|_| Error::Protocol {
-            backend: CameraType::Obs,
+            backend: self.camera_type,
             detail: "performance counter returned a negative value",
         })?;
         Ok(mul_div_u64(counter, 1_000_000_000, self.clock_frequency))
@@ -253,11 +255,11 @@ mod tests {
     fn real_mapping_covers_occupancy_force_write_and_stopping() {
         let name = test_name("state");
         let config = validated(2, 2, false);
-        let mut original = ObsBackend::open(config, &name).expect("first writer opens a new mapping");
+        let mut original = ObsBackend::open(config, &name, CameraType::Obs).expect("first writer opens a new mapping");
 
-        assert!(matches!(ObsBackend::open(config, &name), Err(Error::DeviceInUse)));
+        assert!(matches!(ObsBackend::open(config, &name, CameraType::Obs), Err(Error::DeviceInUse)));
 
-        let mut forced = ObsBackend::open(validated(2, 2, true), &name).expect("force mode reuses a large enough mapping");
+        let mut forced = ObsBackend::open(validated(2, 2, true), &name, CameraType::Obs).expect("force mode reuses a large enough mapping");
         let observer = original.view.as_ref().expect("original view remains mapped");
         let header = observer.as_ptr().cast::<QueueHeader>();
         // SAFETY: `observer` maps the same live initialized queue header.
@@ -306,7 +308,7 @@ mod tests {
         assert!(!raw.is_null());
         // SAFETY: Successful creation returned one owned mapping handle.
         let _mapping = unsafe { OwnedHandle::from_raw(raw) };
-        let error = match ObsBackend::open(validated(64, 64, true), &name) {
+        let error = match ObsBackend::open(validated(64, 64, true), &name, CameraType::Obs) {
             Ok(_) => panic!("small mapping must be rejected"),
             Err(error) => error,
         };

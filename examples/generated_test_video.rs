@@ -217,6 +217,7 @@ fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
                 height: settings.height,
                 ..UnityCaptureOptions::default()
             }),
+            CameraType::ManagedNv12 => unreachable!("managed cameras are opened through ManagedCameraManager"),
         }
         .map_err(|error| IoError::other(format!("failed to open {}: {error}", camera_name(camera_type))))?;
         #[cfg(all(feature = "cuda", windows))]
@@ -355,6 +356,7 @@ fn selected_camera_types(selection: CameraSelection) -> Vec<CameraType> {
 const fn camera_name(camera_type: CameraType) -> &'static str {
     match camera_type {
         CameraType::Obs => "OBS Virtual Camera",
+        CameraType::ManagedNv12 => "Managed NV12 Virtual Camera",
         CameraType::UnityCapture => "Unity Capture",
     }
 }

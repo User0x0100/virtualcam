@@ -1,0 +1,9 @@
+LIBRARY virtualcam-managed
+EXPORTS
+    DllCanUnloadNow PRIVATE
+    DllGetClassObject PRIVATE
+    VirtualCamRegister
+    VirtualCamUnregister
+    VirtualCamRename
+    VirtualCamGet
+    VirtualCamEnumerate
