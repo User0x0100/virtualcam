@@ -75,7 +75,13 @@ mod cuda_runtime_api {
 
     // CUDA's CUDARTAPI is __stdcall under MSVC. Rust's `system` ABI selects that
     // convention on 32-bit Windows and the platform C ABI on 64-bit Windows.
-    #[link(name = "cudart")]
+    //
+    // CUDA 13 ships `cudart.lib` as a static loader shim without `__imp_`
+    // import thunks, so a default dylib link cannot resolve. Linking it as an
+    // unbundled static library references plain symbols, which both that shim
+    // and older import-library toolkits provide; the final link still uses the
+    // toolkit's own `cudart.lib`.
+    #[link(name = "cudart", kind = "static", modifiers = "-bundle")]
     unsafe extern "system" {
         pub(super) fn cudaMemcpyAsync(destination: *mut c_void, source: *const c_void, count: usize, kind: i32, stream: *mut c_void) -> cudaError_t;
         pub(super) fn cudaStreamSynchronize(stream: *mut c_void) -> cudaError_t;
@@ -88,7 +94,7 @@ mod tests {
     use super::*;
     use crate::Error;
 
-    #[link(name = "cudart")]
+    #[link(name = "cudart", kind = "static", modifiers = "-bundle")]
     unsafe extern "system" {
         fn cudaMalloc(device_pointer: *mut *mut c_void, size: usize) -> cudaError_t;
         fn cudaFree(device_pointer: *mut c_void) -> cudaError_t;

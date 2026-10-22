@@ -1,28 +1,12 @@
+//! OBS-compatible three-slot NV12 frame queue.
+//!
+//! OBS Virtual Camera and the managed DirectShow camera share this payload
+//! ABI. Ownership, naming, and lifecycle stay with each backend's control
+//! plane; only the queue layout and its publication order live here.
+
 use core::mem::{align_of, offset_of, size_of};
 
 use crate::{Error, Result};
-
-pub(crate) const VIDEO_NAME: &[u16] = &[
-    b'O' as u16,
-    b'B' as u16,
-    b'S' as u16,
-    b'V' as u16,
-    b'i' as u16,
-    b'r' as u16,
-    b't' as u16,
-    b'u' as u16,
-    b'a' as u16,
-    b'l' as u16,
-    b'C' as u16,
-    b'a' as u16,
-    b'm' as u16,
-    b'V' as u16,
-    b'i' as u16,
-    b'd' as u16,
-    b'e' as u16,
-    b'o' as u16,
-    0,
-];
 
 pub(crate) const STATE_STARTING: u32 = 1;
 pub(crate) const STATE_READY: u32 = 2;
@@ -34,7 +18,7 @@ pub(crate) const SLOT_COUNT: usize = 3;
 /// `shared/obs-shared-memory-queue/shared-memory-queue.c`.
 ///
 /// The three leading `uint32_t` fields are volatile in C. Rust keeps their ABI
-/// as plain integers and confines volatile access to the OBS backend.
+/// as plain integers and accesses them only through `protocol::publication`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct QueueHeader {
@@ -50,11 +34,13 @@ pub(crate) struct QueueHeader {
 }
 
 impl QueueHeader {
-    pub(crate) const fn new(width: u32, height: u32, interval: u64, offsets: [u32; 3]) -> Self {
+    /// Builds a header whose state is still unpublished (zero). Writers copy it
+    /// into the mapping first and publish `STATE_STARTING` afterwards.
+    pub(crate) const fn unpublished(width: u32, height: u32, interval: u64, offsets: [u32; SLOT_COUNT]) -> Self {
         Self {
             write_idx: 0,
             read_idx: 0,
-            state: STATE_STARTING,
+            state: 0,
             offsets,
             queue_type: 0,
             cx: width,
@@ -84,6 +70,18 @@ impl QueueLayout {
         u32::try_from(size).map_err(|_| Error::FrameSizeOverflow)?;
         Ok(Self { total_size: size, offsets, frame_size })
     }
+
+    /// Returns each slot's byte offset as `usize`.
+    pub(crate) fn slot_offsets(&self) -> [usize; SLOT_COUNT] {
+        // u32 -> usize is lossless on every supported Windows target.
+        self.offsets.map(|offset| offset as usize)
+    }
+}
+
+/// Maps a published sequence number to its slot exactly like upstream's
+/// `(unsigned long)inc % 3`.
+pub(crate) const fn slot_index(sequence: u32) -> usize {
+    (sequence % SLOT_COUNT as u32) as usize
 }
 
 fn align_32(size: usize) -> Result<usize> {
@@ -128,6 +126,7 @@ mod tests {
     fn tiny_layout_has_exact_protocol_offsets() {
         let layout = QueueLayout::calculate(1).expect("valid layout");
         assert_eq!(layout.offsets, [96, 160, 224]);
+        assert_eq!(layout.slot_offsets(), [96, 160, 224]);
         assert_eq!(layout.total_size, 288);
         assert_eq!(layout.frame_size, 1);
     }
@@ -138,11 +137,11 @@ mod tests {
     }
 
     #[test]
-    fn new_header_initializes_protocol_state() {
-        let header = QueueHeader::new(640, 480, 333_333, [96, 128, 160]);
+    fn unpublished_header_initializes_protocol_metadata() {
+        let header = QueueHeader::unpublished(640, 480, 333_333, [96, 128, 160]);
         assert_eq!(header.write_idx, 0);
         assert_eq!(header.read_idx, 0);
-        assert_eq!(header.state, STATE_STARTING);
+        assert_eq!(header.state, 0);
         assert_eq!(header.offsets, [96, 128, 160]);
         assert_eq!(header.queue_type, 0);
         assert_eq!((header.cx, header.cy), (640, 480));
@@ -152,9 +151,8 @@ mod tests {
 
     #[test]
     fn index_wraparound_matches_unsigned_long_modulo() {
-        let wrapped = u32::MAX.wrapping_add(1);
-        assert_eq!(wrapped, 0);
-        assert_eq!((wrapped % SLOT_COUNT as u32) as usize, 0);
-        assert_eq!((u32::MAX % SLOT_COUNT as u32) as usize, 0);
+        assert_eq!(slot_index(u32::MAX.wrapping_add(1)), 0);
+        assert_eq!(slot_index(u32::MAX), 0);
+        assert_eq!(slot_index(4), 1);
     }
 }

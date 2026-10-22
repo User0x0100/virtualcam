@@ -25,15 +25,20 @@ For each producer session (managed runtime ABI v3):
   `Local\\VirtualCamRs-{CLSID}-Data-{width}x{height}-{interval}`;
 - `IClassFactory::CreateInstance` waits for the signaled producer lease and Ready
   event, validates the control header, and uses that live format. With no producer
-  lease it creates an idle `640x480@30` NV12 filter that emits black frames;
+  lease it creates an idle NV12 filter using that Windows user's last valid
+  published mode, or `640x480@30` if no valid history exists, and emits black frames;
+- after the first successfully published frame, the Rust producer persists the
+  mode under `HKCU\\Software\\VirtualCamRs\\ManagedCameraFormats\\{CLSID}` as a single
+  versioned `LastFormat` binary value; no administrative rights are required;
 - a later producer may use another valid even NV12 resolution or frame rate while
   an old consumer still retains its old data mapping, because different formats
   no longer share one fixed-capacity section.
 
 A registered camera is therefore activatable by DirectShow/OpenCV even when no
 producer is running. A format is still fixed for one connected DirectShow graph:
-if the consumer opened first, its graph remains `640x480@30`, and a producer that
-appears later is readable without reconnecting only when it uses that same mode.
+if the consumer opened first, its graph remains at the idle historical mode
+(or `640x480@30` without history), and a producer that appears later is readable
+without reconnecting only when it uses that same mode.
 A producer using another runtime format requires the consumer to reopen the camera
 so a new graph can negotiate that live format. While a graph is waiting on no
 producer or an incompatible producer session, queue discovery is throttled to a
@@ -102,7 +107,13 @@ nonzero values are rejected with `ERROR_REVISION_MISMATCH`. ABI v3 changes the
 managed runtime transport to the fixed control mapping plus format-specific data
 mapping described above, so v2 Rust/native combinations are rejected rather than
 silently sharing incompatible queue names. With no producer lease the native
-filter falls back to `640x480@30` NV12.
+filter uses the per-user last successful mode or defaults to `640x480@30` NV12.
+History is updated only after a successful frame write, so merely opening a producer
+never changes it. The HKCU record is per CLSID, and only applies to DirectShow
+consumers running as that same Windows account; services using a different account
+will use their own history or the default. Corrupt or unsupported history is ignored.
+The inactive camera continues producing black frames at its negotiated mode;
+changing the producer to a different format still requires reopening the consumer.
 
 ## Third-party code and license
 

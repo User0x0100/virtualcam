@@ -1,12 +1,42 @@
 #![cfg(windows)]
 
+use std::path::PathBuf;
 use std::sync::Mutex;
+use std::{env, fs};
 
 use virtualcam::{CameraType, Error, ObsFrameRate, ObsOptions, PixelFormat, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode, VirtualCamera, WriteStatus};
 
 // Both installed-driver tests touch globally named protocol objects. Serializing
 // them also makes failures easier to attribute when they are explicitly enabled.
 static INSTALLED_DRIVER_LOCK: Mutex<()> = Mutex::new(());
+
+/// Restores `%APPDATA%\obs-virtualcam.txt`, which every OBS producer open
+/// rewrites so the OBS filter can advertise the last producer mode.
+struct ObsResolutionHintGuard {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+}
+
+impl ObsResolutionHintGuard {
+    fn capture() -> Self {
+        let path = PathBuf::from(env::var_os("APPDATA").expect("APPDATA is set for interactive users")).join("obs-virtualcam.txt");
+        let original = fs::read(&path).ok();
+        Self { path, original }
+    }
+
+    fn current(&self) -> Option<Vec<u8>> {
+        fs::read(&self.path).ok()
+    }
+}
+
+impl Drop for ObsResolutionHintGuard {
+    fn drop(&mut self) {
+        let _ = match &self.original {
+            Some(contents) => fs::write(&self.path, contents),
+            None => fs::remove_file(&self.path),
+        };
+    }
+}
 
 fn tiny_obs_options() -> ObsOptions {
     ObsOptions {
@@ -29,7 +59,10 @@ fn tiny_unity_options() -> UnityCaptureOptions {
 #[ignore = "requires an installed, idle OBS Virtual Camera"]
 fn installed_obs_covers_metadata_publication_occupancy_and_lifecycle() {
     let _serial = INSTALLED_DRIVER_LOCK.lock().expect("installed-driver test lock");
+    let hint = ObsResolutionHintGuard::capture();
     let mut camera = VirtualCamera::open_obs(tiny_obs_options()).expect("OBS Virtual Camera must be installed and idle");
+    // Same `{cx}x{cy}x{interval}` record OBS writes in `virtualcam_start`.
+    assert_eq!(hint.current().as_deref(), Some(&b"2x2x333333"[..]));
 
     assert_eq!(camera.camera_type(), CameraType::Obs);
     assert_eq!(camera.native_format(), PixelFormat::Nv12);
@@ -38,7 +71,9 @@ fn installed_obs_covers_metadata_publication_occupancy_and_lifecycle() {
     assert_eq!(camera.is_ready(), Ok(true));
     assert_eq!(camera.write_host(&[0; 5]), Err(Error::FrameSizeMismatch { expected: 6, actual: 5 }));
 
-    assert!(matches!(VirtualCamera::open_obs(tiny_obs_options()), Err(Error::DeviceInUse)));
+    // A rejected second producer must not overwrite the owner's hint.
+    assert!(matches!(VirtualCamera::open_obs(ObsOptions { width: 4, ..tiny_obs_options() }), Err(Error::DeviceInUse)));
+    assert_eq!(hint.current().as_deref(), Some(&b"2x2x333333"[..]));
     for frame in [[16, 16, 16, 16, 128, 128], [32, 32, 32, 32, 96, 160], [235, 235, 235, 235, 128, 128]] {
         assert_eq!(camera.write_host(&frame), Ok(WriteStatus::Written));
     }

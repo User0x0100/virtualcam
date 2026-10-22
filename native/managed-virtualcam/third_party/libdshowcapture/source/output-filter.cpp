@@ -21,6 +21,8 @@
 #include "dshow-formats.hpp"
 #include "log.hpp"
 
+#include <chrono>
+
 #include <strsafe.h>
 
 namespace DShow {
@@ -616,22 +618,43 @@ void OutputPin::Send(unsigned char *data[DSHOW_MAX_PLANES],
 	UnlockSampleData(timestampStart, timestampEnd);
 }
 
-void OutputPin::UnlockSampleData(long long timestampStart,
-				 long long timestampEnd)
+HRESULT OutputPin::UnlockSampleData(long long timestampStart,
+					    long long timestampEnd,
+					    uint64_t *receiveDurationUs,
+					    bool *receiveCalled)
 {
+	if (receiveDurationUs)
+		*receiveDurationUs = 0;
+	if (receiveCalled)
+		*receiveCalled = false;
 	if (!connectedPin)
-		return;
+		return E_UNEXPECTED;
 
 	ComQIPtr<IMemInputPin> memInput(connectedPin);
+	if (!memInput)
+		return E_NOINTERFACE;
 	REFERENCE_TIME startTime = timestampStart;
 	REFERENCE_TIME endTime = timestampEnd;
 
 	sample->SetMediaTime(&startTime, &endTime);
 	sample->SetTime(&startTime, &endTime);
 
-	memInput->Receive(sample);
+	if (receiveCalled)
+		*receiveCalled = true;
+	HRESULT hr;
+	if (receiveDurationUs) {
+		const auto started = std::chrono::steady_clock::now();
+		hr = memInput->Receive(sample);
+		*receiveDurationUs = static_cast<uint64_t>(
+			std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - started)
+				.count());
+	} else {
+		hr = memInput->Receive(sample);
+	}
 
 	sample.Clear();
+	return hr;
 }
 
 void OutputPin::Stop()

@@ -164,7 +164,8 @@ mod cuda_runtime_api {
         }
     }
 
-    #[link(name = "cudart")]
+    // Same unbundled static link as the crate; see `src/cuda.rs`.
+    #[link(name = "cudart", kind = "static", modifiers = "-bundle")]
     unsafe extern "system" {
         pub(super) fn cudaSetDevice(ordinal: i32) -> cudaError_t;
         pub(super) fn cudaMalloc(device_pointer: *mut *mut c_void, size: usize) -> cudaError_t;
@@ -217,7 +218,7 @@ fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
                 height: settings.height,
                 ..UnityCaptureOptions::default()
             }),
-            CameraType::ManagedNv12 => unreachable!("managed cameras are opened through ManagedCameraManager"),
+            _ => unreachable!("this example only selects OBS and Unity Capture"),
         }
         .map_err(|error| IoError::other(format!("failed to open {}: {error}", camera_name(camera_type))))?;
         #[cfg(all(feature = "cuda", windows))]
@@ -356,8 +357,9 @@ fn selected_camera_types(selection: CameraSelection) -> Vec<CameraType> {
 const fn camera_name(camera_type: CameraType) -> &'static str {
     match camera_type {
         CameraType::Obs => "OBS Virtual Camera",
-        CameraType::ManagedNv12 => "Managed NV12 Virtual Camera",
+        CameraType::ManagedDirectShow => "Managed DirectShow Virtual Camera",
         CameraType::UnityCapture => "Unity Capture",
+        _ => "virtual camera",
     }
 }
 

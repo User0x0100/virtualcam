@@ -7,9 +7,11 @@
 #include "third_party/libdshowcapture/source/output-filter.hpp"
 #include "third_party/libdshowcapture/source/dshow-formats.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -25,6 +27,10 @@ using namespace DShow;
 namespace {
 
 constexpr wchar_t kRegistryRoot[] = L"SOFTWARE\\VirtualCamRs\\ManagedCameras";
+constexpr wchar_t kHistoryRegistryRoot[] = L"Software\\VirtualCamRs\\ManagedCameraFormats";
+constexpr wchar_t kHistoryValueName[] = L"LastFormat";
+constexpr uint32_t kHistoryMagic = 0x464D4356; // little-endian "VCMF"
+constexpr uint32_t kHistoryVersion = 1;
 constexpr wchar_t kManagementMutex[] = L"Global\\VirtualCamRs-ManagedCamera-Management";
 constexpr wchar_t kThreadingModel[] = L"Both";
 constexpr wchar_t kValueName[] = L"Name";
@@ -88,6 +94,15 @@ RuntimeFormat FallbackRuntimeFormat()
 {
     return RuntimeFormat{kFallbackWidth, kFallbackHeight, kFallbackInterval100ns};
 }
+
+struct PersistedFormat {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t width;
+    uint32_t height;
+    uint64_t interval_100ns;
+};
+static_assert(sizeof(PersistedFormat) == 24, "managed persisted format layout changed");
 
 #pragma pack(push, 8)
 struct QueueHeader {
@@ -288,6 +303,28 @@ bool ValidDimensions(uint32_t width, uint32_t height)
     // signed-int arithmetic before storing the result, so keep that operation
     // representable for the sole 12-bpp NV12 media type we expose.
     return pixels <= static_cast<uint64_t>(INT_MAX) / 12ULL;
+}
+
+bool LoadLastSuccessfulFormat(REFGUID camera_id, RuntimeFormat *format)
+{
+    if (!format) return false;
+    const auto guid = GuidString(camera_id);
+    if (guid.empty()) return false;
+    const std::wstring key_path = std::wstring(kHistoryRegistryRoot) + L"\\" + guid;
+    PersistedFormat saved{};
+    DWORD type = 0;
+    DWORD size = sizeof(saved);
+    const LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, key_path.c_str(), kHistoryValueName,
+                                        RRF_RT_REG_BINARY, &type, &saved, &size);
+    if (status != ERROR_SUCCESS || type != REG_BINARY || size != sizeof(saved) ||
+        saved.magic != kHistoryMagic || saved.version != kHistoryVersion ||
+        !ValidDimensions(saved.width, saved.height) || saved.interval_100ns == 0 ||
+        saved.interval_100ns > static_cast<uint64_t>((std::numeric_limits<long long>::max)()) ||
+        saved.interval_100ns > (std::numeric_limits<uint64_t>::max)() / 100ULL) {
+        return false;
+    }
+    *format = RuntimeFormat{saved.width, saved.height, saved.interval_100ns};
+    return true;
 }
 
 HRESULT SetString(HKEY key, const wchar_t *name, const std::wstring &value)
@@ -769,6 +806,172 @@ private:
     std::chrono::steady_clock::time_point retry_after_{};
 };
 
+class TimingDiagnostics {
+    using Clock = std::chrono::steady_clock;
+
+public:
+    TimingDiagnostics(uint32_t width, uint32_t height, uint64_t interval)
+        : enabled_(TimingEnabled()), width_(width), height_(height), interval_(interval)
+    {
+        if (enabled_) {
+            started_ = Clock::now();
+        }
+    }
+
+    bool enabled() const { return enabled_; }
+
+    void FrameAttempted()
+    {
+        if (enabled_) {
+            ++frames_attempted_;
+        }
+    }
+
+    void LockFailed()
+    {
+        if (enabled_) {
+            ++lock_failures_;
+        }
+    }
+
+    void QueueReadMissed()
+    {
+        if (enabled_) {
+            ++queue_read_misses_;
+        }
+    }
+
+    void Overrun(Clock::duration miss)
+    {
+        if (!enabled_) {
+            return;
+        }
+        const auto miss_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(miss).count());
+        ++overruns_;
+        overrun_total_us_ += miss_us;
+        max_overrun_us_ = (std::max)(max_overrun_us_, miss_us);
+    }
+
+    void FrameFinished(Clock::time_point started, uint64_t timestamp, bool receive_called,
+                       HRESULT receive_hr, uint64_t receive_us)
+    {
+        if (!enabled_) {
+            return;
+        }
+
+        const auto frame_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
+        frame_total_us_ += frame_us;
+        max_frame_us_ = (std::max)(max_frame_us_, frame_us);
+
+        if (receive_called) {
+            ++receive_calls_;
+            receive_total_us_ += receive_us;
+            max_receive_us_ = (std::max)(max_receive_us_, receive_us);
+            if (FAILED(receive_hr)) {
+                ++receive_failures_;
+            } else {
+                ++frames_delivered_;
+                RecordTimestamp(timestamp);
+            }
+        }
+    }
+
+    void ReportFinal()
+    {
+        if (enabled_) {
+            Report("final", Clock::now());
+        }
+    }
+
+private:
+    static bool TimingEnabled()
+    {
+        wchar_t value[8]{};
+        const DWORD length = GetEnvironmentVariableW(
+            L"VIRTUALCAM_MANAGED_TIMING", value, static_cast<DWORD>(std::size(value)));
+        return length == 1 && value[0] == L'1';
+    }
+
+    static uint64_t Average(uint64_t total, uint64_t count)
+    {
+        return count == 0 ? 0 : total / count;
+    }
+
+    void RecordTimestamp(uint64_t timestamp)
+    {
+        if (has_last_timestamp_) {
+            const uint64_t delta = timestamp >= last_timestamp_ ? timestamp - last_timestamp_
+                                                                 : last_timestamp_ - timestamp;
+            if (delta != interval_) {
+                ++timestamp_jumps_;
+                max_timestamp_delta_100ns_ = (std::max)(max_timestamp_delta_100ns_, delta);
+            }
+        }
+        has_last_timestamp_ = true;
+        last_timestamp_ = timestamp;
+    }
+
+    void Report(const char *kind, Clock::time_point now) const
+    {
+        const auto elapsed_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - started_).count());
+        std::fprintf(
+            stderr,
+            "[virtualcam-managed timing] %s mode=%ux%u interval_100ns=%llu elapsed_ms=%llu "
+            "frames=%llu delivered=%llu lock_failures=%llu queue_read_misses=%llu "
+            "overruns=%llu overrun_total_us=%llu largest_deadline_miss_us=%llu "
+            "receive_calls=%llu receive_failures=%llu frame_avg_us=%llu frame_max_us=%llu "
+            "receive_avg_us=%llu receive_max_us=%llu timestamp_jumps=%llu "
+            "max_timestamp_delta_100ns=%llu\n",
+            kind,
+            static_cast<unsigned>(width_),
+            static_cast<unsigned>(height_),
+            static_cast<unsigned long long>(interval_),
+            static_cast<unsigned long long>(elapsed_ms),
+            static_cast<unsigned long long>(frames_attempted_),
+            static_cast<unsigned long long>(frames_delivered_),
+            static_cast<unsigned long long>(lock_failures_),
+            static_cast<unsigned long long>(queue_read_misses_),
+            static_cast<unsigned long long>(overruns_),
+            static_cast<unsigned long long>(overrun_total_us_),
+            static_cast<unsigned long long>(max_overrun_us_),
+            static_cast<unsigned long long>(receive_calls_),
+            static_cast<unsigned long long>(receive_failures_),
+            static_cast<unsigned long long>(Average(frame_total_us_, frames_attempted_)),
+            static_cast<unsigned long long>(max_frame_us_),
+            static_cast<unsigned long long>(Average(receive_total_us_, receive_calls_)),
+            static_cast<unsigned long long>(max_receive_us_),
+            static_cast<unsigned long long>(timestamp_jumps_),
+            static_cast<unsigned long long>(max_timestamp_delta_100ns_));
+        std::fflush(stderr);
+    }
+
+    bool enabled_ = false;
+    uint32_t width_ = 0;
+    uint32_t height_ = 0;
+    uint64_t interval_ = 0;
+    Clock::time_point started_{};
+    uint64_t frames_attempted_ = 0;
+    uint64_t frames_delivered_ = 0;
+    uint64_t lock_failures_ = 0;
+    uint64_t queue_read_misses_ = 0;
+    uint64_t overruns_ = 0;
+    uint64_t overrun_total_us_ = 0;
+    uint64_t max_overrun_us_ = 0;
+    uint64_t receive_calls_ = 0;
+    uint64_t receive_failures_ = 0;
+    uint64_t frame_total_us_ = 0;
+    uint64_t max_frame_us_ = 0;
+    uint64_t receive_total_us_ = 0;
+    uint64_t max_receive_us_ = 0;
+    bool has_last_timestamp_ = false;
+    uint64_t last_timestamp_ = 0;
+    uint64_t timestamp_jumps_ = 0;
+    uint64_t max_timestamp_delta_100ns_ = 0;
+};
+
 class ManagedFilter final : public OutputFilter {
 public:
     ManagedFilter(CameraConfig config, RuntimeFormat format)
@@ -791,6 +994,7 @@ public:
         if (worker_.joinable()) {
             worker_.join();
         }
+        timing_.ReportFinal();
         g_locks.fetch_sub(1, std::memory_order_relaxed);
     }
 
@@ -863,7 +1067,9 @@ private:
                 lock.lock();
 
                 const auto now = std::chrono::steady_clock::now();
-                if (now > next + frame_interval) {
+                const auto deadline = next + frame_interval;
+                if (now > deadline) {
+                    timing_.Overrun(now - deadline);
                     // A downstream stall must not turn into a burst of historical
                     // catch-up frames. Drop missed deadlines and resume from the
                     // current clock at the next normal frame boundary.
@@ -880,16 +1086,35 @@ private:
 
     void Frame(uint64_t timestamp)
     {
+        const bool timing_enabled = timing_.enabled();
+        const auto started = timing_enabled ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
+        timing_.FrameAttempted();
         uint8_t *destination = nullptr;
         if (!LockSampleData(&destination)) {
+            timing_.LockFailed();
+            timing_.FrameFinished(started, timestamp, false, E_FAIL, 0);
             return;
         }
-        if (!queue_.Read(destination)) {
+        const bool queue_read = queue_.Read(destination);
+        if (!queue_read) {
+            timing_.QueueReadMissed();
             const size_t y_size = static_cast<size_t>(format_.width) * format_.height;
             std::memset(destination, 16, y_size);
             std::memset(destination + y_size, 128, y_size / 2);
         }
-        UnlockSampleData(static_cast<long long>(timestamp), static_cast<long long>(timestamp + format_.interval_100ns));
+        const auto timestamp_start = static_cast<long long>(timestamp);
+        const auto timestamp_end = static_cast<long long>(timestamp + format_.interval_100ns);
+        if (!timing_enabled) {
+            UnlockSampleData(timestamp_start, timestamp_end);
+            return;
+        }
+
+        uint64_t receive_us = 0;
+        bool receive_called = false;
+        const HRESULT receive_hr =
+            UnlockSampleData(timestamp_start, timestamp_end, &receive_us, &receive_called);
+        timing_.FrameFinished(started, timestamp, receive_called, receive_hr, receive_us);
     }
 
     CameraConfig config_;
@@ -898,6 +1123,7 @@ private:
     std::thread worker_;
     std::mutex mutex_;
     std::condition_variable condition_;
+    TimingDiagnostics timing_{format_.width, format_.height, format_.interval_100ns};
     bool active_ = false;
     bool stopping_ = false;
 };
@@ -949,6 +1175,13 @@ public:
         const HRESULT format_hr = LoadRuntimeFormat(config_, &format);
         if (FAILED(format_hr) && format_hr != HRESULT_FROM_WIN32(ERROR_NOT_READY)) {
             return format_hr;
+        }
+        // An idle filter must advertise the last real published mode, not a
+        // hard-coded 640x480 mode that an already-open consumer cannot change.
+        // Only absence of the producer permits fallback; a broken live producer
+        // remains an activation error rather than being silently hidden.
+        if (format_hr == HRESULT_FROM_WIN32(ERROR_NOT_READY)) {
+            LoadLastSuccessfulFormat(config_.clsid, &format);
         }
 
         auto *filter = new (std::nothrow) ManagedFilter(config_, format);

@@ -26,21 +26,22 @@ Primary sources:
 - `libobs/util/util_uint64.h`
 - `CMakePresets.json` (installed virtual-camera CLSID)
 
-Rust coverage: `src/backend/windows/obs.rs` and `src/backend/windows/protocol/obs.rs`.
+Rust coverage: `src/backend/windows/obs.rs` (naming, occupancy, resolution hint), `src/backend/windows/queue_writer.rs` (queue writer shared with the managed DirectShow camera), `src/backend/windows/protocol/frame_queue.rs` (layout), and `src/backend/windows/protocol/publication.rs` (ordering).
 
 | Property | Pinned upstream behavior | Rust mapping |
 | --- | --- | --- |
 | Mapping | wide name `OBSVirtualCamVideo` | exact UTF-16 name |
 | Writer occupancy | `OpenFileMappingW(FILE_MAP_READ)` succeeds => fail | normal `DeviceInUse` |
 | Creation/view | page-file `CreateFileMappingW(PAGE_READWRITE)`, `MapViewOfFile(FILE_MAP_ALL_ACCESS)` | same APIs/access |
-| Header | 80 bytes, alignment 8; volatile `uint32_t` write/read/state | `#[repr(C)] QueueHeader`; narrow volatile helpers |
+| Header | 80 bytes, alignment 8; volatile `uint32_t` write/read/state | `#[repr(C)] QueueHeader`; write/read/state accessed only through sequentially consistent 32-bit atomic helpers (`Interlocked*` equivalent) |
 | States | invalid 0, starting 1, ready 2, stopping 3 | exact values |
 | Slots | 3; header and each `(32-byte frame header + NV12)` extent aligned to 32 | checked layout calculation |
 | Frame | timestamp at slot start; image at `slot + 32`; Y then UV | tight NV12 split at `width * height` |
-| Publish order | increment write index, timestamp, Y, UV, read index, READY | identical observable order |
+| Publish order | increment write index, timestamp, Y, UV, read index, READY | identical observable order; every publish is a full barrier, so the order also holds on ARM64 |
 | Interval | `fps_den * 10_000_000 / fps_num` in 100ns units | exact `ObsFrameRate` integer calculation |
 | Timestamp | `video_data.timestamp`, derived from QPC as nanoseconds | QPC converted to nanoseconds with upstream mul/div algorithm |
 | Close | writer stores STOPPING before unmap/close | same |
+| Resolution hint | `virtualcam_start` writes `%APPDATA%\obs-virtualcam.txt` as `%dx%dx%lld` (tmp + replace) before creating the queue; the filter reads it when no queue exists | same format and replace-through-temporary write, but only after the queue was created |
 
 The DirectShow consumer currently discards the stored slot timestamp when producing its sample, but the Rust writer still publishes the upstream nanosecond value.
 
@@ -54,9 +55,9 @@ Primary sources/design references:
 - libdshowcapture `source/output-filter.cpp/.hpp`
 - libdshowcapture media-type helpers pinned above
 
-Native coverage: `native/managed-virtualcam`; Rust management coverage: `src/managed.rs` plus the named-queue reuse in `src/backend/windows/obs.rs`.
+Native coverage: `native/managed-virtualcam`; Rust management coverage: `src/managed/mod.rs` with the native-ABI client in `src/managed/native_driver.rs`; producer coverage: `src/backend/windows/managed_dshow/` (control plane and last-format history) on top of the shared `src/backend/windows/queue_writer.rs`.
 
-The managed driver intentionally keeps only the NV12 path. It does not register the OBS CLSID, does not use `OBSVirtualCamVideo`, and does not advertise I420/YUY2. Registration persists only device identity. Runtime ABI v3 uses four CLSID-derived object classes: `-Producer` is an exclusive producer lease, `-Ready` is a reusable publication event, `-Control` is a fixed 32-byte format declaration, and the actual OBS-compatible three-slot queue is `-Data-{width}x{height}-{interval}`. The producer reserves the unsignaled lease, resets Ready, invalidates the control plane, initializes the format-specific data mapping, publishes control metadata, signals Ready, and signals the producer lease last. `IClassFactory::CreateInstance` waits on that publication and validates the control plane; only a genuinely absent producer becomes the `640x480@30` black-frame fallback, while corrupt/inaccessible live-session metadata is surfaced as an activation error. A connected graph remains fixed-mode, but an old consumer can retain its prior data section without limiting the next producer's section size. Queue discovery is throttled after missing/incompatible sessions, and stagnant `read_idx` values trigger producer-lease/control checks so an abnormally terminated producer falls back to black instead of freezing its final frame. Rust `open` resolves the CLSID's actual `InprocServer32` target and requires ABI v3, so incompatible v2 runtime transports are rejected. Registration may point to a stable app-local DLL on a local drive; the module is canonicalized through a file handle, UNC/network modules are rejected, and the ordinary local DOS path is persisted to `InprocServer32`. Rename/unregister rollback snapshots and restores that original COM module path rather than substituting the currently loaded manager DLL.
+The managed driver intentionally keeps only the NV12 path. It does not register the OBS CLSID, does not use `OBSVirtualCamVideo`, and does not advertise I420/YUY2. Registration persists only device identity. Runtime ABI v3 uses four CLSID-derived object classes: `-Producer` is an exclusive producer lease, `-Ready` is a reusable publication event, `-Control` is a fixed 32-byte format declaration, and the actual OBS-compatible three-slot queue is `-Data-{width}x{height}-{interval}`. The producer reserves the unsignaled lease, resets Ready, invalidates the control plane, initializes the format-specific data mapping, publishes control metadata, signals Ready, and signals the producer lease last. `IClassFactory::CreateInstance` waits on that publication and validates the control plane; only a genuinely absent producer becomes the black-frame idle fallback (the same user's last successfully published mode for that CLSID, else `640x480@30`), while corrupt/inaccessible live-session metadata is surfaced as an activation error. A connected graph remains fixed-mode, but an old consumer can retain its prior data section without limiting the next producer's section size. Queue discovery is throttled after missing/incompatible sessions, and stagnant `read_idx` values trigger producer-lease/control checks so an abnormally terminated producer falls back to black instead of freezing its final frame. Rust `open` resolves the CLSID's actual `InprocServer32` target and requires ABI v3, so incompatible v2 runtime transports are rejected. Registration may point to a stable app-local DLL on a local drive; the module is canonicalized through a file handle, UNC/network modules are rejected, and the ordinary local DOS path is persisted to `InprocServer32`. Rename/unregister rollback snapshots and restores that original COM module path rather than substituting the currently loaded manager DLL.
 
 The native DLL uses libdshowcapture's `OutputFilter` infrastructure under its upstream LGPL-2.1-or-later license. The vendored subset and complete LGPL text live under `native/managed-virtualcam/third_party/libdshowcapture`. The local `output-filter.cpp` copy carries one deliberate fixed-mode hardening change: `Connect`, `QueryAccept`, and `IAMStreamConfig::SetFormat` reject media types whose video subtype, dimensions, or frame interval differ from the mode selected for that graph (live producer format or idle fallback), preventing allocator-size drift from the NV12 producer contract. Two additional vendored edits are warning-only and behavior-neutral: the local `Pause` variable avoids shadowing the `pin` member, and `log.hpp` guards its `WIN32_LEAN_AND_MEAN` definition.
 
@@ -96,7 +97,8 @@ Rust coverage: `src/backend/windows/unity_capture.rs` and `src/backend/windows/p
 - `force_open` is a requested extension, isolated in the OBS open path. It validates the accessible mapped region with `VirtualQuery` before reinitializing.
 - Unity Capture's C++ destructor omits `UnmapViewOfFile`; Rust owns and unmaps the view with RAII.
 - Failed mutex waits/releases and event operations become errors with their exact Win32 code instead of being ignored.
-- The OBS application also writes `obs-virtualcam.txt` as a last-format fallback. This library owns only transfer/protocol resources and does not write application configuration files; a live queue carries its current dimensions and interval.
+- Like the OBS application, a successful OBS open writes `%APPDATA%\obs-virtualcam.txt`, because the OBS filter uses it as its consumer-first mode; without it a consumer that opens first negotiates a stale mode and the filter scales this producer's frames into it. Unlike upstream, the file is written only after the queue was created, so a producer rejected with `DeviceInUse` never overwrites the active producer's mode. (Earlier releases deliberately skipped this file.)
+- Queue control fields use sequentially consistent atomics instead of relying on MSVC's x86/x64 `/volatile:ms` acquire/release semantics. The binary layout and the publication sequence are unchanged.
 - Unity's D3D11 texture readback and optional double-buffering are outside `SharedImageMemory::Send`; host/CUDA callers already provide an accessible buffer, so those plugin-only controls are not fabricated by this crate.
 - CUDA writes replace only the upstream CPU data-copy step: one Runtime D2H copy
   targets the selected OBS slot or Unity data field directly, and that stream is

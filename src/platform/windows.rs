@@ -1,9 +1,14 @@
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::ptr::NonNull;
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INVALID_DATA, GetLastError, HANDLE};
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile, VirtualQuery};
+use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::Registry::{HKEY, HKEY_CLASSES_ROOT, KEY_READ, RegCloseKey, RegOpenKeyExW};
-use windows_sys::Win32::System::Threading::{INFINITE, ReleaseMutex, WaitForSingleObject};
+use windows_sys::Win32::UI::Shell::{FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 
 use crate::{Error, Result};
 
@@ -14,7 +19,24 @@ pub(crate) fn last_error(operation: &'static str) -> Error {
     Error::Windows { operation, code }
 }
 
+/// Reports whether the immediately preceding successful `Create*` call opened
+/// an existing named object instead of creating it.
+pub(crate) fn opened_existing_object() -> bool {
+    // SAFETY: `GetLastError` has no preconditions and reads thread-local state.
+    unsafe { GetLastError() == ERROR_ALREADY_EXISTS }
+}
+
+/// Encodes `value` as a NUL-terminated UTF-16 string for wide Win32 APIs.
+pub(crate) fn wide_nul(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(core::iter::once(0)).collect()
+}
+
 pub(crate) struct OwnedHandle(HANDLE);
+
+// SAFETY: Kernel object handles are process-wide and carry no thread
+// affinity. Mutex ownership, the one thread-affine kernel concept used by this
+// crate, never outlives a single write call.
+unsafe impl Send for OwnedHandle {}
 
 impl OwnedHandle {
     /// Takes ownership of a non-null Win32 kernel handle.
@@ -25,6 +47,24 @@ impl OwnedHandle {
     pub(crate) unsafe fn from_raw(raw: HANDLE) -> Self {
         debug_assert!(!raw.is_null());
         Self(raw)
+    }
+
+    /// Takes ownership of the result of a Win32 create/open call, converting a
+    /// null return into that call's `GetLastError`.
+    ///
+    /// Call this immediately after the Win32 call; on success it touches no
+    /// thread-local error state, so [`opened_existing_object`] still applies.
+    ///
+    /// # Safety
+    ///
+    /// A non-null `raw` must be a uniquely owned handle valid for `CloseHandle`.
+    pub(crate) unsafe fn from_result(raw: HANDLE, operation: &'static str) -> Result<Self> {
+        if raw.is_null() {
+            Err(last_error(operation))
+        } else {
+            // SAFETY: Forwarded caller contract for the non-null handle.
+            Ok(unsafe { Self::from_raw(raw) })
+        }
     }
 
     pub(crate) const fn raw(&self) -> HANDLE {
@@ -50,6 +90,11 @@ pub(crate) struct MappedView {
     accessible_len: usize,
 }
 
+// SAFETY: A mapped view is ordinary process memory with no thread affinity.
+// The owner only hands out raw pointers; every mutation through them is
+// serialized by `&mut` access to the owning backend.
+unsafe impl Send for MappedView {}
+
 impl MappedView {
     pub(crate) fn map(handle: HANDLE, desired_access: u32, operation: &'static str) -> Result<Self> {
         // SAFETY: `handle` is a live file-mapping handle. Offsets and length are
@@ -65,12 +110,13 @@ impl MappedView {
         // writable storage of the exact structure size expected by VirtualQuery.
         let queried = unsafe { VirtualQuery(ptr.as_ptr().cast(), &mut info, core::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
         if queried == 0 {
+            let error = last_error("VirtualQuery(mapped view)");
             // SAFETY: The successful mapped view is still owned locally and is
             // being unwound before returning the VirtualQuery error.
             unsafe {
                 UnmapViewOfFile(mapped);
             }
-            return Err(last_error("VirtualQuery(mapped view)"));
+            return Err(error);
         }
 
         Ok(Self { ptr, accessible_len: info.RegionSize })
@@ -80,6 +126,7 @@ impl MappedView {
         self.ptr.as_ptr()
     }
 
+    /// Returns a typed pointer when `T` fits inside the view at an aligned offset.
     pub(crate) fn ptr_at<T>(&self, offset: usize) -> Option<NonNull<T>> {
         let end = offset.checked_add(core::mem::size_of::<T>())?;
         if end > self.accessible_len {
@@ -109,53 +156,51 @@ impl Drop for MappedView {
     }
 }
 
-pub(crate) struct MutexGuard {
-    handle: HANDLE,
-    acquired: bool,
+/// QueryPerformanceCounter clock reporting nanoseconds, matching OBS's
+/// `os_gettime_ns` frame timestamps.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QpcClock {
+    frequency: u64,
 }
 
-impl MutexGuard {
-    pub(crate) fn acquire(handle: HANDLE, operation: &'static str) -> Result<Self> {
-        // SAFETY: `handle` is a live mutex handle with synchronization access.
-        let result = unsafe { WaitForSingleObject(handle, INFINITE) };
-        match result {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self { handle, acquired: true }),
-            WAIT_FAILED => Err(last_error(operation)),
-            _ => Err(Error::Protocol {
-                backend: crate::CameraType::UnityCapture,
-                detail: "infinite mutex wait returned an unexpected status",
+impl QpcClock {
+    pub(crate) fn new() -> Result<Self> {
+        let mut frequency = 0_i64;
+        // SAFETY: `frequency` is valid writable storage for LARGE_INTEGER's i64
+        // representation used by windows-sys.
+        if unsafe { QueryPerformanceFrequency(&raw mut frequency) } == 0 {
+            return Err(last_error("QueryPerformanceFrequency"));
+        }
+        match u64::try_from(frequency) {
+            Ok(frequency) if frequency != 0 => Ok(Self { frequency }),
+            _ => Err(Error::Windows {
+                operation: "QueryPerformanceFrequency(non-positive frequency)",
+                code: ERROR_INVALID_DATA,
             }),
         }
     }
 
-    pub(crate) fn release(mut self, operation: &'static str) -> Result<()> {
-        // Mark released only after the system confirms ownership was relinquished.
-        // SAFETY: This guard was constructed only after a successful or abandoned
-        // mutex wait, both of which grant ownership to the current thread.
-        let released = unsafe { ReleaseMutex(self.handle) };
-        if released == 0 {
-            return Err(last_error(operation));
+    pub(crate) fn now_ns(self) -> Result<u64> {
+        let mut counter = 0_i64;
+        // SAFETY: `counter` is writable storage for the API's LARGE_INTEGER.
+        if unsafe { QueryPerformanceCounter(&raw mut counter) } == 0 {
+            return Err(last_error("QueryPerformanceCounter"));
         }
-        self.acquired = false;
-        Ok(())
+        let counter = u64::try_from(counter).map_err(|_| Error::Windows {
+            operation: "QueryPerformanceCounter(negative counter)",
+            code: ERROR_INVALID_DATA,
+        })?;
+        Ok(mul_div_u64(counter, 1_000_000_000, self.frequency))
     }
 }
 
-impl Drop for MutexGuard {
-    fn drop(&mut self) {
-        if self.acquired {
-            // SAFETY: A live guard represents mutex ownership on this thread.
-            // Drop is best-effort because it cannot return an error.
-            unsafe {
-                ReleaseMutex(self.handle);
-            }
-        }
-    }
+fn mul_div_u64(number: u64, multiplier: u64, divisor: u64) -> u64 {
+    let scaled = (u128::from(number) * u128::from(multiplier)) / u128::from(divisor);
+    u64::try_from(scaled).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn registry_key_exists(path: &str) -> bool {
-    let mut wide: Vec<u16> = path.encode_utf16().collect();
-    wide.push(0);
+    let wide = wide_nul(path);
     let mut key: HKEY = std::ptr::null_mut();
     // SAFETY: `wide` is NUL-terminated for the call and `key` points to valid
     // output storage. HKCR is a predefined non-owning root handle.
@@ -168,5 +213,53 @@ pub(crate) fn registry_key_exists(path: &str) -> bool {
         true
     } else {
         false
+    }
+}
+
+/// Returns the current user's roaming AppData directory (`CSIDL_APPDATA`).
+pub(crate) fn roaming_app_data_dir() -> Result<PathBuf> {
+    let mut raw: *mut u16 = core::ptr::null_mut();
+    // SAFETY: `raw` receives a CoTaskMemAlloc string that is freed below on
+    // every path, as SHGetKnownFolderPath requires even after failure.
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_DEFAULT as u32, core::ptr::null_mut(), &mut raw) };
+    let path = if hr >= 0 && !raw.is_null() {
+        // SAFETY: On success `raw` is a NUL-terminated UTF-16 string.
+        let units = unsafe {
+            let length = (0..).take_while(|&index| *raw.add(index) != 0).count();
+            core::slice::from_raw_parts(raw, length)
+        };
+        Ok(PathBuf::from(OsString::from_wide(units)))
+    } else {
+        Err(Error::Hresult {
+            operation: "SHGetKnownFolderPath(FOLDERID_RoamingAppData)",
+            code: hr,
+        })
+    };
+    // SAFETY: CoTaskMemFree accepts null and the shell-allocated string.
+    unsafe { CoTaskMemFree(raw.cast()) };
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_conversion_matches_upstream_mul_div() {
+        assert_eq!(mul_div_u64(12_345, 1_000_000_000, 10_000_000), 1_234_500);
+        assert_eq!(mul_div_u64(u64::MAX, 1_000_000_000, 1), u64::MAX);
+    }
+
+    #[test]
+    fn qpc_clock_is_monotonic_nanoseconds() {
+        let clock = QpcClock::new().expect("QPC is available on supported Windows");
+        let first = clock.now_ns().expect("read QPC");
+        let second = clock.now_ns().expect("read QPC");
+        assert!(first > 0 && second >= first);
+    }
+
+    #[test]
+    fn roaming_app_data_resolves_to_an_existing_directory() {
+        assert!(roaming_app_data_dir().expect("resolve roaming AppData").is_dir());
     }
 }

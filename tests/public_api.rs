@@ -33,6 +33,13 @@ fn backend_options_are_independent_and_match_upstream_defaults() {
 }
 
 #[test]
+fn cameras_can_move_to_a_dedicated_producer_thread() {
+    fn assert_send<T: Send>() {}
+    assert_send::<VirtualCamera>();
+    assert_send::<virtualcam::ManagedCameraManager>();
+}
+
+#[test]
 fn errors_preserve_useful_display_context() {
     assert_eq!(Error::FrameSizeMismatch { expected: 12, actual: 9 }.to_string(), "frame size mismatch: expected 12 bytes, got 9");
     assert_eq!(Error::Windows { operation: "MapViewOfFile", code: 5 }.to_string(), "Win32 operation MapViewOfFile failed with code 5");

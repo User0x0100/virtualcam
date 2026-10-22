@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "dshow-base.hpp"
 #include "dshow-media-type.hpp"
 #include "../dshowcapture.hpp"
@@ -125,7 +127,9 @@ public:
 		  long long timestampEnd);
 
 	bool LockSampleData(unsigned char **ptr);
-	void UnlockSampleData(long long timestampStart, long long timestampEnd);
+	HRESULT UnlockSampleData(long long timestampStart, long long timestampEnd,
+				uint64_t *receiveDurationUs = nullptr,
+				bool *receiveCalled = nullptr);
 
 	void Stop();
 };
@@ -209,10 +213,13 @@ public:
 		return pin->LockSampleData(ptr);
 	}
 
-	inline void UnlockSampleData(long long timestampStart,
-				     long long timestampEnd)
+	inline HRESULT UnlockSampleData(long long timestampStart,
+				       long long timestampEnd,
+				       uint64_t *receiveDurationUs = nullptr,
+				       bool *receiveCalled = nullptr)
 	{
-		pin->UnlockSampleData(timestampStart, timestampEnd);
+		return pin->UnlockSampleData(timestampStart, timestampEnd,
+					     receiveDurationUs, receiveCalled);
 	}
 };
 

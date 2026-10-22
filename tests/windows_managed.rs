@@ -313,6 +313,9 @@ fn managed_driver_registers_enumerates_and_streams_runtime_formats() {
     capture_without_producer(&renamed, 640, 480, 30);
 
     assert_consumer_recovers_to_black_after_producer_crash(&renamed, info.id, &installed_driver);
+    // Even an abnormally terminated producer leaves its last successful mode
+    // available to a newly opened DirectShow consumer.
+    capture_without_producer(&renamed, 160, 120, 30);
 
     let listed = manager.list().expect("list registrations");
     assert!(listed.iter().any(|camera| camera.id == info.id));
@@ -332,11 +335,12 @@ fn managed_driver_registers_enumerates_and_streams_runtime_formats() {
     assert!(enumeration_text.contains(&second_name), "DirectShow enumeration did not contain {second_name}:\n{enumeration_text}");
 
     let mut landscape = manager.open(info.id, stream(320, 240, 30)).expect("open managed producer at landscape runtime format");
-    assert_eq!(landscape.camera_type(), CameraType::ManagedNv12);
+    assert_eq!(landscape.camera_type(), CameraType::ManagedDirectShow);
     assert_eq!(landscape.native_format(), PixelFormat::Nv12);
     assert_eq!(landscape.frame_size(), 320 * 240 * 3 / 2);
     capture_with_ffmpeg(&renamed, 320, 240, 30, &mut landscape);
     landscape.close().expect("close landscape producer");
+    capture_without_producer(&renamed, 320, 240, 30);
 
     let same_registration = manager.get(info.id).expect("registration survives stream close");
     assert_eq!(same_registration.id, info.id);
@@ -346,6 +350,7 @@ fn managed_driver_registers_enumerates_and_streams_runtime_formats() {
     assert_eq!(portrait.frame_size(), 240 * 320 * 3 / 2);
     capture_with_ffmpeg(&renamed, 240, 320, 25, &mut portrait);
     portrait.close().expect("close portrait producer");
+    capture_without_producer(&renamed, 240, 320, 25);
 
     manager.unregister(info.id).expect("unregister managed camera");
     manager.unregister(second.id).expect("unregister second managed camera");

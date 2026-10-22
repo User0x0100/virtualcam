@@ -8,6 +8,12 @@
 - Added producer lifecycle hardening: separate producer-lease and Ready events, explicit control/data publication ordering, fixed-mode DirectShow validation, idle `640x480@30` black-frame activation for OpenCV/DirectShow, throttled queue retries, stale-frame producer-death detection, and missed-deadline dropping instead of burst catch-up after downstream stalls.
 - Added native fixed-mode/OpenCV-style capture-pin regression coverage plus elevated end-to-end coverage for two simultaneous managed cameras, no-producer fallback, abnormal producer termination returning to black, FFmpeg enumeration/capture, rename, independent queues, and sequential landscape/portrait formats on the same CLSID.
 - Hardened managed camera CLSID parsing so malformed Unicode input returns `InvalidCameraId` instead of risking a string-slicing panic.
+- **Breaking:** renamed `CameraType::ManagedNv12` to `CameraType::ManagedDirectShow` and made `CameraType` `#[non_exhaustive]`, so a future Media Foundation managed backend can be added without another break.
+- `VirtualCamera` is now `Send` (still not `Sync`), so a camera can be opened on one thread and written from a dedicated producer thread.
+- OBS producers now write `%APPDATA%\obs-virtualcam.txt` after a successful open, matching OBS Studio, so consumers that open the OBS camera before the producer negotiate the producer's mode instead of a stale one.
+- OBS and managed queue publication fields now use sequentially consistent atomic stores instead of volatile stores plus compiler fences, so the unchanged publication order also holds on ARM64.
+- Fixed the `cuda` feature failing to link against CUDA 13 toolkits, whose `cudart.lib` has no `__imp_` import thunks.
+- Split the OBS producer from the managed DirectShow producer: both now share one OBS-compatible queue writer, and the DirectShow control plane (`-Producer`/`-Ready`/`-Control`/`-Data-*` and last-format history) lives in its own module. Added Phase 0A queue tests, including an ignored torn-frame stress measurement.
 
 ## 0.1.0 - 2026-07-14
 

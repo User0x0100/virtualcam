@@ -2,13 +2,18 @@ use crate::PixelFormat;
 #[cfg(windows)]
 use crate::{Error, Result};
 
-/// Selects the installed virtual-camera protocol used by a camera instance.
+/// Selects the virtual-camera protocol used by a camera instance.
+///
+/// New managed backends (Media Foundation) are added as new variants, so
+/// matches must keep a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CameraType {
     /// OBS Studio's Windows virtual-camera shared queue.
     Obs,
-    /// This crate's independently registered per-session NV12 DirectShow camera.
-    ManagedNv12,
+    /// This crate's independently registered NV12 DirectShow camera, whose
+    /// producer chooses the runtime format of each session.
+    ManagedDirectShow,
     /// The Unity Capture `SharedImageMemory` protocol.
     UnityCapture,
 }
@@ -174,13 +179,41 @@ impl Default for UnityCaptureOptions {
     }
 }
 
+/// A validated, tightly packed NV12 stream for the OBS-compatible frame queue.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Nv12Format {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// Upstream OBS interval, `denominator * 10_000_000 / numerator` truncated.
+    pub(crate) interval_100ns: u64,
+    pub(crate) frame_size: usize,
+}
+
+#[cfg(windows)]
+impl Nv12Format {
+    pub(crate) fn new(width: u32, height: u32, frame_rate: FrameRate) -> Result<Self> {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(Error::InvalidDimensions);
+        }
+        if frame_rate.numerator == 0 || frame_rate.denominator == 0 {
+            return Err(Error::InvalidFrameRate);
+        }
+
+        let frame_size = PixelFormat::Nv12.frame_size(width, height)?;
+        let interval = u128::from(frame_rate.denominator) * 10_000_000 / u128::from(frame_rate.numerator);
+        let interval_100ns = u64::try_from(interval).map_err(|_| Error::InvalidFrameRate)?;
+        if interval_100ns == 0 {
+            return Err(Error::InvalidFrameRate);
+        }
+        Ok(Self { width, height, interval_100ns, frame_size })
+    }
+}
+
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValidatedObsOptions {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) frame_size: usize,
-    pub(crate) interval_100ns: u64,
+    pub(crate) format: Nv12Format,
     pub(crate) force_open: bool,
 }
 
@@ -201,25 +234,8 @@ pub(crate) struct ValidatedUnityCaptureOptions {
 #[cfg(windows)]
 impl ObsOptions {
     pub(crate) fn validate(self) -> Result<ValidatedObsOptions> {
-        if self.width == 0 || self.height == 0 || !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
-            return Err(Error::InvalidDimensions);
-        }
-        if self.frame_rate.numerator == 0 || self.frame_rate.denominator == 0 {
-            return Err(Error::InvalidFrameRate);
-        }
-
-        let frame_size = PixelFormat::Nv12.frame_size(self.width, self.height)?;
-        let interval = u128::from(self.frame_rate.denominator) * 10_000_000 / u128::from(self.frame_rate.numerator);
-        let interval_100ns = u64::try_from(interval).map_err(|_| Error::InvalidFrameRate)?;
-        if interval_100ns == 0 {
-            return Err(Error::InvalidFrameRate);
-        }
-
         Ok(ValidatedObsOptions {
-            width: self.width,
-            height: self.height,
-            frame_size,
-            interval_100ns,
+            format: Nv12Format::new(self.width, self.height, self.frame_rate)?,
             force_open: self.force_open,
         })
     }
@@ -303,7 +319,9 @@ mod tests {
             frame_rate: FrameRate { numerator: 30_000, denominator: 1001 },
             force_open: false,
         };
-        assert_eq!(options.validate().expect("valid rate").interval_100ns, 333_666);
+        let format = options.validate().expect("valid rate").format;
+        assert_eq!(format.interval_100ns, 333_666);
+        assert_eq!(format.frame_size, 6);
 
         for frame_rate in [FrameRate { numerator: 0, denominator: 1 }, FrameRate { numerator: 1, denominator: 0 }, FrameRate { numerator: u32::MAX, denominator: 1 }] {
             assert!(matches!(ObsOptions { frame_rate, ..options }.validate(), Err(Error::InvalidFrameRate)));

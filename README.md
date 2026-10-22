@@ -18,6 +18,8 @@ The Rust producer path does no scaling, pixel conversion, or color conversion. M
 - an arbitrary DirectShow friendly name;
 - its own `Local\\VirtualCamRs-{CLSID}` runtime-object namespace.
 
+Producers opened this way report `CameraType::ManagedDirectShow`. `CameraType` is `#[non_exhaustive]` because a Media Foundation managed backend is planned (see [WINDOWS_NATIVE_VIRTUAL_CAMERA_PLAN.md](WINDOWS_NATIVE_VIRTUAL_CAMERA_PLAN.md)); it will fix one native mode at registration instead of per producer session.
+
 Width, height, and frame rate are not part of registration. Managed runtime ABI v3 separates lifecycle from frame storage: `-Producer` is the single-writer lease, `-Ready` publishes a complete session, `-Control` is a fixed 32-byte format declaration, and the OBS-compatible three-slot frame queue is named `-Data-{width}x{height}-{interval}`. This lets an old DirectShow graph keep its prior mapping open while a later producer for the same CLSID starts at a larger or otherwise different format without inheriting the old section's capacity. The DirectShow DLL reads the control plane only after the producer claim and Ready event are signaled, so startup races cannot expose partially initialized format metadata.
 
 Build the x64 DLL first, then keep it at the stable application-local path that will own the managed cameras. Machine-wide COM registration mutations still require an elevated process.
@@ -76,7 +78,7 @@ manager.unregister(info.id)?;
 # }
 ```
 
-`register`, `unregister`, `rename`, `get`, and `list` are persistent management operations. Registration uses DirectShow's filter mapper and writes system COM registration, so register/rename/unregister normally require elevation; read/open operations do not. `open` selects one managed ABI v3 runtime session. Before creating it, Rust resolves the camera's actual `HKCR\\CLSID\\{id}\\InprocServer32` target and verifies that the DLL COM will load implements ABI v3; the manager's own DLL path is not treated as authoritative for an existing registration. A registered camera can be opened by DirectShow/OpenCV before any producer exists: the native filter advertises an idle `640x480@30` NV12 mode and emits black frames. A connected graph keeps its negotiated mode; a later matching producer can attach without reconnecting, while another format requires reopening the consumer. Old format-specific data mappings no longer constrain a later producer's mapping size. The receiver also checks producer-lease liveness when frames stop advancing, so an abnormally terminated producer falls back to black instead of freezing its last frame indefinitely. Mutating operations are serialized across processes, and rollback restores the original registered `InprocServer32` path rather than substituting whichever compatible manager DLL initiated the mutation. The native DLL resolves its loaded module through a file handle and persists `InprocServer32` as a normal canonical local DOS full path rather than a `\\?\...` spelling. The DLL may be app-local on a local drive instead of living under Program Files; UNC/network module paths are rejected. Keep that application directory stable for as long as a registration exists, or unregister/re-register after moving it. Because the registration is machine-wide, the application is responsible for the trust and update policy of the directory containing the registered DLL. Existing OBS Virtual Camera registration is untouched. The first native build target is x64; supporting 32-bit DirectShow consumers requires a corresponding x86 DLL/registry view.
+`register`, `unregister`, `rename`, `get`, and `list` are persistent management operations. Registration uses DirectShow's filter mapper and writes system COM registration, so register/rename/unregister normally require elevation; read/open operations do not. `open` selects one managed ABI v3 runtime session. Before creating it, Rust resolves the camera's actual `HKCR\\CLSID\\{id}\\InprocServer32` target and verifies that the DLL COM will load implements ABI v3; the manager's own DLL path is not treated as authoritative for an existing registration. A registered camera can be opened by DirectShow/OpenCV before any producer exists: the native filter advertises the last successfully published NV12 mode for that CLSID and current Windows user, falling back to `640x480@30` when no valid history exists, and emits black frames. Format history is a per-user, versioned binary registry value under `HKCU\\Software\\VirtualCamRs\\ManagedCameraFormats\\{CLSID}`, written once after the first successful frame in each managed producer session; it does not require elevation. A connected graph keeps its negotiated mode; a later matching producer can attach without reconnecting, while another format requires reopening the consumer. Old format-specific data mappings no longer constrain a later producer's mapping size. The receiver also checks producer-lease liveness when frames stop advancing, so an abnormally terminated producer falls back to black instead of freezing its last frame indefinitely. Mutating operations are serialized across processes, and rollback restores the original registered `InprocServer32` path rather than substituting whichever compatible manager DLL initiated the mutation. The native DLL resolves its loaded module through a file handle and persists `InprocServer32` as a normal canonical local DOS full path rather than a `\\?\...` spelling. The DLL may be app-local on a local drive instead of living under Program Files; UNC/network module paths are rejected. Keep that application directory stable for as long as a registration exists, or unregister/re-register after moving it. Because the registration is machine-wide, the application is responsible for the trust and update policy of the directory containing the registered DLL. Existing OBS Virtual Camera registration is untouched. The first native build target is x64; supporting 32-bit DirectShow consumers requires a corresponding x86 DLL/registry view.
 
 ## Independent backend controls
 
@@ -150,6 +152,10 @@ Every frame must contain exactly `camera.frame_size()` bytes. OBS and managed
 NV12 width and height must both be even.
 
 `is_ready()` follows what each upstream protocol can actually report. Unity returns `false` until its DirectShow receiver has created the required objects. OBS has no consumer-presence handshake, so its producer is ready as soon as its queue is open.
+
+Like OBS Studio's own `virtualcam_start`, a successful `open_obs` records the producer mode as `{width}x{height}x{interval}` in `%APPDATA%\obs-virtualcam.txt` (replaced through a temporary file). The OBS DirectShow filter reads that file when a consumer opens the camera while no producer queue exists, so consumer-first applications negotiate this producer's resolution and frame rate instead of scaling from a stale mode. Unlike upstream, the file is written only after the queue was created, so an open rejected with `DeviceInUse` never overwrites the active producer's mode. A failure to write it is not an error.
+
+`VirtualCamera` is `Send` but not `Sync`: open a camera on one thread and move it to a dedicated capture or render thread; writes stay serialized through `&mut self`. For `write_cuda`, each call's device pointer and stream must belong to the CUDA context current on the calling thread.
 
 ## Generated test video example
 
@@ -271,7 +277,7 @@ affinity. The crate never calls `cudaSetDevice`, context APIs,
 the failing operation and exact numeric `cudaError_t`; the minimal binding does
 not call `cudaGetErrorString`.
 
-On Windows, linking uses `cudart`; `build.rs` adds `%CUDA_PATH%\lib\x64` (or `Win32`) when that environment variable is present. The default build never compiles or links CUDA code.
+On Windows, linking uses the toolkit's `cudart.lib`; `build.rs` adds `%CUDA_PATH%\lib\x64` (or `Win32`) when that environment variable is present. The library is linked as an unbundled static library: CUDA 13 ships `cudart.lib` as a loader shim without `__imp_` import thunks, and plain-symbol references resolve against both that shim and older import-library toolkits. The default build never compiles or links CUDA code.
 
 ## `force_open`
 
@@ -283,7 +289,7 @@ The caller guarantees there is no other active producer. `force_open` cannot est
 
 | Platform | Compiles | Runtime behavior |
 | --- | --- | --- |
-| Windows | yes | managed NV12 driver plus OBS and Unity Capture producers |
+| Windows | yes | managed NV12 DirectShow driver plus OBS and Unity Capture producers |
 | Linux | yes | backend-specific open methods return `UnsupportedPlatform` |
 | macOS | yes | backend-specific open methods return `UnsupportedPlatform` |
 
@@ -314,10 +320,20 @@ cargo test --all-features cuda::tests::real_cuda_d2h_writes_directly_to_a_window
 
 Two ignored tests exercise the globally named objects of the OBS/Unity drivers installed
 on the current Windows host. Close any OBS producer before running them; a Unity
-consumer may be open or closed because both states are valid and checked:
+consumer may be open or closed because both states are valid and checked. The OBS
+test restores `%APPDATA%\obs-virtualcam.txt` afterwards:
 
 ```powershell
 cargo test --all-features --test windows_installed -- --ignored --test-threads=1
+```
+
+The OBS-compatible three-slot queue has no per-slot generation, so a writer that
+laps a slow reader can overwrite the slot being copied. A default test pins that
+ABI property, and an ignored stress test measures how often a deliberately slow
+reader observes a torn frame:
+
+```powershell
+cargo test --release --lib high_rate_writer_against_slow_reader -- --ignored --nocapture
 ```
 
 A separate ignored integration test performs the full managed-camera lifecycle: it registers two independent devices, renames one, verifies both through FFmpeg's DirectShow enumeration, opens independent NV12 producer queues, then captures the same CLSID first at `320x240@30` and later at `240x320@25` without re-registering it. It finally unregisters both devices. Run from an elevated shell after building the DLL:

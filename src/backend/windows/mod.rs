@@ -1,14 +1,26 @@
+//! Windows producer backends.
+//!
+//! - `obs`: third-party OBS Virtual Camera queue.
+//! - `managed_dshow`: this crate's managed DirectShow camera (producer-owned
+//!   runtime format, session-local transport).
+//! - `unity_capture`: third-party Unity Capture shared image.
+//!
+//! OBS and managed DirectShow share only the frame-queue writer; their naming,
+//! occupancy, and lifecycle rules are separate.
+
+mod managed_dshow;
 mod obs;
 mod protocol;
+mod queue_writer;
 mod unity_capture;
 
+use self::managed_dshow::ManagedDshowBackend;
 use self::obs::ObsBackend;
-use self::protocol::obs::VIDEO_NAME;
 use self::protocol::unity_capture::ObjectNames;
 use self::unity_capture::UnityCaptureBackend;
-use crate::config::{ValidatedObsOptions, ValidatedUnityCaptureOptions};
+use crate::config::{Nv12Format, ValidatedObsOptions, ValidatedUnityCaptureOptions};
 use crate::platform::windows::registry_key_exists;
-use crate::{CameraType, Error, Result, WriteStatus};
+use crate::{CameraType, Error, ManagedCameraId, Result, WriteStatus};
 #[cfg(feature = "cuda")]
 use crate::{CudaStream, cuda};
 
@@ -53,7 +65,7 @@ impl FrameSource<'_> {
 
 pub(crate) enum Backend {
     Obs(ObsBackend),
-    ManagedNv12(ObsBackend),
+    ManagedDirectShow(ManagedDshowBackend),
     UnityCapture(UnityCaptureBackend),
 }
 
@@ -62,11 +74,11 @@ impl Backend {
         if !registry_key_exists(obs::OBS_CLSID_KEY) {
             return Err(Error::BackendUnavailable(CameraType::Obs));
         }
-        ObsBackend::open(options, VIDEO_NAME, CameraType::Obs).map(Self::Obs)
+        ObsBackend::open(options).map(Self::Obs)
     }
 
-    pub(crate) fn open_managed_nv12(options: ValidatedObsOptions, video_name: &[u16]) -> Result<Self> {
-        ObsBackend::open(options, video_name, CameraType::ManagedNv12).map(Self::ManagedNv12)
+    pub(crate) fn open_managed_dshow(id: ManagedCameraId, format: Nv12Format) -> Result<Self> {
+        ManagedDshowBackend::open(id, format).map(Self::ManagedDirectShow)
     }
 
     pub(crate) fn open_unity_capture(options: ValidatedUnityCaptureOptions) -> Result<Self> {
@@ -78,34 +90,37 @@ impl Backend {
 
     pub(crate) fn is_ready(&mut self) -> Result<bool> {
         match self {
-            Self::Obs(backend) | Self::ManagedNv12(backend) => backend.is_ready(),
+            Self::Obs(backend) => backend.is_ready(),
+            Self::ManagedDirectShow(backend) => backend.is_ready(),
             Self::UnityCapture(backend) => backend.is_ready(),
         }
     }
 
     pub(crate) fn write_host_frame(&mut self, frame: &[u8]) -> Result<WriteStatus> {
-        match self {
-            Self::Obs(backend) | Self::ManagedNv12(backend) => backend.write_frame(FrameSource::Host(frame)),
-            Self::UnityCapture(backend) => backend.write_frame(FrameSource::Host(frame)),
-        }
+        self.write_frame(FrameSource::Host(frame))
     }
 
     #[cfg(feature = "cuda")]
     pub(crate) unsafe fn write_cuda_frame(&mut self, device_source: *const core::ffi::c_void, byte_len: usize, stream: Option<CudaStream>) -> Result<WriteStatus> {
-        let frame = FrameSource::Cuda {
+        self.write_frame(FrameSource::Cuda {
             device_pointer: device_source,
             byte_len,
             stream,
-        };
+        })
+    }
+
+    fn write_frame(&mut self, frame: FrameSource<'_>) -> Result<WriteStatus> {
         match self {
-            Self::Obs(backend) | Self::ManagedNv12(backend) => backend.write_frame(frame),
+            Self::Obs(backend) => backend.write_frame(frame),
+            Self::ManagedDirectShow(backend) => backend.write_frame(frame),
             Self::UnityCapture(backend) => backend.write_frame(frame),
         }
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {
         match self {
-            Self::Obs(backend) | Self::ManagedNv12(backend) => backend.close(),
+            Self::Obs(backend) => backend.close(),
+            Self::ManagedDirectShow(backend) => backend.close(),
             Self::UnityCapture(backend) => backend.close(),
         }
     }

@@ -1,20 +1,22 @@
-use std::marker::PhantomData;
-use std::rc::Rc;
+use core::cell::Cell;
+use core::marker::PhantomData;
 
-#[cfg(not(windows))]
-use crate::ManagedStreamConfig;
+#[cfg(windows)]
+use crate::ManagedCameraId;
 #[cfg(windows)]
 use crate::backend::Backend;
 #[cfg(windows)]
-use crate::config::ValidatedObsOptions;
+use crate::config::Nv12Format;
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaStream;
-use crate::{CameraType, Error, ManagedCameraId, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
+use crate::{CameraType, Error, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
 
 /// Unified producer facade for a selected virtual-camera backend.
 ///
-/// Instances are intentionally neither `Send` nor `Sync`: writes are serialized
-/// through `&mut self`, and CUDA context affinity remains the caller's concern.
+/// A camera is `Send`, so it can be opened on one thread and fed from a
+/// dedicated capture/render thread. It is not `Sync`: writes are serialized
+/// through `&mut self`. With CUDA, each `write_cuda` call's pointer and stream
+/// must belong to the context current on the calling thread.
 pub struct VirtualCamera {
     camera_type: CameraType,
     native_format: PixelFormat,
@@ -22,7 +24,7 @@ pub struct VirtualCamera {
     closed: bool,
     #[cfg(windows)]
     backend: Backend,
-    not_send_or_sync: PhantomData<Rc<()>>,
+    not_sync: PhantomData<Cell<()>>,
 }
 
 impl VirtualCamera {
@@ -44,48 +46,43 @@ impl VirtualCamera {
             let backend = Backend::open_obs(validated)?;
             trace_debug!(
                 camera_type = ?CameraType::Obs,
-                width = validated.width,
-                height = validated.height,
-                interval_100ns = validated.interval_100ns,
+                width = validated.format.width,
+                height = validated.format.height,
+                interval_100ns = validated.format.interval_100ns,
                 "virtual camera opened"
             );
             Ok(Self {
                 camera_type: CameraType::Obs,
                 native_format: PixelFormat::Nv12,
-                frame_size: validated.frame_size,
+                frame_size: validated.format.frame_size,
                 closed: false,
                 backend,
-                not_send_or_sync: PhantomData,
+                not_sync: PhantomData,
             })
         }
     }
 
+    /// Opens one managed DirectShow producer session; reached through
+    /// [`crate::ManagedCameraManager::open`] after registration checks.
     #[cfg(windows)]
-    pub(crate) fn open_managed_validated(id: ManagedCameraId, validated: ValidatedObsOptions) -> Result<Self> {
-        let queue_name = id.queue_name_wide();
-        let backend = Backend::open_managed_nv12(validated, &queue_name)?;
+    pub(crate) fn open_managed_dshow(id: ManagedCameraId, format: Nv12Format) -> Result<Self> {
+        let backend = Backend::open_managed_dshow(id, format)?;
         trace_debug!(
-            camera_type = ?CameraType::ManagedNv12,
+            camera_type = ?CameraType::ManagedDirectShow,
             camera_id = %id,
-            width = validated.width,
-            height = validated.height,
-            interval_100ns = validated.interval_100ns,
+            width = format.width,
+            height = format.height,
+            interval_100ns = format.interval_100ns,
             "managed virtual camera opened"
         );
         Ok(Self {
-            camera_type: CameraType::ManagedNv12,
+            camera_type: CameraType::ManagedDirectShow,
             native_format: PixelFormat::Nv12,
-            frame_size: validated.frame_size,
+            frame_size: format.frame_size,
             closed: false,
             backend,
-            not_send_or_sync: PhantomData,
+            not_sync: PhantomData,
         })
-    }
-
-    #[cfg(not(windows))]
-    pub(crate) fn open_managed(id: ManagedCameraId, stream: ManagedStreamConfig) -> Result<Self> {
-        let _ = (id, stream);
-        Err(Error::UnsupportedPlatform)
     }
 
     /// Opens a Unity Capture producer with Unity-specific protocol controls.
@@ -118,7 +115,7 @@ impl VirtualCamera {
                 frame_size: validated.frame_size,
                 closed: false,
                 backend,
-                not_send_or_sync: PhantomData,
+                not_sync: PhantomData,
             })
         }
     }

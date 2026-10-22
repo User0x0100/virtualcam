@@ -1,14 +1,12 @@
-use core::ptr::NonNull;
-
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, OpenFileMappingA};
-use windows_sys::Win32::System::Threading::{CreateEventA, EVENT_MODIFY_STATE, OpenEventA, SetEvent, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{CreateEventA, EVENT_MODIFY_STATE, INFINITE, OpenEventA, ReleaseMutex, SetEvent, WaitForSingleObject};
 use windows_sys::Win32::System::WindowsProgramming::OpenMutexA;
 
 use super::FrameSource;
 use super::protocol::unity_capture::{DATA_OFFSET, MAX_SHARED_IMAGE_SIZE, ObjectNames, SharedMemHeader};
 use crate::config::ValidatedUnityCaptureOptions;
-use crate::platform::windows::{MappedView, MutexGuard, OwnedHandle, last_error};
+use crate::platform::windows::{MappedView, OwnedHandle, last_error};
 use crate::{CameraType, Error, Result, WriteStatus};
 
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
@@ -18,13 +16,24 @@ const UNITY_CLSID_SUFFIX_BASE: u8 = 0x10;
 #[cfg(target_pointer_width = "32")]
 const UNITY_CLSID_SUFFIX_BASE: u8 = 0x20;
 
-pub(crate) struct UnityCaptureBackend {
+/// Receiver-created objects the sender has attached to so far.
+///
+/// Like upstream `SharedImageMemory`, the sender keeps partially opened
+/// handles across attempts and, once the view exists, stays attached: its own
+/// handles keep the named objects alive, so a restarted receiver reopens the
+/// same objects.
+#[derive(Default)]
+struct Connection {
+    // The view is declared first so it is unmapped before its mapping closes.
     view: Option<MappedView>,
-    header: Option<NonNull<SharedMemHeader>>,
     mapping: Option<OwnedHandle>,
     sent_event: Option<OwnedHandle>,
     want_event: Option<OwnedHandle>,
     mutex: Option<OwnedHandle>,
+}
+
+pub(crate) struct UnityCaptureBackend {
+    connection: Connection,
     names: ObjectNames,
     width: i32,
     height: i32,
@@ -48,12 +57,7 @@ impl UnityCaptureBackend {
         }
 
         Ok(Self {
-            view: None,
-            header: None,
-            mapping: None,
-            sent_event: None,
-            want_event: None,
-            mutex: None,
+            connection: Connection::default(),
             names,
             width,
             height,
@@ -95,11 +99,14 @@ impl UnityCaptureBackend {
             return Ok(WriteStatus::ConsumerInactive);
         }
 
-        let view = self.view.as_ref().ok_or(Error::ConsumerInactive)?;
-        let header = self.header.ok_or(Error::ConsumerInactive)?.as_ptr();
+        let connection = &self.connection;
+        let (Some(view), Some(mutex), Some(sent), Some(want)) = (&connection.view, &connection.mutex, &connection.sent_event, &connection.want_event) else {
+            return Ok(WriteStatus::ConsumerInactive);
+        };
+        let header = view.as_ptr().cast::<SharedMemHeader>();
         // Upstream checks maxSize before taking the mutex.
-        // SAFETY: A connected view was validated to contain the shared header;
-        // `max_size` is the first aligned DWORD written by the receiver.
+        // SAFETY: A connected view was validated to contain the aligned shared
+        // header; `max_size` is the first DWORD written by the receiver.
         let maximum = unsafe { core::ptr::read(core::ptr::addr_of!((*header).max_size)) };
         if maximum < self.frame_size {
             return Err(Error::Protocol {
@@ -115,8 +122,7 @@ impl UnityCaptureBackend {
             });
         }
 
-        let mutex = self.mutex.as_ref().ok_or(Error::ConsumerInactive)?.raw();
-        let guard = MutexGuard::acquire(mutex, "WaitForSingleObject(UnityCapture_Mutx)")?;
+        let guard = MutexGuard::acquire(mutex.raw(), "WaitForSingleObject(UnityCapture_Mutx)")?;
         // SAFETY: The mapped view is writable through FILE_MAP_WRITE and contains
         // `required` bytes. The current thread owns the protocol mutex. Each field
         // is naturally aligned and uses the exact C ABI type.
@@ -132,20 +138,20 @@ impl UnityCaptureBackend {
         // SAFETY: `required` validation proves the full data range is writable,
         // and `guard` keeps the receiver out until the copy has completed.
         let destination = unsafe { view.as_ptr().add(DATA_OFFSET) };
-        frame.copy_to(destination)?;
-        guard.release("ReleaseMutex(UnityCapture_Mutx)")?;
+        let copied = frame.copy_to(destination);
+        // Release once even when the copy failed, reporting the copy's error first.
+        let released = guard.release("ReleaseMutex(UnityCapture_Mutx)");
+        copied?;
+        released?;
 
-        let sent = self.sent_event.as_ref().ok_or(Error::ConsumerInactive)?.raw();
         // SAFETY: `sent` is the live event opened with EVENT_MODIFY_STATE.
-        if unsafe { SetEvent(sent) } == 0 {
+        if unsafe { SetEvent(sent.raw()) } == 0 {
             return Err(last_error("SetEvent(UnityCapture_Sent)"));
         }
 
-        let want = self.want_event.as_ref().ok_or(Error::ConsumerInactive)?.raw();
         // SAFETY: `want` is a live auto-reset event created by this sender. A zero
         // timeout implements upstream's non-blocking frame-skip test.
-        let wait_result = unsafe { WaitForSingleObject(want, 0) };
-        match wait_result {
+        match unsafe { WaitForSingleObject(want.raw(), 0) } {
             WAIT_OBJECT_0 => Ok(WriteStatus::Written),
             WAIT_TIMEOUT => {
                 trace_debug!("Unity Capture consumer skipped a frame");
@@ -159,12 +165,13 @@ impl UnityCaptureBackend {
         }
     }
 
+    /// Mirrors upstream `SharedImageMemory::Open(false)`.
     fn try_connect_sender(&mut self) -> Result<bool> {
-        if self.view.is_some() {
+        if self.connection.view.is_some() {
             return Ok(true);
         }
 
-        if self.mutex.is_none() {
+        if self.connection.mutex.is_none() {
             // SAFETY: Name is a stable NUL-terminated ANSI string. SYNCHRONIZE is
             // the exact sender access mask in `SharedImageMemory::Open(false)`.
             let raw = unsafe { OpenMutexA(SYNCHRONIZE_ACCESS, 0, self.names.mutex.as_ptr().cast()) };
@@ -174,75 +181,20 @@ impl UnityCaptureBackend {
                 return missing_object_or_error("OpenMutexA(UnityCapture_Mutx)", code);
             }
             // SAFETY: Successful OpenMutexA returned one owned kernel handle.
-            self.mutex = Some(unsafe { OwnedHandle::from_raw(raw) });
+            self.connection.mutex = Some(unsafe { OwnedHandle::from_raw(raw) });
         }
 
-        let mutex = self.mutex.as_ref().ok_or(Error::ConsumerInactive)?.raw();
+        let Some(mutex) = self.connection.mutex.as_ref().map(OwnedHandle::raw) else {
+            return Ok(false);
+        };
         let guard = MutexGuard::acquire(mutex, "WaitForSingleObject(UnityCapture_Mutx/open)")?;
-
-        if self.want_event.is_none() {
-            // false manual-reset makes this an automatic-reset event, matching
-            // sender-side CreateEventA in upstream Open(false).
-            // SAFETY: Null security attributes and stable NUL-terminated name are
-            // valid; the returned handle is checked before ownership is taken.
-            let raw = unsafe { CreateEventA(std::ptr::null(), 0, 0, self.names.want.as_ptr().cast()) };
-            if raw.is_null() {
-                let error = last_error("CreateEventA(UnityCapture_Want)");
-                guard.release("ReleaseMutex(UnityCapture_Mutx/open error)")?;
-                return Err(error);
-            }
-            // SAFETY: Successful CreateEventA returned one owned event handle.
-            self.want_event = Some(unsafe { OwnedHandle::from_raw(raw) });
-        }
-
-        if self.sent_event.is_none() {
-            // SAFETY: Stable NUL-terminated name and exact upstream sender access.
-            let raw = unsafe { OpenEventA(EVENT_MODIFY_STATE, 0, self.names.sent.as_ptr().cast()) };
-            if raw.is_null() {
-                // Capture the opening error before releasing the mutex changes
-                // thread-local last-error state.
-                // SAFETY: `GetLastError` reads thread-local state.
-                let code = unsafe { GetLastError() };
-                guard.release("ReleaseMutex(UnityCapture_Mutx/open inactive)")?;
-                return missing_object_or_error("OpenEventA(UnityCapture_Sent)", code);
-            }
-            // SAFETY: Successful OpenEventA returned one owned event handle.
-            self.sent_event = Some(unsafe { OwnedHandle::from_raw(raw) });
-        }
-
-        if self.mapping.is_none() {
-            // SAFETY: Stable NUL-terminated name and exact FILE_MAP_WRITE access.
-            let raw = unsafe { OpenFileMappingA(FILE_MAP_WRITE, 0, self.names.data.as_ptr().cast()) };
-            if raw.is_null() {
-                // SAFETY: `GetLastError` reads thread-local state immediately.
-                let code = unsafe { GetLastError() };
-                guard.release("ReleaseMutex(UnityCapture_Mutx/open inactive)")?;
-                return missing_object_or_error("OpenFileMappingA(UnityCapture_Data)", code);
-            }
-            // SAFETY: Successful OpenFileMappingA returned one owned handle.
-            self.mapping = Some(unsafe { OwnedHandle::from_raw(raw) });
-        }
-
-        if self.view.is_none() {
-            let mapping = self.mapping.as_ref().ok_or(Error::ConsumerInactive)?.raw();
-            let view = MappedView::map(mapping, FILE_MAP_WRITE, "MapViewOfFile(UnityCapture_Data)")?;
-            if view.accessible_len() < DATA_OFFSET {
-                guard.release("ReleaseMutex(UnityCapture_Mutx/open invalid mapping)")?;
-                return Err(Error::Protocol {
-                    backend: CameraType::UnityCapture,
-                    detail: "Unity Capture mapping does not contain SharedMemHeader",
-                });
-            }
-            let header = view.ptr_at::<SharedMemHeader>(0).ok_or(Error::Protocol {
-                backend: CameraType::UnityCapture,
-                detail: "Unity Capture mapping header is misaligned or truncated",
-            })?;
-            self.header = Some(header);
-            self.view = Some(view);
-        }
-
-        guard.release("ReleaseMutex(UnityCapture_Mutx/open)")?;
-        Ok(true)
+        // Every step runs under the receiver mutex. The guard is released once
+        // afterwards so a release failure never masks the step's own error.
+        let connected = attach_under_mutex(&mut self.connection, &self.names);
+        let released = guard.release("ReleaseMutex(UnityCapture_Mutx/open)");
+        let connected = connected?;
+        released?;
+        Ok(connected)
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {
@@ -252,14 +204,58 @@ impl UnityCaptureBackend {
         self.open = false;
         // Upstream's sender has no protocol-visible closing transition. Rust
         // additionally unmaps its owned view instead of leaking it until exit.
-        self.header = None;
-        self.view = None;
-        self.mutex = None;
-        self.want_event = None;
-        self.sent_event = None;
-        self.mapping = None;
+        self.connection = Connection::default();
         Ok(())
     }
+}
+
+/// The receiver-mutex-protected part of upstream `Open(false)`.
+fn attach_under_mutex(connection: &mut Connection, names: &ObjectNames) -> Result<bool> {
+    if connection.want_event.is_none() {
+        // false manual-reset makes this an automatic-reset event, matching
+        // sender-side CreateEventA in upstream Open(false).
+        // SAFETY: Null security attributes and stable NUL-terminated name.
+        let raw = unsafe { CreateEventA(std::ptr::null(), 0, 0, names.want.as_ptr().cast()) };
+        // SAFETY: A non-null CreateEventA result is one owned event handle.
+        connection.want_event = Some(unsafe { OwnedHandle::from_result(raw, "CreateEventA(UnityCapture_Want)") }?);
+    }
+
+    if connection.sent_event.is_none() {
+        // SAFETY: Stable NUL-terminated name and exact upstream sender access.
+        let raw = unsafe { OpenEventA(EVENT_MODIFY_STATE, 0, names.sent.as_ptr().cast()) };
+        if raw.is_null() {
+            // SAFETY: Read immediately after the failed OpenEventA call.
+            let code = unsafe { GetLastError() };
+            return missing_object_or_error("OpenEventA(UnityCapture_Sent)", code);
+        }
+        // SAFETY: Successful OpenEventA returned one owned event handle.
+        connection.sent_event = Some(unsafe { OwnedHandle::from_raw(raw) });
+    }
+
+    let mapping = match &connection.mapping {
+        Some(mapping) => mapping,
+        None => {
+            // SAFETY: Stable NUL-terminated name and exact FILE_MAP_WRITE access.
+            let raw = unsafe { OpenFileMappingA(FILE_MAP_WRITE, 0, names.data.as_ptr().cast()) };
+            if raw.is_null() {
+                // SAFETY: Read immediately after the failed OpenFileMappingA call.
+                let code = unsafe { GetLastError() };
+                return missing_object_or_error("OpenFileMappingA(UnityCapture_Data)", code);
+            }
+            // SAFETY: Successful OpenFileMappingA returned one owned handle.
+            connection.mapping.insert(unsafe { OwnedHandle::from_raw(raw) })
+        }
+    };
+
+    let view = MappedView::map(mapping.raw(), FILE_MAP_WRITE, "MapViewOfFile(UnityCapture_Data)")?;
+    if view.accessible_len() < DATA_OFFSET || view.ptr_at::<SharedMemHeader>(0).is_none() {
+        return Err(Error::Protocol {
+            backend: CameraType::UnityCapture,
+            detail: "Unity Capture mapping does not contain SharedMemHeader",
+        });
+    }
+    connection.view = Some(view);
+    Ok(true)
 }
 
 pub(super) fn unity_clsid_key(capture_number: u8) -> String {
@@ -269,18 +265,60 @@ pub(super) fn unity_clsid_key(capture_number: u8) -> String {
     format!("CLSID\\{{5C2CD55C-92AD-4999-8666-912BD3E700{suffix:02X}}}")
 }
 
-impl Drop for UnityCaptureBackend {
-    fn drop(&mut self) {
-        let _ = self.close();
-    }
-}
-
 fn missing_object_or_error(operation: &'static str, code: u32) -> Result<bool> {
     if code == ERROR_FILE_NOT_FOUND {
         Ok(false)
     } else {
         trace_warn!(operation, code, "Unity Capture handshake failed");
         Err(Error::Windows { operation, code })
+    }
+}
+
+/// Ownership of the Unity Capture protocol mutex by the current thread.
+///
+/// An abandoned mutex is treated as acquired, like upstream, which ignores the
+/// wait result. Ownership never outlives one sender call.
+pub(super) struct MutexGuard {
+    handle: HANDLE,
+    acquired: bool,
+}
+
+impl MutexGuard {
+    pub(super) fn acquire(handle: HANDLE, operation: &'static str) -> Result<Self> {
+        // SAFETY: `handle` is a live mutex handle with synchronization access.
+        let result = unsafe { WaitForSingleObject(handle, INFINITE) };
+        match result {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self { handle, acquired: true }),
+            WAIT_FAILED => Err(last_error(operation)),
+            _ => Err(Error::Protocol {
+                backend: CameraType::UnityCapture,
+                detail: "infinite mutex wait returned an unexpected status",
+            }),
+        }
+    }
+
+    pub(super) fn release(mut self, operation: &'static str) -> Result<()> {
+        // Mark released only after the system confirms ownership was relinquished.
+        // SAFETY: This guard was constructed only after a successful or abandoned
+        // mutex wait, both of which grant ownership to the current thread.
+        let released = unsafe { ReleaseMutex(self.handle) };
+        if released == 0 {
+            return Err(last_error(operation));
+        }
+        self.acquired = false;
+        Ok(())
+    }
+}
+
+impl Drop for MutexGuard {
+    fn drop(&mut self) {
+        if self.acquired {
+            // SAFETY: A live guard represents mutex ownership on this thread.
+            // Drop is best-effort because it cannot return an error.
+            unsafe {
+                ReleaseMutex(self.handle);
+            }
+        }
     }
 }
 
@@ -353,8 +391,8 @@ mod tests {
 
         assert_eq!(sender.is_ready(), Ok(false));
         assert_eq!(sender.write_frame(FrameSource::Host(&[0; 16])), Ok(WriteStatus::ConsumerInactive));
-        assert!(sender.mutex.is_none());
-        assert!(sender.want_event.is_none());
+        assert!(sender.connection.mutex.is_none());
+        assert!(sender.connection.want_event.is_none());
         sender.close().expect("close inactive sender");
         assert_eq!(sender.is_ready(), Err(Error::AlreadyClosed));
         assert_eq!(sender.write_frame(FrameSource::Host(&[0; 16])), Err(Error::AlreadyClosed));
@@ -372,10 +410,10 @@ mod tests {
 
         let mut sender = UnityCaptureBackend::open(validated(), sender_names).expect("construct sender state");
         assert_eq!(sender.is_ready(), Ok(false));
-        assert!(sender.mutex.is_some());
-        assert!(sender.want_event.is_some());
-        assert!(sender.sent_event.is_none());
-        assert!(sender.mapping.is_none());
+        assert!(sender.connection.mutex.is_some());
+        assert!(sender.connection.want_event.is_some());
+        assert!(sender.connection.sent_event.is_none());
+        assert!(sender.connection.mapping.is_none());
 
         // Prove the sender created the partial-handshake Want object.
         // SAFETY: Stable NUL-terminated name and exact modify access.
