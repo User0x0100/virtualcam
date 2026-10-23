@@ -38,8 +38,13 @@ name = "virtualcam"
 version = "0.1.0"
 dependencies = [
  "tracing",
+ "virtualcam-protocol",
  "windows-sys",
 ]
+
+[[package]]
+name = "virtualcam-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "windows-link"

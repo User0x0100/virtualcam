@@ -1,0 +1,9 @@
+[package]
+name = "virtualcam-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Shared-memory wire protocol, format model, and plane copy helpers shared by virtualcam producers and sources"
+license = "MIT"
+publish = false
+
+[dependencies]

@@ -8,12 +8,16 @@ readme = "README.md"
 keywords = ["virtual-camera", "obs", "unity", "cuda", "windows"]
 categories = ["multimedia::video", "os::windows-apis"]
 
+[workspace]
+members = [".", "crates/virtualcam-protocol"]
+
 [features]
 default = []
 cuda = []
 tracing = ["dep:tracing"]
 
 [dependencies]
+virtualcam-protocol = { path = "crates/virtualcam-protocol" }
 tracing = { version = "0.1.41", optional = true, default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
