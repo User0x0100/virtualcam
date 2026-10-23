@@ -6,6 +6,8 @@
 //! cargo run --example managed_camera -- list [--app com.example.studio]
 //! cargo run --example managed_camera -- stream <ID> [--format yuy2] [--size 1280x720] [--fps 30] [--seconds 30]
 //! cargo run --example managed_camera -- unregister <ID> [--app com.example.studio]
+//! cargo run --example managed_camera -- legacy                  # cameras of the retired C++ driver
+//! cargo run --example managed_camera -- remove-legacy <ID>      # elevated
 //! ```
 //!
 //! DirectShow cameras need `virtualcam_dshow.dll`; pass `--dshow-source <path>`
@@ -122,7 +124,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             stream(&mut camera, args.seconds)?;
         }
-        _ => return Err("usage: managed_camera <register|list|stream|unregister> ...".into()),
+        Some("legacy") => {
+            for camera in ManagedCameraManager::legacy_cameras()? {
+                println!("{}  {:?}  driver={:?}", camera.id, camera.name, camera.driver_path);
+            }
+        }
+        Some("remove-legacy") => {
+            let id: ManagedCameraId = args.positional.get(1).ok_or("remove-legacy needs an id")?.parse().map_err(|_| "invalid id")?;
+            ManagedCameraManager::remove_legacy_camera(id)?;
+        }
+        _ => return Err("usage: managed_camera <register|list|stream|unregister|legacy|remove-legacy> ...".into()),
     }
     Ok(())
 }

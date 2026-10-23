@@ -17,6 +17,8 @@
 use core::fmt;
 use std::path::PathBuf;
 
+#[cfg(windows)]
+pub use legacy::LegacyCamera;
 pub use virtualcam_protocol::CameraId as ManagedCameraId;
 
 use crate::{Error, Result, VideoFormat, VirtualCamera};
@@ -25,6 +27,8 @@ use crate::{Error, Result, VideoFormat, VirtualCamera};
 mod com;
 #[cfg(windows)]
 mod dshow;
+#[cfg(windows)]
+mod legacy;
 #[cfg(windows)]
 pub(crate) mod metadata;
 #[cfg(windows)]
@@ -300,6 +304,23 @@ impl ManagedCameraManager {
         }
     }
 
+    /// Lists cameras registered by the retired C++ DirectShow driver.
+    ///
+    /// They keep working only while their C++ DLL exists. Migrate by
+    /// removing each with [`Self::remove_legacy_camera`] and registering a
+    /// new camera (the CLSID changes).
+    #[cfg(windows)]
+    pub fn legacy_cameras() -> Result<Vec<LegacyCamera>> {
+        legacy::list()
+    }
+
+    /// Removes one legacy C++-driver camera (requires elevation).
+    #[cfg(windows)]
+    pub fn remove_legacy_camera(id: ManagedCameraId) -> Result<()> {
+        let _lock = imp::ManagementLock::acquire()?;
+        legacy::remove(id)
+    }
+
     /// The installed Media Foundation source DLL, if any.
     pub fn media_foundation_source() -> Option<PathBuf> {
         #[cfg(windows)]
@@ -348,10 +369,10 @@ mod imp {
     use crate::platform::windows::{OwnedHandle, random_bytes, wide_nul};
 
     /// Cross-process, cross-session serialization of every mutation.
-    struct ManagementLock(OwnedHandle);
+    pub(super) struct ManagementLock(OwnedHandle);
 
     impl ManagementLock {
-        fn acquire() -> Result<Self> {
+        pub(super) fn acquire() -> Result<Self> {
             let name = wide_nul("Global\\VirtualCamRs-Management");
             // SAFETY: NUL-terminated name, default security, not initially owned.
             let raw = unsafe { CreateMutexW(core::ptr::null(), 0, name.as_ptr()) };
