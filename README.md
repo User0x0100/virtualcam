@@ -9,6 +9,8 @@
 | OBS Virtual Camera | NV12 | tightly packed Y plane, then interleaved UV |
 | Unity Capture | RGBA8, RGBA FP16 gamma, or RGBA FP16 linear | tight or explicitly padded rows |
 
+中文使用说明书 / Chinese user guide: [docs/USER_GUIDE.zh-CN.md](docs/USER_GUIDE.zh-CN.md).
+
 Producers never scale or convert pixels. Sources copy each tightly packed frame straight into the consumer's buffer, honoring its pitch row by row (one `memcpy` when the layouts match); colorimetry is signaled as metadata only.
 
 ## Managed cameras
