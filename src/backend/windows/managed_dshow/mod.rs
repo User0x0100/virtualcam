@@ -1,99 +1,218 @@
-//! Producer side of this crate's managed DirectShow camera.
+//! Producer side of this crate's managed DirectShow camera (transport v2).
 //!
-//! DirectShow's control plane is producer-owned: each session chooses its NV12
-//! mode, reserves the single-writer lease, declares the mode in a fixed control
-//! mapping, and writes a format-specific OBS-compatible frame queue. All objects
-//! live in the session-local `Local\VirtualCamRs-{CLSID}` namespace.
+//! DirectShow's control plane is producer-owned: each session takes the
+//! single-writer lease, creates a fresh seqlock'd ring named by a random
+//! generation, and publishes `{generation, format, pid}` in the fixed control
+//! mapping. All objects live in the session-local namespace (see
+//! `virtualcam_protocol::dshow`).
 
-mod history;
-
-use core::ptr::addr_of_mut;
-
+use virtualcam_protocol::ValidatedFormat;
+use virtualcam_protocol::dshow::{CONTROL_MAGIC, CONTROL_STATE_ACTIVE, CONTROL_STATE_STOPPED, CONTROL_VERSION, DshowControl, DshowNames};
+use virtualcam_protocol::registry::values;
+use virtualcam_protocol::ring::{DEFAULT_SLOT_COUNT, RingLayout, RingWriter};
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_ALL_ACCESS, PAGE_READWRITE};
-use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
+use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcessId};
 
 use super::FrameSource;
-use super::protocol::dshow_control::{CONTROL_STATE_READY, CONTROL_STATE_STARTING, CONTROL_STATE_STOPPING, DshowControlHeader, DshowObjectNames};
-use super::protocol::publication;
-use super::queue_writer::{ExistingQueue, QueueWriter};
-use crate::config::Nv12Format;
-use crate::platform::windows::{MappedView, OwnedHandle, last_error, opened_existing_object};
+use crate::managed::metadata::history_path;
+use crate::platform::registry::{Hive, Key};
+use crate::platform::windows::{MappedView, OwnedHandle, QpcClock, current_process_start_time, opened_existing_object, random_nonzero_u64};
 use crate::{CameraType, Error, ManagedCameraId, Result, WriteStatus};
 
+/// A page-file-backed named mapping plus its whole-mapping view.
+pub(super) struct NamedMapping {
+    // Field order is drop order: unmap before closing the section.
+    view: MappedView,
+    _handle: OwnedHandle,
+}
+
+impl NamedMapping {
+    /// Creates a new mapping; `Ok(None)` if the name already exists.
+    pub(super) fn create_new(name: &[u16], size: usize, operation: &'static str) -> Result<Option<Self>> {
+        Self::create(name, size, operation, false)
+    }
+
+    /// Creates a mapping or opens the existing one.
+    pub(super) fn create_or_open(name: &[u16], size: usize, operation: &'static str) -> Result<Self> {
+        Self::create(name, size, operation, true).map(|mapping| mapping.expect("existing mappings are accepted"))
+    }
+
+    fn create(name: &[u16], size: usize, operation: &'static str, accept_existing: bool) -> Result<Option<Self>> {
+        let size = size as u64;
+        // SAFETY: INVALID_HANDLE_VALUE selects the page file; `name` is
+        // NUL-terminated and the returned handle is owned below.
+        let raw = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, core::ptr::null(), PAGE_READWRITE, (size >> 32) as u32, size as u32, name.as_ptr()) };
+        // SAFETY: A non-null CreateFileMappingW result is one owned handle.
+        let handle = unsafe { OwnedHandle::from_result(raw, operation) }?;
+        if opened_existing_object() && !accept_existing {
+            return Ok(None);
+        }
+        let view = MappedView::map(handle.raw(), FILE_MAP_ALL_ACCESS, operation)?;
+        if view.accessible_len() < size as usize {
+            return Err(Error::Protocol {
+                backend: CameraType::ManagedDirectShow,
+                detail: "shared mapping is smaller than required",
+            });
+        }
+        Ok(Some(Self { view, _handle: handle }))
+    }
+
+    pub(super) fn view(&self) -> &MappedView {
+        &self.view
+    }
+}
+
 pub(crate) struct ManagedDshowBackend {
-    // Field order is drop order: the data queue unmaps before the session
-    // releases the control plane and, last, the producer claim.
-    queue: Option<QueueWriter>,
-    session: Option<ProducerSession>,
+    // Field order is drop order: ring, then control, then the lease last.
+    ring: Option<(RingWriter, NamedMapping)>,
+    control: Option<NamedMapping>,
+    record: DshowControl,
+    _lease: OwnedHandle,
+    clock: QpcClock,
     history_id: Option<ManagedCameraId>,
-    format: Nv12Format,
+    format: ValidatedFormat,
     first_frame_published: bool,
 }
 
 impl ManagedDshowBackend {
-    pub(crate) fn open(id: ManagedCameraId, format: Nv12Format) -> Result<Self> {
-        Self::open_named(&DshowObjectNames::for_camera(id), format, Some(id))
+    pub(crate) fn open(id: ManagedCameraId, format: ValidatedFormat) -> Result<Self> {
+        Self::open_named(&DshowNames::for_camera(id), format, Some(id))
     }
 
     /// `history_id` is `None` only in tests that must not write HKCU history.
-    fn open_named(names: &DshowObjectNames, format: Nv12Format, history_id: Option<ManagedCameraId>) -> Result<Self> {
-        let session = ProducerSession::reserve(names)?;
-        // The producer claim is the single-writer lease, so a retained
-        // same-format data section can be safely reinitialized, and different
-        // formats never share section capacity.
-        let queue = QueueWriter::create(&names.data(format), format, ExistingQueue::Reinitialize, CameraType::ManagedDirectShow)?;
-        session.publish(format)?;
+    pub(super) fn open_named(names: &DshowNames, format: ValidatedFormat, history_id: Option<ManagedCameraId>) -> Result<Self> {
+        let clock = QpcClock::new()?;
+        // Only producers ever open the lease, so its existence is an exact
+        // single-writer claim and consumers can never cause DeviceInUse.
+        // SAFETY: NUL-terminated name, default security.
+        let raw = unsafe { CreateEventW(core::ptr::null(), 1, 0, names.lease.as_ptr()) };
+        // SAFETY: A non-null CreateEventW result is one owned handle.
+        let lease = unsafe { OwnedHandle::from_result(raw, "CreateEventW(managed producer lease)") }?;
+        if opened_existing_object() {
+            return Err(Error::DeviceInUse);
+        }
+
+        let layout = RingLayout::for_format(&format, DEFAULT_SLOT_COUNT).map_err(|_| Error::FrameSizeOverflow)?;
+        // SAFETY: Trivial process query.
+        let pid = unsafe { GetCurrentProcessId() };
+        let (generation, ring) = Self::create_ring(names, &format, layout, pid)?;
+
+        let control = NamedMapping::create_or_open(&names.control, DshowControl::SIZE, "CreateFileMappingW(managed control)")?;
+        let header = control.view().ptr_at::<DshowControl>(0).ok_or(Error::Protocol {
+            backend: CameraType::ManagedDirectShow,
+            detail: "control mapping is not aligned",
+        })?;
+        let record = DshowControl {
+            magic: CONTROL_MAGIC,
+            version: CONTROL_VERSION,
+            state: CONTROL_STATE_ACTIVE,
+            sequence: 0,
+            generation,
+            producer_pid: pid,
+            slot_count: layout.slot_count,
+            producer_start_time: current_process_start_time()?,
+            ring_size: layout.total_size as u64,
+            format: format.format().to_wire()?,
+            reserved: [0; 6],
+        };
+        // SAFETY: The lease makes this the only writer of the aligned control view.
+        unsafe { DshowControl::publish(header.as_ptr(), &record) };
+
         Ok(Self {
-            queue: Some(queue),
-            session: Some(session),
+            ring: Some(ring),
+            control: Some(control),
+            record,
+            _lease: lease,
+            clock,
             history_id,
             format,
             first_frame_published: false,
         })
     }
 
+    fn create_ring(names: &DshowNames, format: &ValidatedFormat, layout: RingLayout, pid: u32) -> Result<(u64, (RingWriter, NamedMapping))> {
+        // A pre-existing object at a fresh random name is a collision or a
+        // squatter; never reuse it, pick another generation.
+        for _ in 0..4 {
+            let generation = random_nonzero_u64()?;
+            let Some(mapping) = NamedMapping::create_new(&names.ring(generation), layout.total_size, "CreateFileMappingW(managed ring)")? else {
+                continue;
+            };
+            // SAFETY: The freshly created view is exclusively ours and stays
+            // mapped as long as the writer (they are stored together).
+            let writer = unsafe { RingWriter::initialize(mapping.view().as_ptr(), mapping.view().accessible_len(), format, layout.slot_count, generation, pid) }.map_err(|_| Error::Protocol {
+                backend: CameraType::ManagedDirectShow,
+                detail: "could not initialize the frame ring",
+            })?;
+            return Ok((generation, (writer, mapping)));
+        }
+        Err(Error::Protocol {
+            backend: CameraType::ManagedDirectShow,
+            detail: "could not create a unique frame ring",
+        })
+    }
+
     pub(crate) fn is_ready(&mut self) -> Result<bool> {
-        // Like OBS there is no consumer-presence handshake; a live session is
-        // ready, and the DirectShow source emits black until frames arrive.
-        self.queue.as_ref().map(|_| true).ok_or(Error::AlreadyClosed)
+        // No consumer-presence handshake: an idle consumer shows black and a
+        // connecting one picks up the live format, so a session is ready.
+        self.ring.as_ref().map(|_| true).ok_or(Error::AlreadyClosed)
     }
 
     pub(super) fn write_frame(&mut self, frame: FrameSource<'_>) -> Result<WriteStatus> {
-        self.queue.as_mut().ok_or(Error::AlreadyClosed)?.write(frame)?;
+        let (writer, _) = self.ring.as_mut().ok_or(Error::AlreadyClosed)?;
+        if frame.byte_len() != writer.frame_size() {
+            return Err(Error::FrameSizeMismatch {
+                expected: writer.frame_size(),
+                actual: frame.byte_len(),
+            });
+        }
+        let payload = writer.begin_frame();
+        if let Err(error) = frame.copy_to(payload) {
+            writer.abort_frame();
+            return Err(error);
+        }
+        writer.commit_frame(self.clock.now_100ns()?);
         if !self.first_frame_published {
             self.first_frame_published = true;
-            if let Some(session) = &self.session {
-                session.set_state(CONTROL_STATE_READY);
-            }
             self.record_history();
         }
         Ok(WriteStatus::Written)
     }
 
-    /// Once per session, after the first successful frame, remember this mode
-    /// so an idle consumer opened later advertises it.
+    /// Once per session, after the first frame, remember this format so an
+    /// idle consumer opened later advertises it.
     fn record_history(&self) {
-        if let Some(id) = self.history_id
-            && let Err(error) = history::persist(id, self.format)
-        {
-            trace_warn!(error, %id, "could not persist managed camera's last successful output format");
+        let Some(id) = self.history_id else { return };
+        let result = self
+            .format
+            .format()
+            .to_wire()
+            .map_err(Error::from)
+            .and_then(|wire| Key::create(Hive::CurrentUser, &history_path(id))?.set_binary(values::LAST_FORMAT, &wire.to_bytes()));
+        if let Err(error) = result {
+            trace_warn!(%error, %id, "could not persist managed camera's last format");
             #[cfg(not(feature = "tracing"))]
             let _ = error;
         }
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {
-        // Publish data and control STOPPING before releasing any transport
-        // handle; the producer claim is released last.
-        if let Some(queue) = self.queue.as_mut() {
-            queue.stop();
+        if let Some((writer, _)) = self.ring.as_mut() {
+            writer.stop();
         }
-        if let Some(session) = self.session.as_mut() {
-            session.stop();
+        if let Some(control) = &self.control
+            && let Some(header) = control.view().ptr_at::<DshowControl>(0)
+        {
+            let stopped = DshowControl {
+                state: CONTROL_STATE_STOPPED,
+                ..self.record
+            };
+            // SAFETY: Still the lease holder; aligned control view.
+            unsafe { DshowControl::publish(header.as_ptr(), &stopped) };
         }
-        self.queue = None;
-        self.session = None;
+        self.ring = None;
+        self.control = None;
         Ok(())
     }
 }
@@ -104,226 +223,123 @@ impl Drop for ManagedDshowBackend {
     }
 }
 
-/// The producer-owned lease, Ready event, and fixed control mapping of one session.
-struct ProducerSession {
-    // Field order is drop order; the claim must be released last.
-    control: MappedView,
-    _control_mapping: OwnedHandle,
-    ready: OwnedHandle,
-    claim: OwnedHandle,
-    stopped: bool,
-}
-
-impl ProducerSession {
-    /// Reserves the camera for this producer and invalidates stale control data.
-    fn reserve(names: &DshowObjectNames) -> Result<Self> {
-        // Only producers open this named object, so its lifetime is an exact
-        // single-writer lease. It remains unsignaled until the complete
-        // session has been published.
-        // SAFETY: Stable NUL-terminated name; null security attributes.
-        let raw = unsafe { CreateEventW(core::ptr::null(), 1, 0, names.producer.as_ptr()) };
-        // SAFETY: A non-null CreateEventW result is one owned handle.
-        let claim = unsafe { OwnedHandle::from_result(raw, "CreateEventW(managed producer claim)") }?;
-        if opened_existing_object() {
-            return Err(Error::DeviceInUse);
-        }
-
-        // Ready is a reusable notification object, not an ownership token. A
-        // DirectShow consumer may retain it across producer sessions.
-        // SAFETY: Stable NUL-terminated name; null security attributes.
-        let raw = unsafe { CreateEventW(core::ptr::null(), 1, 0, names.ready.as_ptr()) };
-        // SAFETY: A non-null CreateEventW result is one owned handle.
-        let ready = unsafe { OwnedHandle::from_result(raw, "CreateEventW(managed runtime ready)") }?;
-        // Clear a stale signaled state before invalidating/publishing the new
-        // control header. The producer claim is still unsignaled.
-        // SAFETY: `ready` is a live manual-reset event with modify-state access.
-        if unsafe { ResetEvent(ready.raw()) } == 0 {
-            return Err(last_error("ResetEvent(managed runtime ready)"));
-        }
-
-        const CONTROL_SIZE: u32 = core::mem::size_of::<DshowControlHeader>() as u32;
-        // SAFETY: Page-file-backed fixed-size control mapping with a stable name.
-        let raw = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, core::ptr::null(), PAGE_READWRITE, 0, CONTROL_SIZE, names.control.as_ptr()) };
-        // SAFETY: A non-null CreateFileMappingW result is one owned handle.
-        let control_mapping = unsafe { OwnedHandle::from_result(raw, "CreateFileMappingW(managed control)") }?;
-        let control = MappedView::map(control_mapping.raw(), FILE_MAP_ALL_ACCESS, "MapViewOfFile(managed control)")?;
-        let header = control.ptr_at::<DshowControlHeader>(0).ok_or(Error::Protocol {
-            backend: CameraType::ManagedDirectShow,
-            detail: "managed control mapping does not provide an aligned control header",
-        })?;
-        // Invalidate stale session metadata immediately. No consumer treats the
-        // new session as live until Ready and the producer claim are signaled.
-        // SAFETY: `header` is aligned writable storage inside the mapped view.
-        unsafe {
-            publication::publish_u32(addr_of_mut!((*header.as_ptr()).state), 0);
-            core::ptr::write_bytes(header.as_ptr(), 0, 1);
-        }
-
-        Ok(Self {
-            control,
-            _control_mapping: control_mapping,
-            ready,
-            claim,
-            stopped: false,
-        })
-    }
-
-    /// Declares `format`, then signals Ready and finally the producer claim.
-    ///
-    /// Called only after the data queue and all other fallible state exist, so
-    /// a signaled claim always describes a complete session.
-    fn publish(&self, format: Nv12Format) -> Result<()> {
-        let header = self.header();
-        let declaration = DshowControlHeader {
-            state: 0,
-            ..DshowControlHeader::starting(format)
-        };
-        // SAFETY: `reserve` validated this aligned writable header.
-        unsafe {
-            core::ptr::copy_nonoverlapping(&raw const declaration, header, 1);
-            publication::publish_u32(addr_of_mut!((*header).state), CONTROL_STATE_STARTING);
-        }
-        // SAFETY: Both are live manual-reset events owned by this session.
-        if unsafe { SetEvent(self.ready.raw()) } == 0 {
-            return Err(last_error("SetEvent(managed runtime ready)"));
-        }
-        // Existence reserves ownership; signaling the claim is the final commit
-        // point that tells native consumers the session is complete.
-        // SAFETY: As above.
-        if unsafe { SetEvent(self.claim.raw()) } == 0 {
-            return Err(last_error("SetEvent(managed producer claim)"));
-        }
-        Ok(())
-    }
-
-    fn set_state(&self, state: u32) {
-        // SAFETY: The control view stays mapped for this session's lifetime.
-        unsafe { publication::publish_u32(addr_of_mut!((*self.header()).state), state) };
-    }
-
-    fn stop(&mut self) {
-        if !self.stopped {
-            self.stopped = true;
-            self.set_state(CONTROL_STATE_STOPPING);
-        }
-    }
-
-    fn header(&self) -> *mut DshowControlHeader {
-        self.control.as_ptr().cast()
-    }
-}
-
-impl Drop for ProducerSession {
-    fn drop(&mut self) {
-        self.stop();
-    }
+/// Decodes the last format a producer published for `id` (DirectShow idle mode).
+#[cfg(test)]
+pub(crate) fn last_format(id: ManagedCameraId) -> Option<virtualcam_protocol::VideoFormat> {
+    use virtualcam_protocol::WireVideoFormat;
+    let key = Key::open(Hive::CurrentUser, &history_path(id)).ok()??;
+    let bytes = key.get_binary(values::LAST_FORMAT).ok()??;
+    WireVideoFormat::from_bytes(&bytes).and_then(WireVideoFormat::decode).ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use core::ptr::addr_of;
-
-    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use virtualcam_protocol::dshow::CONTROL_STATE_STOPPED;
+    use virtualcam_protocol::ring::{RING_STATE_ACTIVE, RING_STATE_STOPPED, ReadOutcome, RingReader};
+    use virtualcam_protocol::{FrameRate, PixelFormat, VideoFormat};
     use windows_sys::Win32::System::Memory::{FILE_MAP_READ, OpenFileMappingW};
-    use windows_sys::Win32::System::Threading::{OpenEventW, WaitForSingleObject};
 
-    use super::super::protocol::dshow_control::{CONTROL_MAGIC, CONTROL_VERSION};
-    use super::super::protocol::frame_queue::{STATE_READY, STATE_STOPPING};
-    use super::super::queue_writer::tests::{QueueObserver, nv12};
     use super::*;
 
-    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
-
-    fn names(suffix: &str) -> DshowObjectNames {
-        DshowObjectNames::with_base(format!("Local\\VirtualCamRustManaged_{}_{suffix}", std::process::id()))
+    fn names(suffix: &str) -> DshowNames {
+        DshowNames::with_base(format!("Local\\VirtualCamRustManaged2_{}_{suffix}", std::process::id()))
     }
 
-    fn open_event(name: &[u16]) -> OwnedHandle {
-        // SAFETY: Stable NUL-terminated test-only kernel object name.
-        let raw = unsafe { OpenEventW(SYNCHRONIZE_ACCESS, 0, name.as_ptr()) };
-        // SAFETY: A non-null OpenEventW result is one owned handle.
-        unsafe { OwnedHandle::from_result(raw, "OpenEventW(test)") }.expect("event exists")
+    fn format(pixel_format: PixelFormat, width: u32, height: u32) -> ValidatedFormat {
+        VideoFormat::new(pixel_format, width, height, FrameRate::fps(30)).validate().expect("valid")
     }
 
-    fn signaled(event: &OwnedHandle) -> bool {
-        // SAFETY: `event` is a live SYNCHRONIZE handle.
-        unsafe { WaitForSingleObject(event.raw(), 0) == WAIT_OBJECT_0 }
-    }
-
-    fn control(names: &DshowObjectNames) -> (MappedView, OwnedHandle) {
-        // SAFETY: Stable NUL-terminated test-only mapping name.
-        let raw = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, names.control.as_ptr()) };
+    fn open_view(name: &[u16]) -> (MappedView, OwnedHandle) {
+        // SAFETY: NUL-terminated test name; the result is owned below.
+        let raw = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr()) };
         // SAFETY: A non-null OpenFileMappingW result is one owned handle.
-        let mapping = unsafe { OwnedHandle::from_result(raw, "OpenFileMappingW(test control)") }.expect("control exists");
-        (MappedView::map(mapping.raw(), FILE_MAP_READ, "MapViewOfFile(test control)").expect("map control"), mapping)
+        let handle = unsafe { OwnedHandle::from_result(raw, "OpenFileMappingW(test)") }.expect("mapping exists");
+        (MappedView::map(handle.raw(), FILE_MAP_READ, "MapViewOfFile(test)").expect("map"), handle)
     }
 
-    fn control_header(view: &MappedView) -> DshowControlHeader {
-        let header = view.as_ptr().cast::<DshowControlHeader>();
-        // SAFETY: The view maps a live aligned control header.
-        unsafe {
-            let state = publication::observe_u32(addr_of!((*header).state));
-            DshowControlHeader { state, ..header.read() }
-        }
+    fn control(view: &MappedView) -> DshowControl {
+        // SAFETY: The view maps a live control record.
+        unsafe { DshowControl::snapshot(view.as_ptr().cast()) }.expect("consistent control")
     }
 
     #[test]
-    fn producer_claim_reserves_writer_before_mapping_exists() {
-        let names = names("reservation");
-        // SAFETY: unique NUL-terminated test name; the returned handle is owned.
-        let raw = unsafe { CreateEventW(core::ptr::null(), 1, 0, names.producer.as_ptr()) };
-        // SAFETY: A non-null CreateEventW result is one owned handle.
-        let _claim = unsafe { OwnedHandle::from_result(raw, "CreateEventW(test claim)") }.expect("create claim");
-
-        assert!(matches!(ManagedDshowBackend::open_named(&names, nv12(64, 64), None), Err(Error::DeviceInUse)));
+    fn lease_rejects_a_second_producer_until_close() {
+        let names = names("lease");
+        let mut first = ManagedDshowBackend::open_named(&names, format(PixelFormat::Nv12, 64, 64), None).expect("first producer");
+        assert!(matches!(ManagedDshowBackend::open_named(&names, format(PixelFormat::Nv12, 64, 64), None), Err(Error::DeviceInUse)));
+        first.close().expect("close");
+        drop(first);
+        ManagedDshowBackend::open_named(&names, format(PixelFormat::Yuy2, 64, 64), None).expect("reopen after close");
     }
 
     #[test]
-    fn session_publishes_control_then_ready_then_claim_and_stops_on_close() {
+    fn session_publishes_control_and_ring_then_stops() {
         let names = names("lifecycle");
-        let format = nv12(4, 2);
-        let mut producer = ManagedDshowBackend::open_named(&names, format, None).expect("open managed producer");
-        let claim = open_event(&names.producer);
-        let ready = open_event(&names.ready);
-        assert!(signaled(&claim) && signaled(&ready));
+        let mut producer = ManagedDshowBackend::open_named(&names, format(PixelFormat::Uyvy, 4, 2), None).expect("open");
+        let (control_view, _control) = open_view(&names.control);
+        let record = control(&control_view);
+        assert_eq!(record.state, CONTROL_STATE_ACTIVE);
+        assert_eq!(record.format.decode().expect("format"), format(PixelFormat::Uyvy, 4, 2).format());
+        assert_eq!(record.producer_start_time, current_process_start_time().expect("start time"));
 
-        let (view, _mapping) = control(&names);
-        let declared = control_header(&view);
-        assert_eq!((declared.magic, declared.version, declared.state), (CONTROL_MAGIC, CONTROL_VERSION, CONTROL_STATE_STARTING));
-        assert_eq!((declared.width, declared.height, declared.interval_100ns), (4, 2, 333_333));
+        let (ring_view, _ring) = open_view(&names.ring(record.generation));
+        // SAFETY: The view stays mapped for the reader's lifetime.
+        let reader = unsafe { RingReader::open(ring_view.as_ptr(), ring_view.accessible_len()) }.expect("ring");
+        assert_eq!(reader.generation(), record.generation);
 
-        let data = QueueObserver::open(&names.data(format));
-        assert_eq!(producer.is_ready(), Ok(true));
-        assert_eq!(producer.write_frame(FrameSource::Host(&[16; 12])), Ok(WriteStatus::Written));
-        assert_eq!(control_header(&view).state, CONTROL_STATE_READY);
-        assert_eq!((data.read_idx(), data.state()), (1, STATE_READY));
+        let frame: Vec<u8> = (0..16).collect();
+        assert_eq!(producer.write_frame(FrameSource::Host(&frame)), Ok(WriteStatus::Written));
+        assert_eq!(reader.state(), RING_STATE_ACTIVE);
+        let mut out = [0_u8; 16];
+        let outcome = reader.read_latest(|src| {
+            // SAFETY: 16-byte payload.
+            unsafe { core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), 16) }
+        });
+        assert!(matches!(outcome, ReadOutcome::Frame { sequence: 1, .. }));
+        assert_eq!(out.as_slice(), frame.as_slice());
+        assert!(matches!(producer.write_frame(FrameSource::Host(&frame[..8])), Err(Error::FrameSizeMismatch { .. })));
 
-        producer.close().expect("close managed producer");
-        producer.close().expect("close is idempotent");
-        assert_eq!(producer.write_frame(FrameSource::Host(&[16; 12])), Err(Error::AlreadyClosed));
-        assert_eq!(control_header(&view).state, CONTROL_STATE_STOPPING);
-        assert_eq!(data.state(), STATE_STOPPING);
+        producer.close().expect("close");
+        producer.close().expect("idempotent");
+        assert_eq!(control(&control_view).state, CONTROL_STATE_STOPPED);
+        assert_eq!(reader.state(), RING_STATE_STOPPED);
+        assert_eq!(producer.write_frame(FrameSource::Host(&frame)), Err(Error::AlreadyClosed));
     }
 
     #[test]
-    fn reopen_allows_consumer_held_objects_and_larger_next_format() {
-        let names = names("consumer_holds_objects");
-        let first_format = nv12(64, 64);
-        let mut first = ManagedDshowBackend::open_named(&names, first_format, None).expect("first managed producer opens");
+    fn each_session_gets_a_fresh_ring_beside_retained_old_ones() {
+        let names = names("generations");
+        let mut first = ManagedDshowBackend::open_named(&names, format(PixelFormat::Nv12, 64, 64), None).expect("first");
+        let (control_view, _control) = open_view(&names.control);
+        let old_generation = control(&control_view).generation;
+        // A consumer keeps the old ring mapped across the producer restart.
+        let _held = open_view(&names.ring(old_generation));
+        first.close().expect("close");
+        drop(first);
 
-        // Model a DirectShow consumer that retains the old transport objects.
-        // The next producer must not be constrained by this old data section's
-        // capacity because data mappings are format-specific in managed ABI v3.
-        let held_ready = open_event(&names.ready);
-        let _held_control = control(&names);
-        let _held_old_data = QueueObserver::open(&names.data(first_format));
+        let _second = ManagedDshowBackend::open_named(&names, format(PixelFormat::P010, 1920, 1080), None).expect("larger format");
+        let record = control(&control_view);
+        assert_ne!(record.generation, old_generation);
+        assert_eq!(record.format.decode().expect("format").pixel_format, PixelFormat::P010);
+    }
 
-        assert!(matches!(ManagedDshowBackend::open_named(&names, first_format, None), Err(Error::DeviceInUse)));
+    #[test]
+    fn first_frame_records_per_user_history() {
+        let id = ManagedCameraId::from_u128(0x5EED0000_0000_4000_8000_000000000000 | u128::from(std::process::id()));
+        let _cleanup = HistoryCleanup(id);
+        let names = names("history");
+        let format = format(PixelFormat::Bgra32, 2, 2);
+        let mut producer = ManagedDshowBackend::open_named(&names, format, Some(id)).expect("open");
+        assert_eq!(last_format(id), None);
+        producer.write_frame(FrameSource::Host(&[0; 16])).expect("write");
+        assert_eq!(last_format(id), Some(format.format()));
+    }
 
-        first.close().expect("first managed producer closes");
-        let mut second = ManagedDshowBackend::open_named(&names, nv12(1920, 1080), None).expect("larger producer opens beside retained old data section");
-        // The reopened producer reset and then re-signaled the reusable Ready event.
-        assert!(signaled(&held_ready));
-        second.close().expect("second managed producer closes");
+    struct HistoryCleanup(ManagedCameraId);
+
+    impl Drop for HistoryCleanup {
+        fn drop(&mut self) {
+            let _ = Key::delete_tree(Hive::CurrentUser, &history_path(self.0));
+        }
     }
 }

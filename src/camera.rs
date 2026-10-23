@@ -5,11 +5,11 @@ use core::marker::PhantomData;
 use crate::ManagedCameraId;
 #[cfg(windows)]
 use crate::backend::Backend;
-#[cfg(windows)]
-use crate::config::Nv12Format;
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaStream;
-use crate::{CameraType, Error, ObsOptions, PixelFormat, Result, UnityCaptureOptions, WriteStatus};
+use crate::{CameraType, Error, ObsOptions, PixelFormat, Result, UnityCaptureOptions, VideoFormat, WriteStatus};
+#[cfg(windows)]
+use virtualcam_protocol::ValidatedFormat;
 
 /// Unified producer facade for a selected virtual-camera backend.
 ///
@@ -20,6 +20,7 @@ use crate::{CameraType, Error, ObsOptions, PixelFormat, Result, UnityCaptureOpti
 pub struct VirtualCamera {
     camera_type: CameraType,
     native_format: PixelFormat,
+    video_format: Option<VideoFormat>,
     frame_size: usize,
     closed: bool,
     #[cfg(windows)]
@@ -54,6 +55,7 @@ impl VirtualCamera {
             Ok(Self {
                 camera_type: CameraType::Obs,
                 native_format: PixelFormat::Nv12,
+                video_format: Some(VideoFormat::new(PixelFormat::Nv12, validated.format.width, validated.format.height, options.frame_rate)),
                 frame_size: validated.format.frame_size,
                 closed: false,
                 backend,
@@ -65,24 +67,25 @@ impl VirtualCamera {
     /// Opens one managed DirectShow producer session; reached through
     /// [`crate::ManagedCameraManager::open`] after registration checks.
     #[cfg(windows)]
-    pub(crate) fn open_managed_dshow(id: ManagedCameraId, format: Nv12Format) -> Result<Self> {
+    pub(crate) fn open_managed_dshow(id: ManagedCameraId, format: ValidatedFormat) -> Result<Self> {
         let backend = Backend::open_managed_dshow(id, format)?;
-        trace_debug!(
-            camera_type = ?CameraType::ManagedDirectShow,
-            camera_id = %id,
-            width = format.width,
-            height = format.height,
-            interval_100ns = format.interval_100ns,
-            "managed virtual camera opened"
-        );
-        Ok(Self {
-            camera_type: CameraType::ManagedDirectShow,
-            native_format: PixelFormat::Nv12,
-            frame_size: format.frame_size,
+        Ok(Self::managed(CameraType::ManagedDirectShow, id, format, backend))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn managed(camera_type: CameraType, id: ManagedCameraId, format: ValidatedFormat, backend: Backend) -> Self {
+        trace_debug!(camera_type = ?camera_type, camera_id = %id, format = %format.format(), "managed virtual camera opened");
+        #[cfg(not(feature = "tracing"))]
+        let _ = id;
+        Self {
+            camera_type,
+            native_format: format.format().pixel_format,
+            video_format: Some(format.format()),
+            frame_size: format.frame_size(),
             closed: false,
             backend,
             not_sync: PhantomData,
-        })
+        }
     }
 
     /// Opens a Unity Capture producer with Unity-specific protocol controls.
@@ -112,6 +115,7 @@ impl VirtualCamera {
             Ok(Self {
                 camera_type: CameraType::UnityCapture,
                 native_format: validated.format.pixel_format(),
+                video_format: None,
                 frame_size: validated.frame_size,
                 closed: false,
                 backend,
@@ -128,6 +132,12 @@ impl VirtualCamera {
     /// Returns the native format required by this backend.
     pub const fn native_format(&self) -> PixelFormat {
         self.native_format
+    }
+
+    /// Returns the complete stream format for NV12/managed backends, or `None`
+    /// for Unity Capture (whose RGBA formats carry no frame rate or colorimetry).
+    pub const fn video_format(&self) -> Option<VideoFormat> {
+        self.video_format
     }
 
     /// Returns the exact number of bytes required for each frame.

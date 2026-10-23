@@ -459,6 +459,7 @@ fn fill_pattern(format: PixelFormat, frame: &mut [u8], width: u32, height: u32, 
         PixelFormat::Rgba16FloatGamma => fill_rgba16(frame, width, height, state, false),
         PixelFormat::Rgba16FloatLinear => fill_rgba16(frame, width, height, state, true),
         PixelFormat::Nv12 => fill_nv12(frame, width, height, state),
+        other => unreachable!("OBS and Unity Capture never select {other:?}"),
     }
 }
 

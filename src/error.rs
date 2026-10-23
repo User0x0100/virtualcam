@@ -22,6 +22,22 @@ pub enum Error {
     InvalidCameraName,
     /// A managed camera CLSID string is malformed.
     InvalidCameraId,
+    /// A managed camera application id is empty, too long, or uses
+    /// characters outside `A-Z a-z 0-9 . _ -`.
+    InvalidAppId,
+    /// The pixel format cannot be carried by the selected backend.
+    UnsupportedFormat,
+    /// A Media Foundation producer format differs from the camera's immutable native mode.
+    FormatMismatch,
+    /// No managed camera with this id is visible to the manager (or to its application scope).
+    CameraNotFound,
+    /// Another managed camera of the same backend and scope already uses this name.
+    NameConflict,
+    /// A managed camera registration is incomplete or points at a missing source.
+    RegistrationDegraded {
+        /// Static description of the broken part.
+        detail: &'static str,
+    },
     /// A frame or shared-memory layout size overflowed its target integer type.
     FrameSizeOverflow,
     /// A host or CUDA frame length did not match the configured contiguous layout.
@@ -44,11 +60,6 @@ pub enum Error {
     ConsumerInactive,
     /// An operation other than idempotent `close` was attempted after closure.
     AlreadyClosed,
-    /// The loaded native managed-camera DLL is missing an expected ABI export.
-    ManagedDriverAbi {
-        /// Missing symbol or incompatible ABI field.
-        symbol: &'static str,
-    },
     /// A native COM/DirectShow operation returned a failing HRESULT.
     Hresult {
         /// Native operation that failed.
@@ -90,6 +101,12 @@ impl fmt::Display for Error {
             Self::InvalidFrameRate => formatter.write_str("invalid frame rate"),
             Self::InvalidCameraName => formatter.write_str("invalid managed camera name"),
             Self::InvalidCameraId => formatter.write_str("invalid managed camera CLSID"),
+            Self::InvalidAppId => formatter.write_str("invalid managed camera application id"),
+            Self::UnsupportedFormat => formatter.write_str("pixel format is not supported by this backend"),
+            Self::FormatMismatch => formatter.write_str("format differs from the camera's native mode"),
+            Self::CameraNotFound => formatter.write_str("managed camera not found"),
+            Self::NameConflict => formatter.write_str("another managed camera already uses this name"),
+            Self::RegistrationDegraded { detail } => write!(formatter, "managed camera registration is degraded: {detail}"),
             Self::FrameSizeOverflow => formatter.write_str("frame or shared-memory size overflow"),
             Self::FrameSizeMismatch { expected, actual } => {
                 write!(formatter, "frame size mismatch: expected {expected} bytes, got {actual}")
@@ -98,7 +115,6 @@ impl fmt::Display for Error {
             Self::ExistingMappingTooSmall { required, available } => write!(formatter, "existing mapping is too small: requires {required} accessible bytes, has {available}"),
             Self::ConsumerInactive => formatter.write_str("virtual camera consumer is inactive"),
             Self::AlreadyClosed => formatter.write_str("virtual camera is already closed"),
-            Self::ManagedDriverAbi { symbol } => write!(formatter, "managed virtual-camera driver ABI is missing or incompatible at {symbol}"),
             Self::Hresult { operation, code } => write!(formatter, "native operation {operation} failed with HRESULT 0x{:08X}", *code as u32),
             Self::Windows { operation, code } => {
                 write!(formatter, "Win32 operation {operation} failed with code {code}")
@@ -114,3 +130,21 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<virtualcam_protocol::FormatError> for Error {
+    fn from(error: virtualcam_protocol::FormatError) -> Self {
+        use virtualcam_protocol::FormatError as F;
+        match error {
+            F::UnsupportedPixelFormat | F::InvalidWireFormat => Self::UnsupportedFormat,
+            F::InvalidDimensions => Self::InvalidDimensions,
+            F::InvalidFrameRate => Self::InvalidFrameRate,
+            F::FrameSizeOverflow => Self::FrameSizeOverflow,
+        }
+    }
+}
+
+impl From<virtualcam_protocol::ParseIdError> for Error {
+    fn from(_: virtualcam_protocol::ParseIdError) -> Self {
+        Self::InvalidCameraId
+    }
+}

@@ -156,6 +156,48 @@ impl Drop for MappedView {
     }
 }
 
+/// Fills `N` bytes from the system-preferred cryptographic RNG.
+pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N]> {
+    use windows_sys::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
+
+    let mut bytes = [0_u8; N];
+    let length = u32::try_from(N).map_err(|_| Error::FrameSizeOverflow)?;
+    // SAFETY: `bytes` is writable for `length` bytes; a null algorithm handle
+    // is valid with BCRYPT_USE_SYSTEM_PREFERRED_RNG.
+    let status = unsafe { BCryptGenRandom(core::ptr::null_mut(), bytes.as_mut_ptr(), length, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    if status < 0 {
+        return Err(Error::Hresult {
+            operation: "BCryptGenRandom",
+            code: status,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Returns a random non-zero `u64`.
+pub(crate) fn random_nonzero_u64() -> Result<u64> {
+    loop {
+        let value = u64::from_le_bytes(random_bytes()?);
+        if value != 0 {
+            return Ok(value);
+        }
+    }
+}
+
+/// Creation time of the current process as a `FILETIME` packed into `u64`.
+pub(crate) fn current_process_start_time() -> Result<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut times = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: The pseudo-handle is always valid; all outputs are writable.
+    if unsafe { GetProcessTimes(GetCurrentProcess(), creation, exit, kernel, user) } == 0 {
+        return Err(last_error("GetProcessTimes"));
+    }
+    Ok(u64::from(times[0].dwHighDateTime) << 32 | u64::from(times[0].dwLowDateTime))
+}
+
 /// QueryPerformanceCounter clock reporting nanoseconds, matching OBS's
 /// `os_gettime_ns` frame timestamps.
 #[derive(Debug, Clone, Copy)]
@@ -178,6 +220,16 @@ impl QpcClock {
                 code: ERROR_INVALID_DATA,
             }),
         }
+    }
+
+    /// Current time in 100 ns units (the Windows media clock unit).
+    pub(crate) fn now_100ns(self) -> Result<u64> {
+        let mut counter = 0_i64;
+        // SAFETY: `counter` is writable storage for the API's LARGE_INTEGER.
+        if unsafe { QueryPerformanceCounter(&raw mut counter) } == 0 {
+            return Err(last_error("QueryPerformanceCounter"));
+        }
+        Ok(mul_div_u64(u64::try_from(counter).unwrap_or(0), 10_000_000, self.frequency))
     }
 
     pub(crate) fn now_ns(self) -> Result<u64> {

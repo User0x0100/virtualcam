@@ -1,6 +1,6 @@
 #[cfg(windows)]
 use virtualcam::CameraType;
-use virtualcam::{Error, ObsFrameRate, ObsOptions, PixelFormat, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode, VirtualCamera};
+use virtualcam::{AppId, ColorSpace, Error, FormatError, FrameRate, ObsFrameRate, ObsOptions, PixelFormat, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode, VideoFormat, VirtualCamera};
 
 #[test]
 fn pixel_format_validates_dimensions_and_checked_sizes() {
@@ -8,13 +8,27 @@ fn pixel_format_validates_dimensions_and_checked_sizes() {
     assert_eq!(PixelFormat::Rgba8.frame_size(1920, 1080), Ok(8_294_400));
 
     for format in [PixelFormat::Nv12, PixelFormat::Rgba8, PixelFormat::Rgba16FloatGamma, PixelFormat::Rgba16FloatLinear] {
-        assert_eq!(format.frame_size(0, 2), Err(Error::InvalidDimensions));
-        assert_eq!(format.frame_size(2, 0), Err(Error::InvalidDimensions));
+        assert_eq!(format.frame_size(0, 2), Err(FormatError::InvalidDimensions));
+        assert_eq!(format.frame_size(2, 0), Err(FormatError::InvalidDimensions));
     }
-    assert_eq!(PixelFormat::Nv12.frame_size(3, 2), Err(Error::InvalidDimensions));
-    assert_eq!(PixelFormat::Nv12.frame_size(2, 3), Err(Error::InvalidDimensions));
-    assert_eq!(PixelFormat::Rgba8.frame_size(u32::MAX, u32::MAX), Err(Error::FrameSizeOverflow));
+    assert_eq!(PixelFormat::Nv12.frame_size(3, 2), Err(FormatError::InvalidDimensions));
+    assert_eq!(PixelFormat::Nv12.frame_size(2, 3), Err(FormatError::InvalidDimensions));
+    assert_eq!(PixelFormat::Rgba8.frame_size(u32::MAX, u32::MAX), Err(FormatError::FrameSizeOverflow));
     assert_eq!(PixelFormat::Rgba16FloatLinear.frame_size(2, 3), Ok(48));
+    assert_eq!(Error::from(FormatError::InvalidDimensions), Error::InvalidDimensions);
+}
+
+#[test]
+fn managed_formats_cover_common_yuv_and_rgb_encodings() {
+    for format in PixelFormat::MANAGED {
+        let video = VideoFormat::new(format, 1280, 720, FrameRate::fps(60));
+        assert!(video.validate().is_ok(), "{format:?}");
+    }
+    let hdr = VideoFormat::new(PixelFormat::P010, 3840, 2160, FrameRate { numerator: 60_000, denominator: 1001 }).with_color(ColorSpace::BT2100_PQ);
+    assert_eq!(hdr.validate().map(|v| v.frame_size()), Ok(3840 * 2160 * 3));
+    assert_eq!(VideoFormat::new(PixelFormat::Rgba8, 2, 2, FrameRate::fps(30)).validate().map(|_| ()), Err(FormatError::UnsupportedPixelFormat));
+    assert_eq!(AppId::new("com.example.app").map(|id| id.to_string()), Ok("com.example.app".into()));
+    assert_eq!("bad id".parse::<AppId>(), Err(Error::InvalidAppId));
 }
 
 #[test]

@@ -1,6 +1,6 @@
-use crate::PixelFormat;
 #[cfg(windows)]
 use crate::{Error, Result};
+use crate::{FrameRate, PixelFormat};
 
 /// Selects the virtual-camera protocol used by a camera instance.
 ///
@@ -11,29 +11,14 @@ use crate::{Error, Result};
 pub enum CameraType {
     /// OBS Studio's Windows virtual-camera shared queue.
     Obs,
-    /// This crate's independently registered NV12 DirectShow camera, whose
+    /// This crate's independently registered DirectShow camera, whose
     /// producer chooses the runtime format of each session.
     ManagedDirectShow,
+    /// This crate's independently registered Media Foundation camera, whose
+    /// immutable native mode is fixed at registration.
+    ManagedMediaFoundation,
     /// The Unity Capture `SharedImageMemory` protocol.
     UnityCapture,
-}
-
-/// OBS's rational frame-rate representation.
-///
-/// The upstream producer computes its 100-nanosecond interval as
-/// `denominator * 10_000_000 / numerator`, using integer truncation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameRate {
-    /// Frames in one rate period; must be non-zero.
-    pub numerator: u32,
-    /// Seconds represented by one rate period; must be non-zero.
-    pub denominator: u32,
-}
-
-impl Default for FrameRate {
-    fn default() -> Self {
-        Self { numerator: 30, denominator: 1 }
-    }
 }
 
 /// Compatibility alias for existing OBS API callers.

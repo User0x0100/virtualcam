@@ -127,6 +127,50 @@ impl PixelFormat {
         }))
     }
 
+    /// DirectShow `MEDIASUBTYPE_*` GUID (as a `u128`), or `None` for
+    /// formats managed cameras cannot carry.
+    pub const fn dshow_subtype(self) -> Option<u128> {
+        match self {
+            // MEDIASUBTYPE_RGB32 / MEDIASUBTYPE_RGB24.
+            Self::Bgra32 => Some(0xE436EB7E_524F_11CE_9F53_0020AF0BA770),
+            Self::Rgb24 => Some(0xE436EB7D_524F_11CE_9F53_0020AF0BA770),
+            _ => match self.fourcc() {
+                Some(fourcc) => Some(fourcc_guid(fourcc)),
+                None => None,
+            },
+        }
+    }
+
+    /// Media Foundation `MFVideoFormat_*` GUID (as a `u128`), or `None` for
+    /// formats managed cameras cannot carry.
+    pub const fn mf_subtype(self) -> Option<u128> {
+        match self {
+            // MFVideoFormat_RGB32 (D3DFMT_X8R8G8B8) / MFVideoFormat_RGB24 (D3DFMT_R8G8B8).
+            Self::Bgra32 => Some(fourcc_guid(22)),
+            Self::Rgb24 => Some(fourcc_guid(20)),
+            _ => match self.fourcc() {
+                Some(fourcc) => Some(fourcc_guid(fourcc)),
+                None => None,
+            },
+        }
+    }
+
+    /// Inverse of [`Self::dshow_subtype`] (also accepts `IYUV` for I420).
+    pub fn from_dshow_subtype(subtype: u128) -> Option<Self> {
+        if subtype == fourcc_guid(u32::from_le_bytes(*b"IYUV")) {
+            return Some(Self::I420);
+        }
+        Self::MANAGED.into_iter().find(|format| format.dshow_subtype() == Some(subtype))
+    }
+
+    /// Inverse of [`Self::mf_subtype`] (also accepts `IYUV` for I420).
+    pub fn from_mf_subtype(subtype: u128) -> Option<Self> {
+        if subtype == fourcc_guid(u32::from_le_bytes(*b"IYUV")) {
+            return Some(Self::I420);
+        }
+        Self::MANAGED.into_iter().find(|format| format.mf_subtype() == Some(subtype))
+    }
+
     /// Average bits per pixel (`BITMAPINFOHEADER::biBitCount`).
     pub const fn bits_per_pixel(self) -> u16 {
         match self {
@@ -228,6 +272,11 @@ impl PixelFormat {
     pub fn frame_size(self, width: u32, height: u32) -> Result<usize, FormatError> {
         self.layout(width, height).map(|layout| layout.size)
     }
+}
+
+/// The `{XXXXXXXX-0000-0010-8000-00AA00389B71}` GUID of a FourCC/D3DFORMAT code.
+pub const fn fourcc_guid(code: u32) -> u128 {
+    ((code as u128) << 96) | 0x0000_0010_8000_00AA_0038_9B71
 }
 
 /// One plane inside a frame buffer.
@@ -775,6 +824,20 @@ mod tests {
             corrupt[offset] = value;
             assert_eq!(WireVideoFormat::from_bytes(&corrupt).expect("parse").decode(), Err(FormatError::InvalidWireFormat), "offset {offset}");
         }
+    }
+
+    #[test]
+    fn subtypes_match_windows_sdk_guids() {
+        assert_eq!(PixelFormat::Nv12.dshow_subtype(), Some(0x3231564E_0000_0010_8000_00AA00389B71));
+        assert_eq!(PixelFormat::Yuy2.mf_subtype(), Some(0x32595559_0000_0010_8000_00AA00389B71));
+        assert_eq!(PixelFormat::Bgra32.mf_subtype(), Some(0x00000016_0000_0010_8000_00AA00389B71));
+        assert_eq!(PixelFormat::Rgb24.mf_subtype(), Some(0x00000014_0000_0010_8000_00AA00389B71));
+        assert_eq!(PixelFormat::Rgba8.dshow_subtype(), None);
+        for format in PixelFormat::MANAGED {
+            assert_eq!(PixelFormat::from_dshow_subtype(format.dshow_subtype().expect("managed")), Some(format));
+            assert_eq!(PixelFormat::from_mf_subtype(format.mf_subtype().expect("managed")), Some(format));
+        }
+        assert_eq!(PixelFormat::from_dshow_subtype(0x56555949_0000_0010_8000_00AA00389B71), Some(PixelFormat::I420));
     }
 
     #[test]

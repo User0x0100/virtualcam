@@ -21,6 +21,31 @@ use crate::format::WireVideoFormat;
 use crate::id::CameraId;
 use crate::sync;
 
+/// DirectShow GUIDs used by registration and the source (as `u128`).
+pub mod guids {
+    /// `CLSID_VideoInputDeviceCategory`.
+    pub const VIDEO_INPUT_DEVICE_CATEGORY: u128 = 0x860BB310_5D01_11D0_BD3B_00A0C911CE86;
+    /// `CLSID_FilterMapper2`.
+    pub const FILTER_MAPPER2: u128 = 0xCDA42200_BD88_11D0_BD4E_00A0C911CE86;
+    /// `CLSID_MemoryAllocator`.
+    pub const MEMORY_ALLOCATOR: u128 = 0x1E651CC0_B199_11D0_8212_00C04FC32C45;
+    /// `MEDIATYPE_Video`.
+    pub const MEDIATYPE_VIDEO: u128 = 0x73646976_0000_0010_8000_00AA00389B71;
+    /// `FORMAT_VideoInfo`.
+    pub const FORMAT_VIDEO_INFO: u128 = 0x05589F80_C356_11CE_BF01_00AA0055595A;
+    /// `FORMAT_VideoInfo2`.
+    pub const FORMAT_VIDEO_INFO2: u128 = 0xF72A76A0_EB0A_11D0_ACE4_0000C0CC16BA;
+    /// `AMPROPSETID_Pin`.
+    pub const AMPROPSETID_PIN: u128 = 0x9B00F101_1567_11D1_B3F1_00AA003761C5;
+    /// `PIN_CATEGORY_CAPTURE`.
+    pub const PIN_CATEGORY_CAPTURE: u128 = 0xFB6C4281_0353_11D1_905F_0000C0CC16BA;
+    /// `IID_IAMFilterData`.
+    pub const IID_IAM_FILTER_DATA: u128 = 0x97F7C4D4_547B_4A5F_8332_536430AD2E4D;
+}
+
+/// Name of the source's single output pin.
+pub const PIN_NAME: &str = "Capture";
+
 /// `DshowControl::magic`: `"VCD2"`.
 pub const CONTROL_MAGIC: u32 = u32::from_le_bytes(*b"VCD2");
 /// Current control layout version.

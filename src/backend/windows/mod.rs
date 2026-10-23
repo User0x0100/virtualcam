@@ -2,11 +2,11 @@
 //!
 //! - `obs`: third-party OBS Virtual Camera queue.
 //! - `managed_dshow`: this crate's managed DirectShow camera (producer-owned
-//!   runtime format, session-local transport).
+//!   runtime format, session-local transport v2).
 //! - `unity_capture`: third-party Unity Capture shared image.
 //!
-//! OBS and managed DirectShow share only the frame-queue writer; their naming,
-//! occupancy, and lifecycle rules are separate.
+//! OBS keeps the OBS-compatible three-slot queue; managed cameras use the
+//! seqlock'd transport v2 ring from `virtualcam-protocol`.
 
 mod managed_dshow;
 mod obs;
@@ -18,7 +18,9 @@ use self::managed_dshow::ManagedDshowBackend;
 use self::obs::ObsBackend;
 use self::protocol::unity_capture::ObjectNames;
 use self::unity_capture::UnityCaptureBackend;
-use crate::config::{Nv12Format, ValidatedObsOptions, ValidatedUnityCaptureOptions};
+use virtualcam_protocol::ValidatedFormat;
+
+use crate::config::{ValidatedObsOptions, ValidatedUnityCaptureOptions};
 use crate::platform::windows::registry_key_exists;
 use crate::{CameraType, Error, ManagedCameraId, Result, WriteStatus};
 #[cfg(feature = "cuda")]
@@ -65,7 +67,7 @@ impl FrameSource<'_> {
 
 pub(crate) enum Backend {
     Obs(ObsBackend),
-    ManagedDirectShow(ManagedDshowBackend),
+    ManagedDirectShow(Box<ManagedDshowBackend>),
     UnityCapture(UnityCaptureBackend),
 }
 
@@ -77,8 +79,8 @@ impl Backend {
         ObsBackend::open(options).map(Self::Obs)
     }
 
-    pub(crate) fn open_managed_dshow(id: ManagedCameraId, format: Nv12Format) -> Result<Self> {
-        ManagedDshowBackend::open(id, format).map(Self::ManagedDirectShow)
+    pub(crate) fn open_managed_dshow(id: ManagedCameraId, format: ValidatedFormat) -> Result<Self> {
+        ManagedDshowBackend::open(id, format).map(|backend| Self::ManagedDirectShow(Box::new(backend)))
     }
 
     pub(crate) fn open_unity_capture(options: ValidatedUnityCaptureOptions) -> Result<Self> {

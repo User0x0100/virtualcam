@@ -68,16 +68,15 @@ mod config;
 mod cuda;
 mod error;
 mod managed;
-mod pixel_format;
 #[cfg(windows)]
 mod platform;
 mod status;
 
 pub use camera::VirtualCamera;
-pub use config::{CameraType, FrameRate, ObsFrameRate, ObsOptions, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode};
+pub use config::{CameraType, ObsFrameRate, ObsOptions, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode};
 #[cfg(feature = "cuda")]
 pub use cuda::CudaStream;
 pub use error::{Error, Result};
-pub use managed::{ManagedCameraConfig, ManagedCameraId, ManagedCameraInfo, ManagedCameraManager, ManagedStreamConfig};
-pub use pixel_format::PixelFormat;
+pub use managed::{AppId, DirectShowRegistration, ManagedBackend, ManagedCameraId, ManagedCameraInfo, ManagedCameraManager, ManagedCameraRegistration, MediaFoundationRegistration, RegistrationHealth, RegistrationScope};
 pub use status::WriteStatus;
+pub use virtualcam_protocol::{ColorMatrix, ColorPrimaries, ColorRange, ColorSpace, FormatError, FrameRate, PixelFormat, TransferFunction, VideoFormat};
