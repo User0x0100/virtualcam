@@ -1,0 +1,349 @@
+//! The single video stream: synchronous, request-driven sample production.
+
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use virtualcam_protocol::planes::{copy_frame, fill_black};
+use virtualcam_protocol::ring::ReadOutcome;
+use virtualcam_protocol::{FrameLayout, ValidatedFormat};
+use windows::Win32::Foundation::{E_POINTER, E_UNEXPECTED, S_OK};
+use windows::Win32::Media::MediaFoundation::{
+    IMF2DBuffer, IMF2DBuffer2, IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaBuffer, IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource, IMFMediaStream_Impl, IMFMediaStream2,
+    IMFMediaStream2_Impl, IMFMediaType, IMFSample, IMFStreamDescriptor, IMFVideoSampleAllocator, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MEMediaSample, MEStreamStarted, MEStreamStopped, MF_E_INVALIDREQUEST,
+    MF_E_MEDIA_SOURCE_WRONGSTATE, MF_E_SHUTDOWN, MF_STREAM_STATE, MF_STREAM_STATE_PAUSED, MF_STREAM_STATE_RUNNING, MF_STREAM_STATE_STOPPED, MF2DBuffer_LockFlags_Write, MFCreate2DMediaBuffer, MFCreateMemoryBuffer, MFCreateSample,
+    MFGetSystemTime, MFSampleExtension_Token,
+};
+use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows_core::{GUID, IUnknown, Interface, Ref, implement};
+
+use crate::rendezvous::TransportSlot;
+use crate::{ModuleRef, guard};
+
+/// Frames requested from a provided allocator.
+const ALLOCATOR_FRAMES: u32 = 10;
+
+pub(crate) struct StreamInner {
+    state: MF_STREAM_STATE,
+    shutdown: bool,
+    /// Strong back-reference for `GetMediaSource`; broken by `shutdown`.
+    source: Option<IMFMediaSource>,
+    allocator: Option<IMFVideoSampleAllocator>,
+    allocator_ready: bool,
+}
+
+#[implement(IMFMediaStream2)]
+pub(crate) struct MediaStream {
+    pub(crate) queue: IMFMediaEventQueue,
+    pub(crate) descriptor: IMFStreamDescriptor,
+    pub(crate) attributes: IMFAttributes,
+    media_type: IMFMediaType,
+    format: ValidatedFormat,
+    transport: Arc<TransportSlot>,
+    inner: Mutex<StreamInner>,
+    _module: ModuleRef,
+}
+
+/// A `VT_I8` PROPVARIANT (event start times).
+pub(crate) fn variant_i64(value: i64) -> PROPVARIANT {
+    let mut variant = PROPVARIANT::default();
+    // SAFETY: Writes the discriminant and the matching union member.
+    unsafe {
+        let inner = &mut *variant.Anonymous.Anonymous;
+        inner.vt = windows::Win32::System::Variant::VT_I8;
+        inner.Anonymous.hVal = value;
+    }
+    variant
+}
+
+impl MediaStream {
+    pub(crate) fn new(queue: IMFMediaEventQueue, descriptor: IMFStreamDescriptor, attributes: IMFAttributes, media_type: IMFMediaType, format: ValidatedFormat, transport: Arc<TransportSlot>) -> Self {
+        Self {
+            queue,
+            descriptor,
+            attributes,
+            media_type,
+            format,
+            transport,
+            inner: Mutex::new(StreamInner {
+                state: MF_STREAM_STATE_STOPPED,
+                shutdown: false,
+                source: None,
+                allocator: None,
+                allocator_ready: false,
+            }),
+            _module: ModuleRef::new(),
+        }
+    }
+
+    fn inner(&self) -> MutexGuard<'_, StreamInner> {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn live(&self) -> windows_core::Result<MutexGuard<'_, StreamInner>> {
+        let inner = self.inner();
+        if inner.shutdown { Err(MF_E_SHUTDOWN.into()) } else { Ok(inner) }
+    }
+
+    pub(crate) fn set_source(&self, source: IMFMediaSource) {
+        self.inner().source = Some(source);
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.inner().state == MF_STREAM_STATE_RUNNING
+    }
+
+    /// Stores a pipeline-provided allocator; refused while running.
+    pub(crate) fn set_allocator(&self, allocator: Option<IMFVideoSampleAllocator>) -> windows_core::Result<()> {
+        let mut inner = self.live()?;
+        if inner.state == MF_STREAM_STATE_RUNNING {
+            return Err(MF_E_INVALIDREQUEST.into());
+        }
+        if let Some(old) = inner.allocator.take()
+            && inner.allocator_ready
+        {
+            // SAFETY: Valid allocator.
+            let _ = unsafe { old.UninitializeSampleAllocator() };
+        }
+        inner.allocator = allocator;
+        inner.allocator_ready = false;
+        Ok(())
+    }
+
+    /// Source -> stream: begin producing. Queues `MEStreamStarted`.
+    pub(crate) fn start(&self, time: i64) -> windows_core::Result<()> {
+        let mut inner = self.live()?;
+        if let Some(allocator) = inner.allocator.clone()
+            && !inner.allocator_ready
+        {
+            // SAFETY: Valid allocator and media type. A failing allocator is
+            // dropped so the standard MF allocation path still works.
+            if unsafe { allocator.InitializeSampleAllocator(ALLOCATOR_FRAMES, &self.media_type) }.is_ok() {
+                inner.allocator_ready = true;
+            } else {
+                inner.allocator = None;
+            }
+        }
+        inner.state = MF_STREAM_STATE_RUNNING;
+        // SAFETY: Valid queue; the variant outlives the call.
+        unsafe { self.queue.QueueEventParamVar(MEStreamStarted.0 as u32, &GUID::zeroed(), S_OK, &variant_i64(time)) }
+    }
+
+    /// Source -> stream: stop producing. Queues `MEStreamStopped`.
+    pub(crate) fn stop(&self) -> windows_core::Result<()> {
+        let mut inner = self.live()?;
+        let was_running = inner.state != MF_STREAM_STATE_STOPPED;
+        inner.state = MF_STREAM_STATE_STOPPED;
+        if inner.allocator_ready
+            && let Some(allocator) = &inner.allocator
+        {
+            // SAFETY: Valid allocator; rebuilt on the next start.
+            let _ = unsafe { allocator.UninitializeSampleAllocator() };
+            inner.allocator_ready = false;
+        }
+        if was_running {
+            // SAFETY: Valid queue.
+            unsafe { self.queue.QueueEventParamVar(MEStreamStopped.0 as u32, &GUID::zeroed(), S_OK, &PROPVARIANT::default()) }?;
+        }
+        Ok(())
+    }
+
+    /// Source -> stream: release everything and break the source cycle.
+    pub(crate) fn shutdown(&self) {
+        let mut inner = self.inner();
+        if inner.shutdown {
+            return;
+        }
+        inner.shutdown = true;
+        inner.state = MF_STREAM_STATE_STOPPED;
+        if let Some(allocator) = inner.allocator.take()
+            && inner.allocator_ready
+        {
+            // SAFETY: Valid allocator.
+            let _ = unsafe { allocator.UninitializeSampleAllocator() };
+        }
+        inner.allocator_ready = false;
+        inner.source = None;
+        // SAFETY: Valid queue; later queue calls report MF_E_SHUTDOWN.
+        let _ = unsafe { self.queue.Shutdown() };
+    }
+
+    fn allocate(&self, inner: &StreamInner) -> windows_core::Result<IMFSample> {
+        if inner.allocator_ready
+            && let Some(allocator) = &inner.allocator
+        {
+            // SAFETY: Initialized allocator.
+            return unsafe { allocator.AllocateSample() };
+        }
+        let format = self.format.format();
+        // SAFETY: Plain MF object creation.
+        let sample = unsafe { MFCreateSample() }?;
+        let fourcc = (format.pixel_format.mf_subtype().unwrap_or(0) >> 96) as u32;
+        // SAFETY: Plain MF object creation; fall back to a linear buffer.
+        let buffer = match unsafe { MFCreate2DMediaBuffer(format.width, format.height, fourcc, false) } {
+            Ok(buffer) => buffer,
+            Err(_) => unsafe { MFCreateMemoryBuffer(self.format.frame_size() as u32) }?,
+        };
+        // SAFETY: Valid sample and buffer.
+        unsafe { sample.AddBuffer(&buffer) }?;
+        Ok(sample)
+    }
+
+    /// Copies the newest producer frame (or black) into `buffer`, honoring
+    /// its pitch, which may differ from the tight producer layout and may be
+    /// negative for bottom-up RGB.
+    fn fill(&self, buffer: &IMFMediaBuffer) -> windows_core::Result<()> {
+        if let Ok(buffer2) = buffer.cast::<IMF2DBuffer2>() {
+            let (mut scanline0, mut pitch, mut start, mut length) = (core::ptr::null_mut(), 0_i32, core::ptr::null_mut(), 0_u32);
+            // SAFETY: Valid buffer; all outputs writable.
+            unsafe { buffer2.Lock2DSize(MF2DBuffer_LockFlags_Write, &mut scanline0, &mut pitch, &mut start, &mut length) }?;
+            let result = self.write_region(start, length as usize, scanline0, pitch);
+            // SAFETY: Balances the successful lock on every path.
+            let _ = unsafe { buffer2.Unlock2D() };
+            return result;
+        }
+        if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer>() {
+            let (mut scanline0, mut pitch) = (core::ptr::null_mut(), 0_i32);
+            // SAFETY: Valid buffer; outputs writable.
+            unsafe { buffer2d.Lock2D(&mut scanline0, &mut pitch) }?;
+            // SAFETY: Valid 2D buffer.
+            let length = unsafe { buffer2d.GetContiguousLength() }.unwrap_or(0) as usize;
+            let region = if pitch < 0 {
+                scanline0.wrapping_offset((self.format.format().height as isize - 1) * pitch as isize)
+            } else {
+                scanline0
+            };
+            let result = self.write_region(region, length, scanline0, pitch);
+            // SAFETY: Balances the successful lock on every path.
+            let _ = unsafe { buffer2d.Unlock2D() };
+            return result;
+        }
+        let (mut data, mut max_length) = (core::ptr::null_mut(), 0_u32);
+        // SAFETY: Valid buffer; outputs writable.
+        unsafe { buffer.Lock(&mut data, Some(&mut max_length), None) }?;
+        let pitch = self.format.layout().planes()[0].pitch as i32;
+        let result = self.write_region(data, max_length as usize, data, pitch);
+        // SAFETY: Balances the successful lock on every path.
+        let _ = unsafe { buffer.Unlock() };
+        if result.is_ok() {
+            // SAFETY: Valid buffer.
+            unsafe { buffer.SetCurrentLength(self.format.frame_size() as u32) }?;
+        }
+        result
+    }
+
+    fn write_region(&self, start: *mut u8, length: usize, scanline0: *mut u8, pitch: i32) -> windows_core::Result<()> {
+        let format = self.format.format();
+        let invalid = || windows_core::Error::from(E_UNEXPECTED);
+        if start.is_null() || scanline0.is_null() || pitch == 0 {
+            return Err(E_POINTER.into());
+        }
+        let flip = pitch < 0;
+        let magnitude = pitch.unsigned_abs() as usize;
+        // The lowest-addressed row: the top row for top-down buffers, the
+        // bottom row for negative pitch.
+        let lowest = if flip { scanline0.wrapping_offset(-((format.height as isize - 1) * magnitude as isize)) } else { scanline0 };
+        let offset = (lowest as usize).checked_sub(start as usize).ok_or_else(invalid)?;
+        let layout: FrameLayout = format.pixel_format.layout_with_pitch(format.width, format.height, magnitude).map_err(|_| invalid())?;
+        if flip && layout.planes().len() != 1 {
+            return Err(invalid());
+        }
+        let available = length.checked_sub(offset).ok_or_else(invalid)?;
+        if layout.size() > available {
+            return Err(invalid());
+        }
+        // SAFETY: `lowest..lowest + layout.size()` lies inside the locked
+        // buffer region `start..start + length`, validated above.
+        let destination = unsafe { core::slice::from_raw_parts_mut(lowest, layout.size()) };
+        let mut copied = true;
+        let outcome = self.transport.read_latest(|src| {
+            // SAFETY: `src` spans the ring's validated tight frame.
+            copied = unsafe { copy_frame(src, self.format.layout(), destination, &layout, flip) }.is_ok();
+        });
+        if !copied || matches!(outcome, None | Some(ReadOutcome::Empty)) {
+            fill_black(destination, &layout, format.pixel_format, format.color.is_full_range(format.pixel_format)).map_err(|_| invalid())?;
+        }
+        Ok(())
+    }
+}
+
+impl IMFMediaEventGenerator_Impl for MediaStream_Impl {
+    fn GetEvent(&self, flags: MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS) -> windows_core::Result<IMFMediaEvent> {
+        // Check shutdown under the lock, then block with no lock held.
+        drop(self.live()?);
+        // SAFETY: Valid queue (it reports MF_E_SHUTDOWN itself if shut down meanwhile).
+        unsafe { self.queue.GetEvent(flags.0) }
+    }
+
+    fn BeginGetEvent(&self, callback: Ref<IMFAsyncCallback>, state: Ref<IUnknown>) -> windows_core::Result<()> {
+        drop(self.live()?);
+        // SAFETY: Valid queue and forwarded references.
+        unsafe { self.queue.BeginGetEvent(callback.as_ref(), state.as_ref()) }
+    }
+
+    fn EndGetEvent(&self, result: Ref<IMFAsyncResult>) -> windows_core::Result<IMFMediaEvent> {
+        drop(self.live()?);
+        // SAFETY: Valid queue and forwarded reference.
+        unsafe { self.queue.EndGetEvent(result.as_ref()) }
+    }
+
+    fn QueueEvent(&self, met: u32, extended: *const GUID, status: windows_core::HRESULT, value: *const PROPVARIANT) -> windows_core::Result<()> {
+        drop(self.live()?);
+        // SAFETY: Forwarded arguments.
+        unsafe { self.queue.QueueEventParamVar(met, extended, status, value) }
+    }
+}
+
+impl IMFMediaStream_Impl for MediaStream_Impl {
+    fn GetMediaSource(&self) -> windows_core::Result<IMFMediaSource> {
+        // Copy the parent pointer only; never call into the source here.
+        self.live()?.source.clone().ok_or_else(|| MF_E_SHUTDOWN.into())
+    }
+
+    fn GetStreamDescriptor(&self) -> windows_core::Result<IMFStreamDescriptor> {
+        drop(self.live()?);
+        Ok(self.descriptor.clone())
+    }
+
+    fn RequestSample(&self, token: Ref<IUnknown>) -> windows_core::Result<()> {
+        guard(|| {
+            let inner = self.live()?;
+            if inner.state != MF_STREAM_STATE_RUNNING {
+                return Err(MF_E_MEDIA_SOURCE_WRONGSTATE.into());
+            }
+            // Failures return their HRESULT here and are never also queued
+            // as MEError.
+            let sample = self.allocate(&inner)?;
+            // SAFETY: Valid sample with at least one buffer.
+            let buffer = unsafe { sample.GetBufferByIndex(0) }?;
+            self.fill(&buffer)?;
+            // SAFETY: Valid sample.
+            unsafe {
+                sample.SetSampleTime(MFGetSystemTime())?;
+                sample.SetSampleDuration(self.format.interval_100ns() as i64)?;
+                if let Some(token) = token.as_ref() {
+                    sample.SetUnknown(&MFSampleExtension_Token, token)?;
+                }
+                self.queue.QueueEventParamUnk(MEMediaSample.0 as u32, &GUID::zeroed(), S_OK, &sample)
+            }
+        })
+    }
+}
+
+impl IMFMediaStream2_Impl for MediaStream_Impl {
+    fn SetStreamState(&self, value: MF_STREAM_STATE) -> windows_core::Result<()> {
+        let mut inner = self.live()?;
+        match value {
+            MF_STREAM_STATE_STOPPED | MF_STREAM_STATE_PAUSED => {
+                inner.state = value;
+                Ok(())
+            }
+            // Running is entered only through the source's Start, which
+            // also initializes the allocator and queues the events.
+            MF_STREAM_STATE_RUNNING if inner.state == MF_STREAM_STATE_RUNNING => Ok(()),
+            _ => Err(MF_E_INVALIDREQUEST.into()),
+        }
+    }
+
+    fn GetStreamState(&self) -> windows_core::Result<MF_STREAM_STATE> {
+        Ok(self.live()?.state)
+    }
+}

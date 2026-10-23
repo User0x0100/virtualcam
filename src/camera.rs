@@ -72,6 +72,14 @@ impl VirtualCamera {
         Ok(Self::managed(CameraType::ManagedDirectShow, id, format, backend))
     }
 
+    /// Opens one managed Media Foundation producer session; reached through
+    /// [`crate::ManagedCameraManager::open`] after registration checks.
+    #[cfg(windows)]
+    pub(crate) fn open_managed_mf(id: ManagedCameraId, format: ValidatedFormat, rendezvous_id: &str) -> Result<Self> {
+        let backend = Backend::open_managed_mf(id, format, rendezvous_id)?;
+        Ok(Self::managed(CameraType::ManagedMediaFoundation, id, format, backend))
+    }
+
     #[cfg(windows)]
     pub(crate) fn managed(camera_type: CameraType, id: ManagedCameraId, format: ValidatedFormat, backend: Backend) -> Self {
         trace_debug!(camera_type = ?camera_type, camera_id = %id, format = %format.format(), "managed virtual camera opened");
@@ -156,9 +164,11 @@ impl VirtualCamera {
 
     /// Reports whether the backend protocol can currently accept a frame.
     ///
-    /// Unity Capture returns `false` until receiver-created objects exist. OBS
-    /// has no consumer-presence handshake, so an open producer is ready even if
-    /// no application currently reads the camera.
+    /// Unity Capture returns `false` until receiver-created objects exist, and
+    /// a managed Media Foundation camera until a client has started it and
+    /// this producer authenticated to its source. OBS and managed DirectShow
+    /// have no consumer-presence handshake, so an open producer is ready even
+    /// if no application currently reads the camera.
     pub fn is_ready(&mut self) -> Result<bool> {
         if self.closed {
             return Err(Error::AlreadyClosed);

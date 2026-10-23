@@ -9,7 +9,7 @@ keywords = ["virtual-camera", "obs", "unity", "cuda", "windows"]
 categories = ["multimedia::video", "os::windows-apis"]
 
 [workspace]
-members = [".", "crates/virtualcam-protocol", "crates/virtualcam-dshow"]
+members = [".", "crates/virtualcam-protocol", "crates/virtualcam-dshow", "crates/virtualcam-mf"]
 
 [features]
 default = []
@@ -47,3 +47,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
 ] }
+
+[target.'cfg(windows)'.dev-dependencies]
+virtualcam-mf = { path = "crates/virtualcam-mf" }
+windows-core = "0.62"

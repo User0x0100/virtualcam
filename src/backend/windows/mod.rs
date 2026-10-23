@@ -3,18 +3,22 @@
 //! - `obs`: third-party OBS Virtual Camera queue.
 //! - `managed_dshow`: this crate's managed DirectShow camera (producer-owned
 //!   runtime format, session-local transport v2).
+//! - `managed_mf`: this crate's managed Media Foundation camera (source-owned
+//!   native mode, authenticated cross-session transport).
 //! - `unity_capture`: third-party Unity Capture shared image.
 //!
 //! OBS keeps the OBS-compatible three-slot queue; managed cameras use the
 //! seqlock'd transport v2 ring from `virtualcam-protocol`.
 
 mod managed_dshow;
+mod managed_mf;
 mod obs;
 mod protocol;
 mod queue_writer;
 mod unity_capture;
 
 use self::managed_dshow::ManagedDshowBackend;
+use self::managed_mf::ManagedMfBackend;
 use self::obs::ObsBackend;
 use self::protocol::unity_capture::ObjectNames;
 use self::unity_capture::UnityCaptureBackend;
@@ -68,6 +72,7 @@ impl FrameSource<'_> {
 pub(crate) enum Backend {
     Obs(ObsBackend),
     ManagedDirectShow(Box<ManagedDshowBackend>),
+    ManagedMediaFoundation(Box<ManagedMfBackend>),
     UnityCapture(UnityCaptureBackend),
 }
 
@@ -83,6 +88,10 @@ impl Backend {
         ManagedDshowBackend::open(id, format).map(|backend| Self::ManagedDirectShow(Box::new(backend)))
     }
 
+    pub(crate) fn open_managed_mf(id: ManagedCameraId, format: ValidatedFormat, rendezvous_id: &str) -> Result<Self> {
+        ManagedMfBackend::open(id, format, rendezvous_id).map(|backend| Self::ManagedMediaFoundation(Box::new(backend)))
+    }
+
     pub(crate) fn open_unity_capture(options: ValidatedUnityCaptureOptions) -> Result<Self> {
         if !registry_key_exists(&unity_capture::unity_clsid_key(options.capture_number)) {
             return Err(Error::BackendUnavailable(CameraType::UnityCapture));
@@ -94,6 +103,7 @@ impl Backend {
         match self {
             Self::Obs(backend) => backend.is_ready(),
             Self::ManagedDirectShow(backend) => backend.is_ready(),
+            Self::ManagedMediaFoundation(backend) => backend.is_ready(),
             Self::UnityCapture(backend) => backend.is_ready(),
         }
     }
@@ -115,6 +125,7 @@ impl Backend {
         match self {
             Self::Obs(backend) => backend.write_frame(frame),
             Self::ManagedDirectShow(backend) => backend.write_frame(frame),
+            Self::ManagedMediaFoundation(backend) => backend.write_frame(frame),
             Self::UnityCapture(backend) => backend.write_frame(frame),
         }
     }
@@ -123,6 +134,7 @@ impl Backend {
         match self {
             Self::Obs(backend) => backend.close(),
             Self::ManagedDirectShow(backend) => backend.close(),
+            Self::ManagedMediaFoundation(backend) => backend.close(),
             Self::UnityCapture(backend) => backend.close(),
         }
     }

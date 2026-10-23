@@ -184,6 +184,41 @@ pub(crate) fn random_nonzero_u64() -> Result<u64> {
     }
 }
 
+/// `S-1-...` text of the user this process runs as.
+pub(crate) fn current_user_sid() -> Result<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = core::ptr::null_mut();
+    // SAFETY: Pseudo process handle; the token is owned below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(last_error("OpenProcessToken"));
+    }
+    // SAFETY: OpenProcessToken returned one owned handle.
+    let token = unsafe { OwnedHandle::from_raw(token) };
+    let mut buffer = [0_u64; 64];
+    let mut length = 0_u32;
+    // SAFETY: 512 aligned bytes hold TOKEN_USER plus any SID.
+    if unsafe { GetTokenInformation(token.raw(), TokenUser, buffer.as_mut_ptr().cast(), core::mem::size_of_val(&buffer) as u32, &mut length) } == 0 {
+        return Err(last_error("GetTokenInformation(TokenUser)"));
+    }
+    // SAFETY: The buffer now holds a TOKEN_USER.
+    let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let mut text: *mut u16 = core::ptr::null_mut();
+    // SAFETY: Valid SID; the string is LocalFree'd below.
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        return Err(last_error("ConvertSidToStringSidW"));
+    }
+    // SAFETY: NUL-terminated string from the API.
+    let units = unsafe { core::slice::from_raw_parts(text, (0..).take_while(|&i| *text.add(i) != 0).count()) };
+    let value = String::from_utf16_lossy(units);
+    // SAFETY: Allocated by ConvertSidToStringSidW.
+    unsafe { LocalFree(text.cast()) };
+    Ok(value)
+}
+
 /// Creation time of the current process as a `FILETIME` packed into `u64`.
 pub(crate) fn current_process_start_time() -> Result<u64> {
     use windows_sys::Win32::Foundation::FILETIME;

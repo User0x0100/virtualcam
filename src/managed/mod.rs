@@ -264,6 +264,54 @@ impl ManagedCameraManager {
         imp::open(self, id, Some(format))
     }
 
+    /// Installs the shared Media Foundation source DLL machine-wide.
+    ///
+    /// Required once per machine before Media Foundation cameras can be
+    /// registered; needs an elevated process. Frame Server loads the DLL as
+    /// Local Service, so place it where that account can read it (for
+    /// example under Program Files), never in a user profile.
+    pub fn install_media_foundation_source(path: impl AsRef<std::path::Path>) -> Result<()> {
+        #[cfg(windows)]
+        {
+            mf::install_source(path.as_ref())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Err(Error::UnsupportedPlatform)
+        }
+    }
+
+    /// Removes the machine-wide Media Foundation source registration.
+    ///
+    /// Fails safe while the current user still has Media Foundation
+    /// cameras. Cameras of other Windows users cannot be enumerated here;
+    /// pass `other_users_cleaned = true` only after they were removed (each
+    /// user unregisters their own), otherwise the source stays installed.
+    pub fn uninstall_media_foundation_source(other_users_cleaned: bool) -> Result<()> {
+        #[cfg(windows)]
+        {
+            mf::uninstall_source(other_users_cleaned)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = other_users_cleaned;
+            Err(Error::UnsupportedPlatform)
+        }
+    }
+
+    /// The installed Media Foundation source DLL, if any.
+    pub fn media_foundation_source() -> Option<PathBuf> {
+        #[cfg(windows)]
+        {
+            mf::installed_source()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
     /// Opens a producer session with the camera's registered format (the
     /// Media Foundation native mode or the DirectShow default format).
     pub fn open_registered(&self, id: ManagedCameraId) -> Result<VirtualCamera> {

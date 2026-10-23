@@ -1,0 +1,36 @@
+[package]
+name = "virtualcam-mf"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust Media Foundation (Frame Server) custom media source for virtualcam managed cameras"
+license = "MIT"
+publish = false
+
+[lib]
+name = "virtualcam_mf"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+virtualcam-protocol = { path = "../virtualcam-protocol" }
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_Marshal",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }

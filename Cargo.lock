@@ -73,6 +73,7 @@ name = "virtualcam"
 version = "0.1.0"
 dependencies = [
  "tracing",
+ "virtualcam-mf",
  "virtualcam-protocol",
  "windows",
  "windows-core",
@@ -81,6 +82,15 @@ dependencies = [
 
 [[package]]
 name = "virtualcam-dshow"
+version = "0.1.0"
+dependencies = [
+ "virtualcam-protocol",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "virtualcam-mf"
 version = "0.1.0"
 dependencies = [
  "virtualcam-protocol",
