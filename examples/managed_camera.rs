@@ -8,6 +8,8 @@
 //! cargo run --example managed_camera -- unregister <ID> [--app com.example.studio]
 //! cargo run --example managed_camera -- legacy                  # cameras of the retired C++ driver
 //! cargo run --example managed_camera -- remove-legacy <ID>      # elevated
+//! cargo run --example managed_camera -- install-mf <PATH>       # elevated, once per machine
+//! cargo run --example managed_camera -- uninstall-mf [--other-users-cleaned]  # elevated
 //! ```
 //!
 //! DirectShow cameras need `virtualcam_dshow.dll`; pass `--dshow-source <path>`
@@ -29,6 +31,7 @@ struct Args {
     fps: u32,
     seconds: f64,
     dshow_source: Option<String>,
+    other_users_cleaned: bool,
 }
 
 fn parse_args() -> Result<Args, Box<dyn Error>> {
@@ -42,6 +45,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         fps: 30,
         seconds: 30.0,
         dshow_source: None,
+        other_users_cleaned: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -54,6 +58,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--fps" => args.fps = value()?.parse()?,
             "--seconds" => args.seconds = value()?.parse()?,
             "--dshow-source" => args.dshow_source = Some(value()?),
+            "--other-users-cleaned" => args.other_users_cleaned = true,
             "--size" => {
                 let text = value()?;
                 let (w, h) = text.split_once('x').ok_or("size must look like 1280x720")?;
@@ -133,7 +138,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             let id: ManagedCameraId = args.positional.get(1).ok_or("remove-legacy needs an id")?.parse().map_err(|_| "invalid id")?;
             ManagedCameraManager::remove_legacy_camera(id)?;
         }
-        _ => return Err("usage: managed_camera <register|list|stream|unregister|legacy|remove-legacy> ...".into()),
+        Some("install-mf") => {
+            let path = args.positional.get(1).ok_or("install-mf needs the virtualcam_mf.dll path")?;
+            ManagedCameraManager::install_media_foundation_source(path)?;
+            println!("installed {:?}", ManagedCameraManager::media_foundation_source());
+        }
+        Some("uninstall-mf") => ManagedCameraManager::uninstall_media_foundation_source(args.other_users_cleaned)?,
+        _ => return Err("usage: managed_camera <register|list|stream|unregister|legacy|remove-legacy|install-mf|uninstall-mf> ...".into()),
     }
     Ok(())
 }
