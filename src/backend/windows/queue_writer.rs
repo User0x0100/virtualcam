@@ -1,8 +1,8 @@
 //! Producer side of the OBS-compatible NV12 frame queue.
 //!
-//! OBS Virtual Camera and the managed DirectShow camera both write this queue;
-//! they differ only in naming, occupancy, and control-plane lifecycle, which
-//! stay in their own backend modules.
+//! Only the OBS Virtual Camera backend writes this queue; its naming,
+//! occupancy, and resolution hint stay in `obs.rs`. Managed cameras use the
+//! seqlock ring of `virtualcam-protocol` instead.
 
 use core::ptr::addr_of_mut;
 
@@ -307,14 +307,14 @@ pub(super) mod tests {
     fn reinitialize_resets_a_retained_same_format_mapping() {
         let name = test_name("Queue", "reinitialize");
         let format = nv12(2, 2);
-        let mut first = QueueWriter::create(&name, format, ExistingQueue::Reinitialize, CameraType::ManagedDirectShow).expect("first queue");
+        let mut first = QueueWriter::create(&name, format, ExistingQueue::Reinitialize, CameraType::Obs).expect("first queue");
         let observer = QueueObserver::open(&name);
         first.write(FrameSource::Host(&[1; 6])).expect("first frame");
         drop(first);
         assert_eq!(observer.state(), STATE_STOPPING);
 
         // The observer still holds the section; a later producer reuses it.
-        let _second = QueueWriter::create(&name, format, ExistingQueue::Reinitialize, CameraType::ManagedDirectShow).expect("reinitialize retained queue");
+        let _second = QueueWriter::create(&name, format, ExistingQueue::Reinitialize, CameraType::Obs).expect("reinitialize retained queue");
         assert_eq!((observer.write_idx(), observer.read_idx(), observer.state()), (0, 0, STATE_STARTING));
     }
 

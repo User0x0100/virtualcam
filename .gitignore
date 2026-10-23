@@ -1,7 +1,6 @@
 /target
 /.upstream
 /.vscode
-/native/managed-virtualcam/build
 *.pdb
 *.ilk
 *.exp

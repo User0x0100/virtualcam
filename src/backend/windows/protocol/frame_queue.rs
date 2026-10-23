@@ -1,8 +1,8 @@
 //! OBS-compatible three-slot NV12 frame queue.
 //!
-//! OBS Virtual Camera and the managed DirectShow camera share this payload
-//! ABI. Ownership, naming, and lifecycle stay with each backend's control
-//! plane; only the queue layout and its publication order live here.
+//! The OBS Virtual Camera payload ABI. Ownership, naming, and lifecycle stay
+//! in the OBS backend; only the queue layout and its publication order live
+//! here.
 
 use core::mem::{align_of, offset_of, size_of};
 

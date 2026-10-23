@@ -357,7 +357,6 @@ fn selected_camera_types(selection: CameraSelection) -> Vec<CameraType> {
 const fn camera_name(camera_type: CameraType) -> &'static str {
     match camera_type {
         CameraType::Obs => "OBS Virtual Camera",
-        CameraType::ManagedDirectShow => "Managed DirectShow Virtual Camera",
         CameraType::UnityCapture => "Unity Capture",
         _ => "virtual camera",
     }

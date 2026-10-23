@@ -25,7 +25,7 @@ Primary sources:
 - `libobs/util/util_uint64.h`
 - `CMakePresets.json` (installed virtual-camera CLSID)
 
-Rust coverage: `src/backend/windows/obs.rs` (naming, occupancy, resolution hint), `src/backend/windows/queue_writer.rs` (queue writer shared with the managed DirectShow camera), `src/backend/windows/protocol/frame_queue.rs` (layout), and `src/backend/windows/protocol/publication.rs` (ordering).
+Rust coverage: `src/backend/windows/obs.rs` (naming, occupancy, resolution hint), `src/backend/windows/queue_writer.rs` (queue writer), `src/backend/windows/protocol/frame_queue.rs` (layout), and `src/backend/windows/protocol/publication.rs` (ordering).
 
 | Property | Pinned upstream behavior | Rust mapping |
 | --- | --- | --- |

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本文件是本仓库 coding agent 的长期上下文。开始修改代码前必须先读本文件，再读任务相关源码和 `WINDOWS_NATIVE_VIRTUAL_CAMERA_PLAN.md`。
+本文件是本仓库 coding agent 的长期上下文。开始修改代码前必须先读本文件，再读任务相关源码。用户文档见 `README.md` 与 `docs/USER_GUIDE.zh-CN.md`。
 
 如果本文件、旧会话记忆和当前代码冲突，以用户最新指令 + 当前代码 + 可验证平台事实为准，并同步修正文档。
 
@@ -8,15 +8,17 @@
 
 `virtualcam` 是 Rust Windows virtual-camera library。
 
-当前三类能力：
+三类能力：
 
-1. OBS Virtual Camera producer。
-2. Unity Capture producer。
-3. Managed camera（pure Rust）：
+1. OBS Virtual Camera producer（第三方协议，NV12，3-slot queue）。
+2. Unity Capture producer（第三方协议，RGBA）。
+3. Managed camera（本项目自有，pure Rust）：
    - DirectShow：`crates/virtualcam-dshow` -> `virtualcam_dshow.dll`。
    - Media Foundation：`crates/virtualcam-mf` -> `virtualcam_mf.dll`。
 
 OBS backend != managed DShow backend。
+
+用户要求（2026-10-23）：两个 backend、多格式/色彩空间/分辨率/帧率、pure Rust、App ID 区分程序注册（不是鉴权）、性能优先、产品未定型可自由重构。
 
 ## 2. 当前事实
 
@@ -30,262 +32,131 @@ Workspace：
   - `src/managed/dshow.rs`：HKCU/HKLM COM + category instance + 系统 `IAMFilterData` FilterData。
   - `src/managed/mf.rs`：`MFCreateVirtualCamera`（CurrentUser + System）。
   - `src/managed/metadata.rs`：`{HKCU|HKLM}\Software\VirtualCamRs\Cameras\{ID}` records；`Global\VirtualCamRs-Management` mutex。
-  - `src/managed/legacy.rs`：旧 C++ driver camera 列出/删除。
-  - `src/backend/windows/managed_dshow/`、`managed_mf.rs`：两个 producer。
-  - `src/backend/windows/obs.rs`、`queue_writer.rs`、`protocol/frame_queue.rs`：OBS producer（3-slot queue 仅 OBS 使用）。
+  - `src/managed/legacy.rs`：已删除的 C++ driver 留下的 camera 列出/删除。
+  - `src/backend/windows/managed_dshow/`、`managed_mf.rs`：两个 managed producer。
+  - `src/backend/windows/obs.rs`、`queue_writer.rs`、`protocol/{frame_queue,publication}.rs`：OBS producer（3-slot queue 仅 OBS 使用）。
   - `src/backend/windows/unity_capture.rs`、`src/platform/`。
+- `examples/managed_camera.rs`：命令行管理工具；`examples/generated_test_video.rs`：OBS/Unity 测试图案。
+- `tests/`：`public_api`、`windows_installed`（OBS/Unity，ignored）、`windows_dshow`（FFmpeg 端到端，ignored）、`windows_mf`（真机 Frame Server，ignored，需先 install-mf）。
 
-`CameraType` 是 `#[non_exhaustive]`，含 `ManagedDirectShow`、`ManagedMediaFoundation`。`VirtualCamera` 是 `Send`、非 `Sync`。
+`CameraType` 是 `#[non_exhaustive]`，含 `Obs`、`UnityCapture`、`ManagedDirectShow`、`ManagedMediaFoundation`。`VirtualCamera` 是 `Send`、非 `Sync`。
 
-C++ `native/managed-virtualcam` 已删除（commit 95d6795）；旧 camera 只能通过 `legacy_cameras`/`remove_legacy_camera` 清理。
+C++ driver（`native/managed-virtualcam`、libdshowcapture、CMake）已删除；旧 camera 只能通过 `legacy_cameras`/`remove_legacy_camera` 清理。
 
-用户 2026-10-23 指令覆盖下文旧约束：多格式（覆盖 D052）、App ID、性能优先可自由重构（managed 改用 transport v2，覆盖 D001/D019 的 "不改 ABI"）。下文 §5 3-slot / §6 v1 namespace 描述的是 OBS 与已删除 C++ driver 的历史 ABI。
+验证状态（2026-10-24）：DShow FFmpeg 端到端逐字节通过；MF contract + in-process `IMFSourceReader` 通过；真机 Frame Server（Local Service / Session 0）单用户逐字节通过。未验证：多用户 / Fast User Switching。
 
-## 3. 最终 backend 模型
+## 3. Backend 模型
 
 ```text
 DirectShow
 -----------
 producer owns runtime format/control
-session-local transport
-dshow-source.dll
+session-local transport (Local\)
+virtualcam_dshow.dll
 
 Media Foundation
 ----------------
 source owns media capability/control
-cross-session transport
-mf-source.dll
+cross-session transport (Global\, same-session fallback Local\)
+virtualcam_mf.dll
 FrameServer / Local Service / Session 0
 ```
 
 两个 backend **不是同一个 transport lifecycle 换个 consumer API**。
 
-## 4. Common protocol 只共享 frame queue
+## 4. Common protocol 只共享 frame ring
 
-未来 `managed-protocol` 建议拆：
+`virtualcam-protocol` 两个 backend 共享：
 
-```text
-frame_queue
-publication helpers
-dshow_control
-mf_control
-```
+- ring layout、slot/sequence、seqlock。
+- format/payload validation、plane layout、pitch-aware copy/black。
+- publication ordering（`sync.rs`）。
 
-可以共享：
+不共享：
 
-- frame queue layout。
-- slot/sequence。
-- payload validation。
-- publication ordering。
-- stale detection。
-
-不能默认共享：
-
-- control header。
+- control header（DShow `DshowControl` vs MF pipe Hello/Welcome）。
 - who selects format。
 - object namespace。
-- ownership。
-- readiness。
-- registration semantics。
+- ownership / readiness / registration semantics。
 
 ## 5. Cross-process memory ordering 是协议
 
-当前 Rust producer 的 write_idx/read_idx/state 只经 `protocol/publication.rs`（SeqCst 32-bit atomic，等价 `Interlocked*`）发布；C++ consumer 用 `MemoryBarrier`。
+protocol contract = layout + ordering。不要只实现 `#[repr(C)]` structs 就认为兼容完成。
 
-所以 protocol contract = layout + ordering。
+跨进程 publish/observe 字段只经 SeqCst atomic helper（等价 Windows `Interlocked*`）：managed 用 `virtualcam-protocol/src/sync.rs`，OBS 用 `src/backend/windows/protocol/publication.rs`。必须考虑 ARM64，不依赖 x86 强内存顺序。
 
-不要只实现 `#[repr(C)]` structs 就认为兼容完成。
-
-Writer：
+Transport v2 ring（VCR2）：
 
 ```text
-advance/reserve sequence
-write timestamp/payload
-publication barrier
-publish readable index
-publish READY
+4 KiB header page（256-byte header）+ 4 KiB-aligned slots（64-byte slot header）
+writer: slot lock = 2s+1 -> write payload -> slot lock = 2s -> publish latest_seq
+reader: observe latest_seq -> read slot lock (even, matches) -> copy -> re-check lock
+        mismatch -> retry (≤4) -> Contended；never accept a torn frame
+writer 从不等待 reader；每个 producer session 用新 ring（generation 命名）
 ```
 
-Reader：
+OBS-compatible 3-slot queue（仅 OBS）没有 per-slot generation：writer 绕回 3 帧会覆盖 reader 已选 slot。oracle 在 `src/backend/windows/queue_writer.rs`（`lapping_writer_reuses_the_selected_slot_without_a_generation_marker`；ignored stress 2026-10-22 实测 26,376 次读取中 74 次 torn）。这是 OBS 上游 ABI，不改；managed 已因此改用 v2。
+
+## 6. DShow transport
+
+Namespace（`virtualcam-protocol/src/dshow.rs`）：
 
 ```text
-observe ready/index
-observation barrier
-validate
-read/copy payload
+Local\VirtualCamRs2-{ID}-Lease            event；存在即 single-writer lease，仅 producer 持有
+Local\VirtualCamRs2-{ID}-Control          128-byte DshowControl（magic "VCD2"，seqlock'd）
+Local\VirtualCamRs2-{ID}-Ring-{GEN:016X}  per-session VCR2 ring
 ```
 
-Pure Rust 后把 unsafe publication/observation 收敛进 managed-protocol helper。
-
-Windows-only v1 优先统一使用 Windows `Interlocked*` primitive 做跨进程 publish/observe fields，不让各 backend 自由混用不同 atomic strategy。
-
-必须考虑 ARM64，不依赖 x86 强内存顺序。
-
-当前 OBS-compatible 3-slot queue 没有 per-slot generation/seqlock。reader 读取一次 `read_idx` 后直接 memcpy；producer 连续绕回同一个 slot 时存在理论 torn-frame 窗口。
-
-规则：
-
-- Phase 0A 做 high-rate writer + deliberately slow reader + pattern/checksum stress。
-- Phase 2 不顺手改 ABI。
-- 若实测需要修，单独设计 protocol v2 + per-slot generation/seqlock。
-
-Phase 0A 已有 oracle（`src/backend/windows/queue_writer.rs`）：
-
-- `lapping_writer_reuses_the_selected_slot_without_a_generation_marker` 固定当前 ABI 性质：writer 绕回 3 帧后覆盖 reader 已选 slot。
-- `high_rate_writer_against_slow_reader_reports_torn_frames`（ignored）实测：2026-10-22，x64，640x480，无节流 writer ≈60k fps + 分块 yield 的慢 reader，3 s 内 26,376 次读取中 74 次 torn。torn 风险真实存在，但需要 reader 单次 copy 期间 writer 推进 ≥3 帧；正常 30/60 fps 下只在 consumer 线程被长时间挂起时出现。是否做 protocol v2 仍需单独决策，不在 DShow rewrite 中顺手改。
-
-## 6. DShow transport hard constraints
-
-Namespace：
-
-```text
-Local\VirtualCamRs-{CLSID}-Producer
-Local\VirtualCamRs-{CLSID}-Ready
-Local\VirtualCamRs-{CLSID}-Control
-Local\VirtualCamRs-{CLSID}-Data-{width}x{height}-{interval}
-```
-
-Control current ABI：
-
-- 32 bytes。
-- align 8。
-- magic VCMR。
-- version 1。
-- STARTING/READY/STOPPING。
-
-Data：
-
-- OBS-compatible 3 slots。
-- format-specific mapping。
-
-Format：
-
-- NV12 only。
-- tightly packed shared-memory source frame。
-- even dimensions。
-- no conversion。
+`DshowControl`：format（WireVideoFormat）、ring generation/slots/size、producer pid + process start time。
 
 Lifecycle：
 
-- one producer。
-- producer decides runtime width/height/fps。
-- registration 不固化 format。
-- idle 使用同一 Windows 用户、同一 CLSID 最近一次成功输出的格式；无有效历史时 640x480@30 black。已协商的 graph 格式仍固定。
-- connected graph mode fixed。
-- crash -> black。
-- corrupt active producer != idle。
+- one producer（第二个 -> `DeviceInUse`）。
+- producer decides runtime format；registration 只存可选 `default_format`。
+- idle advertised format 优先级：SetFormat > live producer > per-user last format（`HKCU\Software\VirtualCamRs\History\{ID}\LastFormat`）> registered default > NV12 640x480@30。
+- connected graph mode fixed；格式不同的 producer 在该 graph 上显示 black，同格式无需重连。
+- producer liveness = 打开 producer 进程（SYNCHRONIZE）+ 比对 creation time；死亡 -> black。
+- source 不做格式转换；RGB 自上而下输入，source 翻转为 bottom-up DIB 并处理 RGB24 DWORD 行对齐。
 
-## 7. DShow Rust implementation scope
+## 7. DShow source / registration contract
 
-至少：
+实现接口：IClassFactory、IBaseFilter/IMediaFilter/IPersist（raw HRESULT，paused `GetState` 返回 `VFW_S_CANT_CUE`）、IPin、IAMStreamConfig、IKsPropertySet、IEnumPins、IEnumMediaTypes、IMemInputPin downstream query、IMemAllocator negotiation（downstream 优先，`CLSID_MemoryAllocator` fallback）、Receive（尊重 `S_FALSE`）。
 
-- IClassFactory。
-- IBaseFilter/IMediaFilter/IPersist。
-- IPin。
-- IAMStreamConfig。
-- IKsPropertySet。
-- IEnumPins。
-- IEnumMediaTypes。
-- IMemInputPin downstream query。
-- IMemAllocator negotiation。
-- IMediaSample。
-- Receive。
+Filter strong-own pin，pin weak-ref filter。media types 同时提供 VIH 与 VIH2（DXVA colorimetry bits）。push thread 用 high-resolution waitable timer，无 catch-up burst。
 
-不要复制当前 libdshowcapture `OutputPin::QueryInterface(IID_IMemInputPin)` self-cast。
-
-Parity = observable behavior，不是逐行翻译。
-
-DirectShow registration/filter contract 保持 current baseline：
+Registration contract：
 
 ```text
 category = CLSID_VideoInputDeviceCategory
 merit    = MERIT_DO_NOT_USE
-
-REGFILTER2 version = 1
-cPins = 1
-pin:
-  rendered = FALSE
-  output   = TRUE
-  zero     = FALSE
-  many     = FALSE
-  media type = MEDIATYPE_Video / MEDIASUBTYPE_NV12
-
-runtime output pin IKsPropertySet:
-  AMPROPSETID_Pin / AMPROPERTY_PIN_CATEGORY
-    -> PIN_CATEGORY_CAPTURE
+REGFILTER2 version = 1, cPins = 1
+pin: rendered=FALSE output=TRUE zero=FALSE many=FALSE
+     media types = MEDIATYPE_Video / 每个 managed PixelFormat 的 subtype
+FilterData 由系统 IAMFilterData::CreateFilterData 生成，不手工构造
+runtime output pin IKsPropertySet: AMPROPERTY_PIN_CATEGORY -> PIN_CATEGORY_CAPTURE
+scope: CurrentUser = HKCU Classes（免提权）；AllUsers = HKLM（需提权）
 ```
 
-不要在 Rust rewrite 时改变这些可观察 registration/pin 语义。
+manager 调用 COM 时尊重调用线程现有 apartment（`src/managed/com.rs` `ComApartment`）；只有自己成功初始化才 `CoUninitialize`。
 
-DirectShow source 是 in-process COM DLL。
+COM registration：两个 DLL 的 InprocServer32 `ThreadingModel = Both`。`Both` 只是 registration model，不替代 MF FTM/agility。
 
-如果产品保留 32-bit consumer support，必须分别构建：
+两个 source DLL 的 `DllMain` 必须接近空：禁止 COM、registry、LoadLibrary、IPC、worker startup/join、blocking wait、对象构造。
 
-```text
-dshow-source-x64.dll
-dshow-source-x86.dll
-```
+Rust COM/FFI boundary 不传播 panic：export / class factory / COM method 最外层 `catch_unwind`（`guard`/`guard_hr`），panic -> stable HRESULT；外部输入和共享内存处理禁止 unwrap/expect/assert；不用 `panic=abort`。
 
-同 camera CLSID 分别注册到 64-bit / 32-bit WOW64 registry view，并验证两个 bitness 的 DirectShow category enumeration/activation。
+x86：目前不支持。若以后加入，必须单独构建 x86 DLL、注册到 WOW64 view、x64+x86 作为一个 logical transaction（失败回滚、list/get 识别 partial），x86 helper 不得再次获取 management mutex，不由 x64 手工构造 32-bit FilterData。
 
-若支持 x86，parent x64 transaction coordinator 持有全局 management mutex，x86 helper/process **不得再次获取同一个 transaction mutex**；helper 只执行 x86 COM/FilterMapper registration 并返回结构化结果。不要让 x64 manager 手工构造 32-bit FilterData blob。
+## 8. MF format model 与 DShow 不同
 
-x64+x86 management 是一个 logical transaction：snapshot 两边 -> mutate 两边 -> 两边都成功后才 commit metadata。任一失败回滚已成功一边；list/get 必须识别 partial/degraded registration。
+MF source 在 producer 不存在时也必须能被 Frame Server 枚举 media types，所以：
 
-`IAMStreamConfig`/media-type parity 不是“接口存在即可”。Phase 0A/2 至少覆盖 `GetFormat`、`GetNumberOfCapabilities`、`GetStreamCaps`、valid/invalid `SetFormat`、`IPin::QueryAccept`、`IEnumMediaTypes`，并分别覆盖 idle fallback 与 producer runtime mode。
+**每台 MF camera 一个持久化 native mode**（任一 managed `PixelFormat` + width/height + fps num/den + `ColorSpace`），以 `WireVideoFormat` blob 存于 vendor attribute。
 
-manager 调用 COM/`IFilterMapper2` 时必须尊重调用线程现有 COM apartment；只有自己成功初始化 apartment 时才负责对应 `CoUninitialize`，不能无条件 init/uninit。
-
-COM registration contract：
-
-```text
-dshow-source.dll InprocServer32 ThreadingModel = Both
-mf-source.dll    InprocServer32 ThreadingModel = Both
-```
-
-`Both` 只是 registration model，不替代 MF FTM/agility。
-
-两个 source DLL 的 `DllMain` 必须接近空 stub：只做必要 HMODULE 记录和可选 `DisableThreadLibraryCalls`。禁止 COM、registry、LoadLibrary、IPC 初始化、worker startup/join、blocking wait、allocator/source/filter construction；所有实质初始化延迟到正常 COM lifecycle，避免 loader-lock deadlock。
-
-Rust COM/FFI boundary 不能传播 panic：
-
-- release source DLL 使用可捕获 panic 的策略。
-- DLL export / class factory / COM method 最外层 `catch_unwind`。
-- panic -> stable HRESULT。
-- 外部输入和共享内存处理禁止依赖 unwrap/expect/assert。
-- `panic=abort` 不作为 in-process source DLL 默认策略。
-
-## 8. MF v1 的 format model 与 DShow 不同
-
-这是 hard constraint。
-
-MF source 在 producer 不存在时也必须能被 Frame Server 枚举 media types。
-
-所以 MF v1 采用：
-
-**每台 MF logical camera 一个持久化 native NV12 mode。**
-
-Record 包含：
-
-- width。
-- height。
-- fps numerator。
-- fps denominator。
-- NV12。
-
-source 只 advertise 这个 mode。
-
-producer open 必须匹配这个 mode。
-
-第一版禁止：
-
-- producer 任意改变 camera runtime mode。
-- dynamic capability mutation。
-- implicit resize/fps convert。
-
-native mode 创建后 immutable。修改 native mode = recreate camera transaction，不能只更新 metadata/vendor attributes，否则可能和已激活 FrameServer source 的旧 descriptor split-brain。
-
-future multi-mode 由 source/client selection 驱动，再通过 mf_control 告诉 producer。
+- source 只 advertise 这个 mode；producer open 必须匹配（否则 `FormatMismatch`）。
+- 禁止 producer 改变 runtime mode、dynamic capability mutation、implicit resize/fps convert。
+- native mode immutable。修改 = recreate camera，不能只更新 metadata/attributes，否则与已激活 FrameServer source 的旧 descriptor split-brain。
+- future multi-mode 由 source/client selection 驱动，再通知 producer。
 
 ## 9. MF source host
 
@@ -302,14 +173,14 @@ Local\VirtualCamRs-*
 
 作为 production MF IPC。
 
-候选：
+实现：
 
 ```text
-source creates Global\VirtualCamRs-MF-{TransportId}-{GenerationNonce}-...
-authenticated desktop producer attaches
+source 在 producer 认证成功后创建 Global\VirtualCamRs-MF-{GenerationNonce:032X}
+（同 session 时 fallback Local\），owner-only DACL，经 pipe Welcome 返回名字
 ```
 
-`TransportId` 只是 routing/config hint，不是 security capability。每个 source transport generation 由 source 生成高熵 `GenerationNonce`。
+`GenerationNonce` 由 source 生成（高熵），rendezvous id 只是 routing，不是 security capability。
 
 Named-object squatting hard rule：
 
@@ -318,9 +189,7 @@ Named-object squatting hard rule：
 - regenerate fresh source-owned nonce 或 fail activation。
 - mapping/event/semaphore/mutex 都做 pre-creation collision tests。
 
-Phase 0B 真机验证后冻结。
-
-MF source native architecture v1 scope：**x64-only**。ARM64 shared-memory ordering 仍保持正确，但不等于已经支持 ARM64 MF deployment。未来支持 Windows on ARM 时单独产出/register native `mf-source-arm64.dll` 并做真实 FrameServer activation/IPC tests。
+MF source native architecture v1 scope：**x64-only**。ARM64 shared-memory ordering 仍保持正确，但不等于已经支持 ARM64 MF deployment。未来支持 Windows on ARM 时单独产出/register native ARM64 `virtualcam_mf.dll` 并做真实 FrameServer activation/IPC tests。
 
 ## 10. MF CurrentUser-only v1
 
@@ -342,7 +211,7 @@ Session lifetime 未来必须用长期持有 `IMFVirtualCamera` 的 RAII handle 
 MF CurrentUser camera records 必须 user-scoped：
 
 ```text
-HKCU\Software\VirtualCamRs\ManagedCameras
+HKCU\Software\VirtualCamRs\Cameras\{ID}
 ```
 
 或等价 per-user protected storage。
@@ -359,7 +228,7 @@ v1 进一步禁止 source 侧 `symbolic-link -> owner HKCU` fallback：source �
 
 ## 12. MF fixed CLSID + IMFActivate
 
-固定 `mf-source.dll` COM CLSID。
+固定 `virtualcam_mf.dll` COM CLSID `{872FEE29-230E-41D8-83A7-2A383D956486}`（`virtualcam_protocol::mf::SOURCE_CLSID`）。
 
 Factory：
 
@@ -398,9 +267,9 @@ DLL：
 
 ThreadingModel=Both 不代表 object 可以无锁，也不代表对象天然满足 Media Foundation 的 cross-apartment/cross-process marshaling 要求。
 
-`MfSourceActivate` / `MfMediaSource` 必须是 free-threaded/neutral；优先验证聚合 Free-Threaded Marshaler（FTM）或等价 agile/free-threaded 策略。不要假设 `windows` crate 普通 `#[implement]` 自动提供 FTM。Phase 0B 必须在 MTA、多线程和 FrameServer cross-process activation 下验证 marshaling。
+`MfSourceActivate` / `MfMediaSource` 必须是 free-threaded/neutral：当前聚合 Free-Threaded Marshaler（`crates/virtualcam-mf/src/ftm.rs`，raw-vtable 转发 `IMarshal`）并实现 `IAgileObject`；FrameServer cross-process activation 已真机验证。不要假设 `windows` crate 普通 `#[implement]` 自动提供 FTM。
 
-同一个 `MfSourceActivate` 的重复 `ActivateObject` 行为必须 Phase 0B 实测；production 不允许无意创建两个互不关联、各自拥有 transport 的 source instance。若平台表现为 singleton-per-activation，则缓存复用。
+同一个 `MfSourceActivate` 的重复 `ActivateObject` 返回同一个缓存 source（直到它 Shutdown），不会创建两个互不关联、各自拥有 transport 的 source instance。
 
 MF source 同样必须有 panic boundary：所有 exports、factory、IMFActivate/source/stream/IKsControl/allocator callbacks 最外层 `catch_unwind`，panic 转 HRESULT，不能让 recoverable Rust panic 直接终止 FrameServer。
 
@@ -408,19 +277,17 @@ MF source 同样必须有 panic boundary：所有 exports、factory、IMFActivat
 
 Microsoft VirtualCamera sample 已使用 custom `IMFVirtualCamera::Set*` 属性向 source activation传配置。
 
-本项目使用**配置型** attributes：
+本项目使用**配置型** attributes（`virtualcam-protocol/src/mf.rs`）：
 
 ```text
-VIRTUALCAMRS_CAMERA_ID
-VIRTUALCAMRS_TRANSPORT_ID          # routing hint only
-VIRTUALCAMRS_RENDEZVOUS_ID         # high-entropy routing id, not authorization
-VIRTUALCAMRS_EXPECTED_OWNER_SID    # assertion only, never direct authorization
-VIRTUALCAMRS_PROTOCOL_VERSION
-VIRTUALCAMRS_NATIVE_WIDTH
-VIRTUALCAMRS_NATIVE_HEIGHT
-VIRTUALCAMRS_NATIVE_FPS_NUM
-VIRTUALCAMRS_NATIVE_FPS_DEN
+ATTR_CAMERA_ID
+ATTR_RENDEZVOUS_ID         # high-entropy routing id, not authorization
+ATTR_EXPECTED_OWNER_SID    # assertion only, never direct authorization
+ATTR_PROTOCOL_VERSION
+ATTR_NATIVE_FORMAT         # WireVideoFormat blob
 ```
+
+Rendezvous pipe：`\\.\pipe\VirtualCamRs-MF-{RID}`；Hello 64 B / Welcome 232 B fixed-size messages；handshake deadline 2 s。
 
 不要把 `OWNER_SID` vendor attribute 当 production authorization input。所有 custom attributes 都是 untrusted configuration：必须 bounds/version/overflow validation，不能直接决定 DACL。
 
@@ -470,7 +337,7 @@ v1 threat model 只承诺阻止 cross-user / remote / unauthenticated injection�
 - multiple users。
 - malicious/oversized/malformed attributes。
 
-如果必需 attributes 缺失/越界/版本不支持，source fail closed 或只进入安全 black 状态（Phase 0B 决定）；不从任意用户 HKCU 猜 runtime routing。symbolic link 只供 manager 做 system identity/reconcile/repair。
+如果必需 attributes 缺失/越界/版本不支持，`ActivateObject` fail closed（`SourceConfig::from_attributes` 返回错误）；不从任意用户 HKCU 猜 runtime routing。symbolic link 只供 manager 做 system identity/reconcile/repair。
 
 ## 14. MF creation tuple
 
@@ -490,7 +357,7 @@ Start 后保存 symbolic link。
 
 不要写死 `SYSTEM + owner`，也不要信 vendor `OWNER_SID`。
 
-Phase 0B 必须先验证 producer authentication / owner binding。real identity 来自 Windows token/impersonation/handle semantics，不来自 custom attributes。
+producer authentication / owner binding 已实现并真机验证（单用户）。real identity 来自 Windows token/impersonation/handle semantics，不来自 custom attributes。
 
 DACL/access mask 按 object type 分开：
 
@@ -547,7 +414,7 @@ RequestSample error signaling：
 - 没有对应 RequestSample 的后台/控制路径发现 fatal error -> 才 queue `MEError`。
 - no producer/stale producer -> black fallback，不是 fatal error。
 
-Phase 0B 先测 1080p30/60 等目标 mode 的 RequestSample latency。
+RequestSample latency 尚未专门测量；真机 640x360@30 端到端正常。
 
 只有同步路径确实阻塞 Frame Server/超过预算时，才单独引入 async：届时才需要 FIFO、Start generation、Stop/Shutdown cancellation 和 stale-work protection。
 
@@ -647,7 +514,7 @@ Stream attributes 至少验证：
 - `MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES = MFFrameSourceTypes_Color`
 - `MF_DEVICESTREAM_FRAMESERVER_SHARED = 1`，若目标 OS/SDK contract 支持并实测正确。
 
-Camera Profile 不默认照抄 sample：Phase 0B 测试“不发布 profile collection”与“发布 profile collection”两种路径。若发布，必须包含 `KSCAMERAPROFILE_Legacy`，且 filter 必须与本 camera 的真实 native mode 相容；不要直接复制 sample 的固定 30/60fps filter。
+Camera Profile：当前**不发布** profile collection（真机 Frame Server 可正常枚举/读取）。若发布，必须包含 `KSCAMERAPROFILE_Legacy`，且 filter 必须与本 camera 的真实 native mode 相容；不要直接复制 sample 的固定 30/60fps filter。
 
 Stream：
 
@@ -684,7 +551,7 @@ IMFMediaStream2 state：
 
 - RUNNING -> RequestSample 可产出 sample。
 - STOPPED -> RequestSample 必须 `MF_E_MEDIA_SOURCE_WRONGSTATE`。
-- PAUSED 与 source-level Pause 不等价，Phase 0B 按 FrameServer 实际行为再定。
+- `SetStreamState(PAUSED)` 被接受并记录；RequestSample 只在 RUNNING 产出（PAUSED 同样 `MF_E_MEDIA_SOURCE_WRONGSTATE`）。RUNNING 只能经 source Start 进入。
 - source-level Pause 返回 `MF_E_INVALID_STATE_TRANSITION`。
 
 Source/Stream ownership 与锁顺序：
@@ -706,27 +573,14 @@ Unsupported stubs：
 
 Seek unsupported。
 
-## 20. MF producer-first 仍待 Phase 0B 验证
+## 20. MF producer attach
 
-不要提前把 MF open 定义成必须 `ReceiverInactive`，但也不要认为 `GetMediaSource()` 本身已经启动 stream。
+实现为 lazy attach，不 keepalive：
 
-正确 spike：
-
-```text
-MFCreateVirtualCamera
-Start
-GetMediaSource
-CreatePresentationDescriptor/select native stream
-通过 SourceReader 或等价 shared-client pipeline 真正 Start/read
-MfMediaSource::Start
-transport / RequestSample active?
-```
-
-`GetMediaSource` 是 shared-client/reduced-function source，生命周期绑定 IMFVirtualCamera；取得 interface != stream running。
-
-测试 keepalive 是否影响其他 camera clients，以及 producer close 后如何释放 shared-client resources 而不 Remove system camera。
-
-如果可稳定激活 transport，producer API 保持 producer-first。
+- producer `open` 不启动 camera，也不调用 `GetMediaSource`。
+- producer 每 250 ms 尝试连接 rendezvous pipe；source 只在被 client Start 后才 listen。
+- 未连上时 `write_host -> WriteStatus::ConsumerInactive`、`is_ready() == false`。
+- 连上后 PeekNamedPipe 每 100 ms 检测 liveness；pipe 关闭 -> source 回 black、producer 重新等待。
 
 禁止用 exclusive `MFCreateDeviceSource` 作为常驻 keepalive，避免锁掉其他 camera clients。
 
@@ -740,23 +594,19 @@ Permanent delete 必须 Remove。
 
 v1 only tests System lifetime。Session lifetime仅作为 future RAII-handle design 的平台事实，不进入当前 manager contract。
 
-## 22. Old DirectShow camera migration
+## 22. 旧 C++ camera 清理 / source DLL 升级
 
-Phase 3 前不能直接删 old C++ DLL。
-
-默认 v1 选择 breaking migration：
+C++ driver 已删除。它注册的 camera（`HKLM\SOFTWARE\VirtualCamRs\ManagedCameras\{CLSID}`）只在旧 DLL 仍存在时可用：
 
 ```text
-unregister old camera while old DLL exists
-install Rust dshow-source
-recreate camera
+legacy_cameras()            列出 id/name/旧 DLL 路径
+remove_legacy_camera(id)    elevated；删除 category instance + COM class + record
+register(...)               重建（CLSID 改变，breaking migration）
 ```
 
-必须提供明确 cleanup/migration path。
+用户机器上的 "iPhone Camera" 来自其他项目（`iphone-usb-webcam`），不要删除。
 
-如果以后用户要求 preserve CLSID/system device identity，再设计 in-place InprocServer32 migration。
-
-source DLL update 优先采用版本化文件名 + registration 原子切换：新进程加载新 DLL，仍持有旧 DLL 的进程继续运行；确认旧版本不再被使用后再清理文件。不要默认覆盖正在被 FrameServer/第三方进程加载的 DLL。
+source DLL update 优先采用版本化文件名 + registration 切换：新进程加载新 DLL，仍持有旧 DLL 的进程继续运行；确认不再被使用后再清理文件。不要覆盖正在被 FrameServer/第三方进程加载的 DLL。
 
 ## 23. MF rename
 
@@ -780,89 +630,23 @@ API最终宜返回新 `ManagedCameraInfo`。
 
 CUDA producer仍直接 D2H到 shared slot。
 
-## 25. 实施顺序
+## 25. 未完成工作
 
-### Phase 0A
-
-DShow baseline + memory ordering oracle + 3-slot torn-frame stress + current bitness registration baseline。
-
-### Phase 0B
-
-MF architecture spike（v1 x64-only）：
-
-- activation/vendor attributes + repeated ActivateObject instance behavior。
-- formal `VIRTUALCAMRS_EXPECTED_OWNER_SID` assertion + `VIRTUALCAMRS_RENDEZVOUS_ID` routing attributes。
-- vendor attributes treated as untrusted configuration；malformed/oversized values严格校验。
-- free-threaded/FTM-or-equivalent marshaling in MTA/FrameServer。
-- same-store GetSourceAttributes/GetStreamAttributes semantics。
-- blocking GetEvent outside state lock。
-- source<->stream Shutdown 拆环 + Source->Stream lock hierarchy。
-- immutable native one-mode enumeration。
-- Camera Profile A/B strategy；发布 profiles 时 Legacy profile 与 native mode 相容。
-- required stream attributes。
-- required Start/Stop event set + valid state transitions；不锁死跨 queue 总顺序。
-- Start position validation。
-- IMFMediaStream2 RUNNING/STOPPED contract。
-- no EOS/EOP on normal live-camera transitions。
-- CurrentUser HKCU metadata仅 manager bookkeeping；source 不读 owner HKCU fallback。
-- Local Service/session0。
-- named pipe uses explicit DACL + first-instance + local-only + message mode + overlapped I/O；禁止 default pipe DACL。
-- bounded handshake must be read before `ImpersonateNamedPipeClient`。
-- token SID compare + impersonation-level validation + all-path `RevertToSelf`。
-- authentication is lazy/non-blocking：ActivateObject/Start 不等待 producer；未认证 producer 时继续 black。
-- stalled/malformed client deadline；rendezvous worker cancellation/Shutdown/`DllCanUnloadNow` lifecycle。
-- source-generated GenerationNonce only after authenticated attach。
-- Global named-object squatting/pre-creation rejection。
-- object-type-specific DACL/access masks。
-- cross-user/Fast User Switching isolation；same-user malicious process明确不在 v1 isolation guarantee。
-- synchronous RequestSample token + stopped `MF_E_MEDIA_SOURCE_WRONGSTATE` + non-duplicated error signaling + latency measurement。
-- preferred provided allocator lifecycle + standard MF fallback。
-- unsupported GetService/KsControl/SetD3DManager HRESULTs。
-- post-Shutdown `MF_E_SHUTDOWN` behavior。
-- pitch/timestamps。
-- producer-first GetMediaSource + actual shared-client Start/read。
-- multi-user System-camera uninstall/source-removal cleanup。
-- client compatibility。
-
-### Phase 1
-
-Rust DShow management，包括完整 REGFILTER2 v1 single-output-pin NV12 metadata、`CLSID_VideoInputDeviceCategory`、`MERIT_DO_NOT_USE`、COM apartment ownership、x64/x86 registry views 和 architecture-matched FilterMapper registration；若支持 x86，不由 x64 manager 手工伪造 32-bit FilterData。x64+x86 mutate 是一个 logical transaction，list/get 能识别 partial/degraded registration。
-
-### Phase 2
-
-Pure Rust DShow source，包括 x64/x86 artifact scope、panic boundary、module/object lock，以及 `IAMStreamConfig` / `IPin::QueryAccept` / media-type enumeration parity。
-
-### Phase 3
-
-old-camera migration/cleanup，然后删除 C++/CMake/libdshowcapture。
-
-### Phase 4
-
-Production MF source：同步 RequestSample 优先；只有 latency gate 证明必要才加 async work queue；同时实现 free-threaded/FTM-or-equivalent marshaling、repeated ActivateObject policy、required event/state contract、same-store attributes、GetEvent lock discipline、source<->stream Shutdown 拆环/锁层级、provided allocator lifecycle + standard MF fallback、non-duplicated error signaling、unsupported-interface HRESULTs、post-Shutdown `MF_E_SHUTDOWN` 和 panic boundary。
-
-### Phase 5
-
-MF manager：CurrentUser + System lifetime only。Session lifetime 未来单独 RAII handle。Source uninstall/upgrade 必须先清理或证明可安全保留所有指向该 source CLSID 的 System cameras；多用户 cleanup 不可靠时 fail safe，不先删除 source registration/DLL。
-
-### Phase 6
-
-Unified API / Auto。
+- 多用户 / Fast User Switching 下 MF 隔离与 source uninstall cleanup 的真机验证。
+- x86 DirectShow DLL（见 §7）；ARM64 构建。
+- `Auto` backend 选择 / 更高层统一 API。
+- MF multi-mode（§8 future）。
+- 若需要：RequestSample latency 超预算时才引入 async work queue（§16）。
 
 ## 26. API 不要伪统一
 
 不要强迫两个 backend registration语义一样。
 
-可能的方向：
+当前 API：
 
 ```rust
-ManagedCameraRegistration::DirectShow {
-    name,
-}
-
-ManagedCameraRegistration::MediaFoundation {
-    name,
-    native_stream,
-}
+ManagedCameraRegistration::DirectShow(DirectShowRegistration { name, scope, default_format })
+ManagedCameraRegistration::MediaFoundation(MediaFoundationRegistration { name, native_format })
 ```
 
 DShow stream format在 producer open时决定。
@@ -875,14 +659,13 @@ MF v1 native stream在 registration时决定；access 固定 CurrentUser，lifet
 
 1. git status。
 2. 读 AGENTS。
-3. 读 plan relevant phase。
-4. 读当前代码。
-5. 保护 user uncommitted changes。
-6. 小步改。
-7. 测试。
-8. review diff。
-9. 更新 docs。
-10. 按阶段分别 commit（D058）。
+3. 读当前代码。
+4. 保护 user uncommitted changes。
+5. 小步改。
+6. 测试。
+7. review diff。
+8. 更新 docs（README、CHANGELOG、`docs/USER_GUIDE.zh-CN.md`、本文件）。
+9. 按阶段分别 commit（D058）。
 
 禁止：
 
@@ -894,7 +677,7 @@ MF v1 native stream在 registration时决定；access 固定 CurrentUser，lifet
 ## 28. 决策记录
 
 ### D001
-DShow rewrite期间不改其 transport ABI。
+~~DShow rewrite期间不改其 transport ABI。~~ 被用户 2026-10-23 "性能优先、可自由重构" 取代，见 D054。
 
 ### D002
 Common只共享 frame queue/protocol primitives，不强制共享 control plane。
@@ -948,7 +731,7 @@ MF producer-first由 GetMediaSource + actual shared-client Start/read spike决�
 cross-process memory ordering是协议的一部分，Windows v1 优先统一 Interlocked publication helper。
 
 ### D019
-当前 3-slot queue torn-frame 风险先 stress，不在 DShow rewrite 中静默改 ABI。
+（managed 已改用 v2 ring，见 D054；本条仅约束 OBS 上游 ABI）当前 3-slot queue torn-frame 风险先 stress，不在 DShow rewrite 中静默改 ABI。
 
 ### D020
 旧 DShow registration在删 C++前必须 cleanup/migrate。
@@ -993,7 +776,7 @@ MF data-path errors use one signaling path: RequestSample HRESULT or background 
 If camera profiles are published, `KSCAMERAPROFILE_Legacy` is required and filters must match the camera's real native mode.
 
 ### D034
-Repeated `IMFActivate::ActivateObject` behavior is verified in Phase 0B; one activation object must not accidentally create multiple unrelated source/transport instances.
+Repeated `IMFActivate::ActivateObject` returns the cached source; one activation object must not accidentally create multiple unrelated source/transport instances.
 
 ### D035
 Unsupported MF services/controls return explicit contract HRESULTs; post-Shutdown methods return `MF_E_SHUTDOWN` without touching released state.
@@ -1002,7 +785,7 @@ Unsupported MF services/controls return explicit contract HRESULTs; post-Shutdow
 MF vendor attributes are untrusted configuration, never producer identity/authorization. `OWNER_SID` is not a production authorization attribute.
 
 ### D037
-MF production transport requires an authenticated producer-binding design based on Windows token/impersonation/handle semantics before Phase 4; HKCU is manager bookkeeping only.
+MF production transport requires an authenticated producer-binding design based on Windows token/impersonation/handle semantics ; HKCU is manager bookkeeping only.
 
 ### D038
 Source-owned Global named objects use a source-generated generation nonce and reject same-type `ERROR_ALREADY_EXISTS` and cross-type `ERROR_INVALID_HANDLE` namespace collisions; never reuse pre-existing objects.
@@ -1066,6 +849,9 @@ DShow 支持 per-user（HKCU，免提权）与 machine-wide（HKLM）注册；Fi
 
 ### D058
 提交按阶段拆分（protocol / DShow management / DShow source / MF / migration / docs），不做一次性大提交。
+
+### D059
+实现完成后删除 `WINDOWS_NATIVE_VIRTUAL_CAMERA_PLAN.md`（git 历史可查）；设计约束以本文件为准，用户文档为 README 与 `docs/USER_GUIDE.zh-CN.md`。
 
 ## 29. 官方参考
 
