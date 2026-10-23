@@ -80,6 +80,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtualcam-dshow"
+version = "0.1.0"
+dependencies = [
+ "virtualcam-protocol",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "virtualcam-protocol"
 version = "0.1.0"
 

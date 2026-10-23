@@ -9,7 +9,7 @@ keywords = ["virtual-camera", "obs", "unity", "cuda", "windows"]
 categories = ["multimedia::video", "os::windows-apis"]
 
 [workspace]
-members = [".", "crates/virtualcam-protocol"]
+members = [".", "crates/virtualcam-protocol", "crates/virtualcam-dshow"]
 
 [features]
 default = []

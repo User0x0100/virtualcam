@@ -1,0 +1,31 @@
+[package]
+name = "virtualcam-dshow"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust DirectShow source filter for virtualcam managed cameras"
+license = "MIT"
+publish = false
+
+[lib]
+name = "virtualcam_dshow"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+virtualcam-protocol = { path = "../virtualcam-protocol" }
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media",
+    "Win32_Media_DirectShow",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
