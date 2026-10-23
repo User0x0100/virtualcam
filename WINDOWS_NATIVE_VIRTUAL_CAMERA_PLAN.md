@@ -1,6 +1,6 @@
 # Windows 原生虚拟摄像头双后端实施规划
 
-> 状态：Phase 1–5 已实施（见 §0），Phase 0B 的真机 Frame Server 项待验证  
+> 状态：Phase 1–5 已实施（见 §0），真机 Frame Server 单用户已验证，多用户待验证  
 > 文档版本：v11  
 > 基线日期：2026-10-04  
 > 适用仓库：`virtualcam`
@@ -16,7 +16,7 @@
 | Phase | 状态 | 实现 |
 | --- | --- | --- |
 | 0A | 完成 | OBS queue oracle + torn-frame stress（`src/backend/windows/queue_writer.rs`）；结论驱动 transport v2 |
-| 0B | 部分 | MF contract 与 in-process `IMFSourceReader` 端到端测试通过；真机 Frame Server / Session 0 / 多用户需 elevated install 后跑 `tests/windows_mf.rs` |
+| 0B | 部分 | MF contract 与 in-process `IMFSourceReader` 端到端测试通过；2026-10-24 真机 Frame Server（Local Service / Session 0）端到端逐字节通过（`tests/windows_mf.rs`，单用户 x64）。多用户 / Fast User Switching 未验证 |
 | 1 | 完成 | `src/managed/dshow.rs`：HKCU（免提权）/HKLM 注册，系统 `IAMFilterData` 生成 FilterData，REGFILTER2 v1 / `MERIT_DO_NOT_USE` / `CLSID_VideoInputDeviceCategory` |
 | 2 | 完成（x64） | `crates/virtualcam-dshow`；FFmpeg 端到端逐字节验证；x86 DLL 未做 |
 | 3 | 完成 | `src/managed/legacy.rs` 列出/删除旧 C++ camera；`native/managed-virtualcam` 已删除 |

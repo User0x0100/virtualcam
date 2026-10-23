@@ -109,7 +109,7 @@ Cameras registered by the previous C++ DirectShow DLL keep working only while th
 - x64 only. There is no x86 DirectShow DLL yet (32-bit DirectShow apps do not see managed cameras) and no ARM64 build.
 - FFmpeg's `dshow` demuxer does not implement P010; other DirectShow consumers may.
 - `uninstall_media_foundation_source` cannot enumerate other Windows users' cameras; it refuses unless told they were cleaned.
-- The Frame Server path is covered by an opt-in test that needs the source installed (elevated); the rest of the MF contract is tested in-process.
+- The Frame Server path is covered by an opt-in test that needs the source installed (elevated); it is verified for a single user, not yet across multiple Windows users. Frame Server shows the camera under its name plus a localized " (Windows Virtual Camera)" suffix.
 
 ## Independent backend controls
 

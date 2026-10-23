@@ -50,6 +50,12 @@ fn video_devices() -> Vec<(String, IMFActivate)> {
     }
 }
 
+/// Frame Server appends a localized suffix such as " (Windows Virtual
+/// Camera)" to the registered friendly name.
+fn is_camera(device: &str, name: &str) -> bool {
+    device.strip_prefix(name).is_some_and(|rest| rest.is_empty() || rest.starts_with(" ("))
+}
+
 #[test]
 #[ignore = "requires the Media Foundation source installed machine-wide (elevated, once)"]
 fn frame_server_camera_delivers_producer_frames() {
@@ -90,7 +96,7 @@ fn frame_server_camera_delivers_producer_frames() {
         })
     };
 
-    let (_, device) = video_devices().into_iter().find(|(device, _)| *device == name).expect("Frame Server lists the camera");
+    let (_, device) = video_devices().into_iter().find(|(device, _)| is_camera(device, &name)).expect("Frame Server lists the camera");
     // SAFETY: Activating the enumerated device and reading synchronously.
     let matched = unsafe {
         let source = device.ActivateObject::<windows::Win32::Media::MediaFoundation::IMFMediaSource>().expect("activate");
@@ -117,5 +123,5 @@ fn frame_server_camera_delivers_producer_frames() {
     assert!(matched, "producer frame never arrived through Frame Server ({written} frames written)");
 
     manager.unregister(info.id).expect("unregister");
-    assert!(video_devices().iter().all(|(device, _)| *device != name), "camera removed");
+    assert!(video_devices().iter().all(|(device, _)| !is_camera(device, &name)), "camera removed");
 }
