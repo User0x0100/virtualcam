@@ -1,9 +1,42 @@
 # Windows 原生虚拟摄像头双后端实施规划
 
-> 状态：已完成第九轮架构审查，待实施  
-> 文档版本：v10  
+> 状态：Phase 1–5 已实施（见 §0），Phase 0B 的真机 Frame Server 项待验证  
+> 文档版本：v11  
 > 基线日期：2026-10-04  
 > 适用仓库：`virtualcam`
+
+## 0. 实施状态（2026-10-23）
+
+本文其余部分是 v10 架构规划，保留作为设计依据。实现时用户追加了三项要求，**覆盖**下文对应约束：
+
+1. 多格式：NV12/I420/YUY2/UYVY/P010/BGRA32/RGB24 + `ColorSpace` 元数据（覆盖 D052 "NV12 only"）。
+2. App ID：`AppId` + `ManagedCameraManager::for_app` 按程序区分/查询注册（不是鉴权）。
+3. 性能优先、可自由重构：managed backend 不再沿用 OBS-compatible 3-slot queue 与 DShow control v1 ABI（覆盖 D001/D019 "不改 ABI"），改用 transport v2。
+
+| Phase | 状态 | 实现 |
+| --- | --- | --- |
+| 0A | 完成 | OBS queue oracle + torn-frame stress（`src/backend/windows/queue_writer.rs`）；结论驱动 transport v2 |
+| 0B | 部分 | MF contract 与 in-process `IMFSourceReader` 端到端测试通过；真机 Frame Server / Session 0 / 多用户需 elevated install 后跑 `tests/windows_mf.rs` |
+| 1 | 完成 | `src/managed/dshow.rs`：HKCU（免提权）/HKLM 注册，系统 `IAMFilterData` 生成 FilterData，REGFILTER2 v1 / `MERIT_DO_NOT_USE` / `CLSID_VideoInputDeviceCategory` |
+| 2 | 完成（x64） | `crates/virtualcam-dshow`；FFmpeg 端到端逐字节验证；x86 DLL 未做 |
+| 3 | 完成 | `src/managed/legacy.rs` 列出/删除旧 C++ camera；`native/managed-virtualcam` 已删除 |
+| 4 | 完成（待真机） | `crates/virtualcam-mf`：同步 RequestSample、FTM、named-pipe 认证 rendezvous、owner-only ring |
+| 5 | 完成 | `src/managed/mf.rs`：CurrentUser + System lifetime，rename = recreate，source install/uninstall |
+| 6 | 部分 | 统一 `ManagedCameraManager`；`Auto` backend 选择未做 |
+
+Transport v2（`crates/virtualcam-protocol`）：
+
+```text
+DShow:  Local\VirtualCamRs2-{ID}-Lease      producer-only event
+        Local\VirtualCamRs2-{ID}-Control    128-byte seqlock'd control (format, ring generation, producer pid + start time)
+        Local\VirtualCamRs2-{ID}-Ring-{GEN} VCR2 ring
+MF:     \.\pipe\VirtualCamRs-MF-{RID}      explicit DACL, first instance, token SID check
+        Global\ (same session: Local\) ring, owner-only DACL, source-generated name
+Ring:   4 KiB header page + 4 KiB-aligned slots, per-slot seqlock (2s+1 writing / 2s done),
+        latest_seq published last, reader retries and never accepts a torn frame
+```
+
+已知限制：x64-only（无 x86 DShow DLL、无 ARM64）；FFmpeg dshow demuxer 不支持 P010；`uninstall_media_foundation_source` 无法枚举其他用户的 camera，需调用方声明已清理。
 
 ## 1. 项目目标
 

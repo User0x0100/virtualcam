@@ -1,84 +1,115 @@
 # virtualcam
 
-`virtualcam` is a Rust 2024 library for Windows virtual cameras. It can write directly to installed OBS/Unity Capture shared-memory protocols and can also manage this repository's independent NV12 DirectShow camera driver.
+`virtualcam` is a Rust 2024 library for Windows virtual cameras. It registers and feeds its **own** virtual cameras — pure Rust DirectShow and Media Foundation sources, with common pixel formats, colorimetry, resolutions, and frame rates — and can also write to the installed OBS Virtual Camera and Unity Capture shared-memory protocols.
 
-| Backend | Input | Layout |
+| Backend | Input formats | Layout |
 | --- | --- | --- |
-| Managed NV12 DirectShow camera | NV12 | tightly packed Y plane, then interleaved UV |
+| Managed DirectShow camera | NV12, I420, YUY2, UYVY, P010, BGRA32, RGB24 | tightly packed (see `PixelFormat::layout`) |
+| Managed Media Foundation camera | same set; one immutable native mode per camera | tightly packed |
 | OBS Virtual Camera | NV12 | tightly packed Y plane, then interleaved UV |
 | Unity Capture | RGBA8, RGBA FP16 gamma, or RGBA FP16 linear | tight or explicitly padded rows |
 
-The Rust producer path does no scaling, pixel conversion, or color conversion. Managed camera registration stores only persistent device identity; each producer session selects one NV12 width/height/frame-rate before a DirectShow consumer connects. The native DLL owns only output pacing and copies the selected NV12 queue slot into the consumer sample. Unity's receiver can optionally scale or mirror after receiving a frame.
+Producers never scale or convert pixels. Sources copy each tightly packed frame straight into the consumer's buffer, honoring its pitch row by row (one `memcpy` when the layouts match); colorimetry is signaled as metadata only.
 
-## Managed independent NV12 cameras
+## Managed cameras
 
-`native/managed-virtualcam` builds a DirectShow in-process COM DLL derived around OBS/libdshowcapture's output-filter infrastructure. It does **not** reuse OBS's CLSID or `OBSVirtualCamVideo` object name. One DLL can back multiple simultaneously registered cameras because every registration gets:
+The workspace builds two COM source DLLs and the library that manages them:
 
-- a generated, independent COM CLSID;
-- an arbitrary DirectShow friendly name;
-- its own `Local\\VirtualCamRs-{CLSID}` runtime-object namespace.
-
-Producers opened this way report `CameraType::ManagedDirectShow`. `CameraType` is `#[non_exhaustive]` because a Media Foundation managed backend is planned (see [WINDOWS_NATIVE_VIRTUAL_CAMERA_PLAN.md](WINDOWS_NATIVE_VIRTUAL_CAMERA_PLAN.md)); it will fix one native mode at registration instead of per producer session.
-
-Width, height, and frame rate are not part of registration. Managed runtime ABI v3 separates lifecycle from frame storage: `-Producer` is the single-writer lease, `-Ready` publishes a complete session, `-Control` is a fixed 32-byte format declaration, and the OBS-compatible three-slot frame queue is named `-Data-{width}x{height}-{interval}`. This lets an old DirectShow graph keep its prior mapping open while a later producer for the same CLSID starts at a larger or otherwise different format without inheriting the old section's capacity. The DirectShow DLL reads the control plane only after the producer claim and Ready event are signaled, so startup races cannot expose partially initialized format metadata.
-
-Build the x64 DLL first, then keep it at the stable application-local path that will own the managed cameras. Machine-wide COM registration mutations still require an elevated process.
+| | DirectShow (`virtualcam_dshow.dll`) | Media Foundation (`virtualcam_mf.dll`) |
+| --- | --- | --- |
+| Seen by | DirectShow apps: FFmpeg `dshow`, OpenCV `CAP_DSHOW`, OBS, legacy conferencing apps | Frame Server apps: Windows Camera, browsers, Teams, WinRT `MediaCapture`, `IMFSourceReader` |
+| Install | none; each registration points at the DLL | once per machine, elevated: `install_media_foundation_source` |
+| Registration | `CurrentUser` (no elevation) or `AllUsers` (elevated) | per-user (`CurrentUser` access, `System` lifetime), no elevation |
+| Format | chosen by the producer for each session | one immutable native mode fixed at registration |
+| Transport | producer-owned, session-local | source-owned, authenticated, cross-session |
 
 ```powershell
-cmake -S native/managed-virtualcam -B native/managed-virtualcam/build -G "Visual Studio 18 2026" -A x64
-cmake --build native/managed-virtualcam/build --config Release
-$driverDir = Join-Path $PWD 'my-app'
-New-Item -ItemType Directory -Force $driverDir | Out-Null
-Copy-Item native/managed-virtualcam/build/Release/virtualcam-managed.dll $driverDir/virtualcam-managed.dll -Force
+cargo build --release -p virtualcam-dshow -p virtualcam-mf
+# -> target\release\virtualcam_dshow.dll, target\release\virtualcam_mf.dll
 ```
 
-Then manage devices through the public Rust API:
+### Application ids
+
+Every camera can carry an `AppId` (`A-Z a-z 0-9 . _ -`, up to 128 chars). A manager created with `ManagedCameraManager::for_app` stamps its id on new cameras and only sees cameras with that id; `ManagedCameraManager::new()` sees everything. It is a namespace to tell programs' cameras apart, not a security boundary.
 
 ```rust,no_run
-use virtualcam::{
-    ManagedCameraConfig, ManagedCameraManager, ManagedStreamConfig, ObsFrameRate,
-    WriteStatus,
-};
+use virtualcam::{AppId, ColorSpace, DirectShowRegistration, FrameRate, ManagedCameraManager, PixelFormat, VideoFormat, WriteStatus};
 
 # fn run() -> Result<(), virtualcam::Error> {
-let manager = ManagedCameraManager::new(
-    r"C:\path\to\my-app\virtualcam-managed.dll",
-);
-let info = manager.register(ManagedCameraConfig {
-    name: "FaceSwap Output".into(),
-})?;
+let manager = ManagedCameraManager::for_app(AppId::new("com.example.studio")?)
+    .with_dshow_source(r"C:\Program Files\Studio\virtualcam_dshow.dll");
 
-let mut camera = manager.open(
-    info.id,
-    ManagedStreamConfig {
-        width: 1080,
-        height: 1920,
-        frame_rate: ObsFrameRate { numerator: 60, denominator: 1 },
-    },
-)?;
-let nv12 = vec![0_u8; camera.frame_size()];
-assert_eq!(camera.write_host(&nv12)?, WriteStatus::Written);
+// Per-user DirectShow camera: no elevation needed.
+let info = manager.register(DirectShowRegistration::new("Studio Cam"))?;
+
+// Each producer session picks its own format.
+let format = VideoFormat::new(PixelFormat::Yuy2, 1280, 720, FrameRate::fps(60)).with_color(ColorSpace::BT709);
+let mut camera = manager.open(info.id, format)?;
+let frame = vec![0_u8; camera.frame_size()];
+assert_eq!(camera.write_host(&frame)?, WriteStatus::Written);
 camera.close()?;
 
-// The registration and CLSID stay unchanged. A later producer session may use
-// another format before the next DirectShow consumer connects.
-let mut camera = manager.open(
-    info.id,
-    ManagedStreamConfig {
-        width: 2560,
-        height: 1440,
-        frame_rate: ObsFrameRate { numerator: 30, denominator: 1 },
-    },
-)?;
-camera.close()?;
-
-manager.rename(info.id, "FaceSwap Main")?;
+// Only this application's cameras.
+for camera in manager.list()? {
+    println!("{} {} {:?}", camera.id, camera.name, camera.health);
+}
+manager.rename(info.id, "Studio Cam Main")?;
 manager.unregister(info.id)?;
 # Ok(())
 # }
 ```
 
-`register`, `unregister`, `rename`, `get`, and `list` are persistent management operations. Registration uses DirectShow's filter mapper and writes system COM registration, so register/rename/unregister normally require elevation; read/open operations do not. `open` selects one managed ABI v3 runtime session. Before creating it, Rust resolves the camera's actual `HKCR\\CLSID\\{id}\\InprocServer32` target and verifies that the DLL COM will load implements ABI v3; the manager's own DLL path is not treated as authoritative for an existing registration. A registered camera can be opened by DirectShow/OpenCV before any producer exists: the native filter advertises the last successfully published NV12 mode for that CLSID and current Windows user, falling back to `640x480@30` when no valid history exists, and emits black frames. Format history is a per-user, versioned binary registry value under `HKCU\\Software\\VirtualCamRs\\ManagedCameraFormats\\{CLSID}`, written once after the first successful frame in each managed producer session; it does not require elevation. A connected graph keeps its negotiated mode; a later matching producer can attach without reconnecting, while another format requires reopening the consumer. Old format-specific data mappings no longer constrain a later producer's mapping size. The receiver also checks producer-lease liveness when frames stop advancing, so an abnormally terminated producer falls back to black instead of freezing its last frame indefinitely. Mutating operations are serialized across processes, and rollback restores the original registered `InprocServer32` path rather than substituting whichever compatible manager DLL initiated the mutation. The native DLL resolves its loaded module through a file handle and persists `InprocServer32` as a normal canonical local DOS full path rather than a `\\?\...` spelling. The DLL may be app-local on a local drive instead of living under Program Files; UNC/network module paths are rejected. Keep that application directory stable for as long as a registration exists, or unregister/re-register after moving it. Because the registration is machine-wide, the application is responsible for the trust and update policy of the directory containing the registered DLL. Existing OBS Virtual Camera registration is untouched. The first native build target is x64; supporting 32-bit DirectShow consumers requires a corresponding x86 DLL/registry view.
+Media Foundation cameras fix their format at registration because Frame Server enumerates media types before any producer exists:
+
+```rust,no_run
+use virtualcam::{FrameRate, ManagedCameraManager, MediaFoundationRegistration, PixelFormat, VideoFormat, WriteStatus};
+
+# fn run() -> Result<(), virtualcam::Error> {
+// Once per machine, elevated, from a folder Local Service can read:
+// ManagedCameraManager::install_media_foundation_source(r"C:\Program Files\Studio\virtualcam_mf.dll")?;
+let manager = ManagedCameraManager::new();
+let native = VideoFormat::new(PixelFormat::Nv12, 1920, 1080, FrameRate::fps(30));
+let info = manager.register(MediaFoundationRegistration::new("Studio MF Cam", native))?;
+let mut camera = manager.open_registered(info.id)?; // `open` with any other format: FormatMismatch
+let frame = vec![0_u8; camera.frame_size()];
+// ConsumerInactive until an application starts the camera; then Written.
+let _status: WriteStatus = camera.write_host(&frame)?;
+# Ok(())
+# }
+```
+
+### Formats and colorimetry
+
+| `PixelFormat` | Layout (tightly packed) | DirectShow subtype | MF subtype |
+| --- | --- | --- | --- |
+| `Nv12` | Y, then interleaved UV (4:2:0) | `NV12` | `NV12` |
+| `I420` | Y, U, V planes (4:2:0) | `I420` (accepts `IYUV`) | `I420` |
+| `Yuy2` / `Uyvy` | packed 4:2:2 | `YUY2` / `UYVY` | `YUY2` / `UYVY` |
+| `P010` | 16-bit LE words, data in the high 10 bits; Y, then UV | `P010` | `P010` |
+| `Bgra32` | `B G R A`, top-down | `RGB32` (bottom-up DIB, flipped by the source) | `RGB32` |
+| `Rgb24` | `B G R`, top-down, no row padding | `RGB24` (DWORD-aligned DIB rows) | `RGB24` |
+
+`ColorSpace` (matrix, range, primaries, transfer) defaults per format and height (`BT601` SD, `BT709` HD, `BT2020` for P010, `SRGB` for RGB) and has presets including `BT709_FULL`, `BT2100_PQ`, and `BT2100_HLG`. It is published as `VIDEOINFOHEADER2` DXVA extended-format bits (DirectShow) and `MF_MT_*` attributes (Media Foundation), and selects the black level (limited Y=16 / full Y=0) of idle frames. Dimensions up to 16384, rates from one frame per minute to 1000 fps.
+
+### Runtime behavior
+
+- **Idle cameras** emit black. A DirectShow camera advertises the live producer's format, else this user's last published format for that camera, else the registered `default_format`, else NV12 640x480@30. `IAMStreamConfig::SetFormat` lets a consumer pick any format before connecting.
+- A connected DirectShow graph keeps its negotiated format; a producer with another format shows black there until the graph reconnects. Producers with the same format attach without reconnecting.
+- **One producer per camera** (`Error::DeviceInUse` otherwise). A crashed producer is detected (process handle + creation time / pipe closure) and consumers fall back to black.
+- **Transport v2**: every session writes a fresh ring whose slots are guarded by a sequence lock, so consumers never accept a torn frame and the writer never waits. DirectShow delivery is paced by a high-resolution timer without catch-up bursts.
+- **Media Foundation producers** attach lazily: `write_host` returns `ConsumerInactive` (and `is_ready` is `false`) until a client starts the camera. The source authenticates the producer's Windows token against the camera owner on a DACL-protected pipe and hands it a ring created with an owner-only DACL; another user cannot inject frames.
+- Every exported function and COM method is panic-guarded; `DllMain` does nothing.
+
+### Migrating cameras of the retired C++ driver
+
+Cameras registered by the previous C++ DirectShow DLL keep working only while that DLL exists. `ManagedCameraManager::legacy_cameras()` lists them; `remove_legacy_camera(id)` (elevated) removes one, after which a new camera can be registered. The CLSID changes.
+
+### Scope and limitations
+
+- x64 only. There is no x86 DirectShow DLL yet (32-bit DirectShow apps do not see managed cameras) and no ARM64 build.
+- FFmpeg's `dshow` demuxer does not implement P010; other DirectShow consumers may.
+- `uninstall_media_foundation_source` cannot enumerate other Windows users' cameras; it refuses unless told they were cleaned.
+- The Frame Server path is covered by an opt-in test that needs the source installed (elevated); the rest of the MF contract is tested in-process.
 
 ## Independent backend controls
 
@@ -148,10 +179,10 @@ buffering are not shared-memory camera controls. They are intentionally absent
 because this crate receives an already accessible host or CUDA buffer instead
 of a Unity `ID3D11Texture2D`.
 
-Every frame must contain exactly `camera.frame_size()` bytes. OBS and managed
-NV12 width and height must both be even.
+Every frame must contain exactly `camera.frame_size()` bytes. 4:2:0 formats
+need even width and height, 4:2:2 formats an even width.
 
-`is_ready()` follows what each upstream protocol can actually report. Unity returns `false` until its DirectShow receiver has created the required objects. OBS has no consumer-presence handshake, so its producer is ready as soon as its queue is open.
+`is_ready()` follows what each protocol can actually report. Unity returns `false` until its DirectShow receiver has created the required objects, and a managed Media Foundation camera until a client started it and the producer attached. OBS and managed DirectShow have no consumer-presence handshake, so their producers are ready as soon as they are open.
 
 Like OBS Studio's own `virtualcam_start`, a successful `open_obs` records the producer mode as `{width}x{height}x{interval}` in `%APPDATA%\obs-virtualcam.txt` (replaced through a temporary file). The OBS DirectShow filter reads that file when a consumer opens the camera while no producer queue exists, so consumer-first applications negotiate this producer's resolution and frame rate instead of scaling from a stale mode. Unlike upstream, the file is written only after the queue was created, so an open rejected with `DeviceInUse` never overwrites the active producer's mode. A failure to write it is not an error.
 
@@ -289,7 +320,7 @@ The caller guarantees there is no other active producer. `force_open` cannot est
 
 | Platform | Compiles | Runtime behavior |
 | --- | --- | --- |
-| Windows | yes | managed NV12 DirectShow driver plus OBS and Unity Capture producers |
+| Windows | yes | managed DirectShow and Media Foundation cameras plus OBS and Unity Capture producers |
 | Linux | yes | backend-specific open methods return `UnsupportedPlatform` |
 | macOS | yes | backend-specific open methods return `UnsupportedPlatform` |
 
@@ -336,9 +367,16 @@ reader observes a torn frame:
 cargo test --release --lib high_rate_writer_against_slow_reader -- --ignored --nocapture
 ```
 
-A separate ignored integration test performs the full managed-camera lifecycle: it registers two independent devices, renames one, verifies both through FFmpeg's DirectShow enumeration, opens independent NV12 producer queues, then captures the same CLSID first at `320x240@30` and later at `240x320@25` without re-registering it. It finally unregisters both devices. Run from an elevated shell after building the DLL:
+Managed cameras have two more opt-in suites. The DirectShow suite registers per-user cameras (no elevation), checks FFmpeg enumeration, sends every format FFmpeg supports byte-exact through a real DirectShow graph (including bottom-up RGB and DIB row padding), checks idle black at the registered default, crash-to-black with last-format idle, app-id isolation, rename, and unregister:
 
 ```powershell
-$env:VIRTUALCAM_MANAGED_DRIVER = "$PWD\native\managed-virtualcam\build\Release\virtualcam-managed.dll"
-cargo test --all-features --test windows_managed -- --ignored --nocapture
+cargo test --release --test windows_dshow -- --ignored --test-threads=1
 ```
+
+The Media Foundation contract (activation, attributes, events, `RequestSample`, shutdown) and an in-process end-to-end run through `IMFSourceReader` with the real producer and authenticated rendezvous are part of the default suite. The Frame Server test needs the source installed (see `tests/windows_mf.rs`):
+
+```powershell
+cargo test --test windows_mf -- --ignored
+```
+
+`cargo run --example managed_camera -- register|list|stream|unregister|legacy|remove-legacy ...` exercises the manager from the command line.

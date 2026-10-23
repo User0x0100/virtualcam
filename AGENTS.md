@@ -12,43 +12,34 @@
 
 1. OBS Virtual Camera producer。
 2. Unity Capture producer。
-3. Managed camera：
-   - 当前 source 仍是 C++ DirectShow + libdshowcapture-derived。
-   - 目标 Pure Rust DirectShow + Media Foundation。
+3. Managed camera（pure Rust）：
+   - DirectShow：`crates/virtualcam-dshow` -> `virtualcam_dshow.dll`。
+   - Media Foundation：`crates/virtualcam-mf` -> `virtualcam_mf.dll`。
 
 OBS backend != managed DShow backend。
 
 ## 2. 当前事实
 
-当前 Rust：
+Workspace：
 
-- `src/managed/mod.rs`：ManagedCameraId、registration/stream config、`ManagedCameraManager`。
-- `src/managed/native_driver.rs`：C++ management ABI v3 FFI client（Phase 1 用 Rust registration 替换）。
-- `src/backend/windows/obs.rs`：OBS producer（`OBSVirtualCamVideo`、occupancy、`obs-virtualcam.txt` hint）。
-- `src/backend/windows/managed_dshow/`：managed DShow producer（Producer/Ready/Control/Data lifecycle + per-user last-format history）。
-- `src/backend/windows/queue_writer.rs`：OBS 与 managed DShow 共享的 3-slot queue writer。
-- `src/backend/windows/unity_capture.rs`
-- `src/backend/windows/protocol/frame_queue.rs`：OBS-compatible queue layout。
-- `src/backend/windows/protocol/publication.rs`：跨进程 publish/observe helper。
-- `src/backend/windows/protocol/dshow_control.rs`：DShow control header + object names。
-- `src/platform/windows.rs`
+- `crates/virtualcam-protocol`：`CameraId`、`PixelFormat`/`ColorSpace`/`VideoFormat`/`WireVideoFormat`、plane layout + pitch-aware copy/black、transport v2 seqlock ring（`ring.rs`）、DShow control/names（`dshow.rs`）、MF attributes/pipe messages/names（`mf.rs`）、registry schema。只含 layout/name/ordering，不持有 handle。
+- `crates/virtualcam-dshow`：DirectShow source filter cdylib（filter/pin/IAMStreamConfig/IKsPropertySet/allocator/push thread）。
+- `crates/virtualcam-mf`：MF source cdylib（IMFActivate + FTM、IMFMediaSourceEx、IMFMediaStream2、named-pipe rendezvous、owner-only ring）。
+- root `virtualcam`：
+  - `src/managed/mod.rs`：`AppId`、`ManagedCameraRegistration::{DirectShow, MediaFoundation}`、`ManagedCameraManager`（`for_app` scoping、register/unregister/rename/list/get/open/open_registered、MF source install/uninstall、legacy）。
+  - `src/managed/dshow.rs`：HKCU/HKLM COM + category instance + 系统 `IAMFilterData` FilterData。
+  - `src/managed/mf.rs`：`MFCreateVirtualCamera`（CurrentUser + System）。
+  - `src/managed/metadata.rs`：`{HKCU|HKLM}\Software\VirtualCamRs\Cameras\{ID}` records；`Global\VirtualCamRs-Management` mutex。
+  - `src/managed/legacy.rs`：旧 C++ driver camera 列出/删除。
+  - `src/backend/windows/managed_dshow/`、`managed_mf.rs`：两个 producer。
+  - `src/backend/windows/obs.rs`、`queue_writer.rs`、`protocol/frame_queue.rs`：OBS producer（3-slot queue 仅 OBS 使用）。
+  - `src/backend/windows/unity_capture.rs`、`src/platform/`。
 
-`protocol/` 只含 layout/name/ordering，不持有 handle，可直接迁入未来 `managed-protocol` crate。
+`CameraType` 是 `#[non_exhaustive]`，含 `ManagedDirectShow`、`ManagedMediaFoundation`。`VirtualCamera` 是 `Send`、非 `Sync`。
 
-`CameraType::ManagedDirectShow` 标识 managed DShow producer；`CameraType` 是 `#[non_exhaustive]`，MF backend 落地时新增 variant。`VirtualCamera` 是 `Send`、非 `Sync`。
+C++ `native/managed-virtualcam` 已删除（commit 95d6795）；旧 camera 只能通过 `legacy_cameras`/`remove_legacy_camera` 清理。
 
-当前 native：
-
-`native/managed-virtualcam/`
-
-仍包含：
-
-- C++ COM DirectShow source。
-- CMake。
-- libdshowcapture-derived implementation。
-- native tests。
-
-不要把规划中的 Rust crates 当成已经存在。
+用户 2026-10-23 指令覆盖下文旧约束：多格式（覆盖 D052）、App ID、性能优先可自由重构（managed 改用 transport v2，覆盖 D001/D019 的 "不改 ABI"）。下文 §5 3-slot / §6 v1 namespace 描述的是 OBS 与已删除 C++ driver 的历史 ABI。
 
 ## 3. 最终 backend 模型
 
@@ -891,6 +882,7 @@ MF v1 native stream在 registration时决定；access 固定 CurrentUser，lifet
 7. 测试。
 8. review diff。
 9. 更新 docs。
+10. 按阶段分别 commit（D058）。
 
 禁止：
 
@@ -1055,7 +1047,25 @@ MF v1 threat model blocks cross-user/remote/unauthenticated injection but does n
 CurrentUser/System cameras must be cleaned before source uninstall; if multi-user cleanup cannot be proven complete, installer fails safe without deleting source registration/DLL.
 
 ### D052
-first version NV12-only。
+~~first version NV12-only~~ 被 D053 取代。
+
+### D053
+Managed cameras 支持 NV12/I420/YUY2/UYVY/P010/BGRA32/RGB24；`ColorSpace` 只作 metadata（VIH2 DXVA bits / `MF_MT_*`），source 不做转换，按 pitch 逐行 copy。
+
+### D054
+Managed transport v2：per-slot seqlock ring（VCR2），writer 不等待、reader 不接受 torn frame。DShow namespace `Local\VirtualCamRs2-{ID}-{Lease,Control,Ring-{GEN}}`；producer liveness = process handle + creation time。
+
+### D055
+`AppId` 是 per-program namespace（`A-Za-z0-9._-`，≤128），不是鉴权；`for_app` manager 只看到自己 app id 的 camera，其它返回 `CameraNotFound`。
+
+### D056
+DShow 支持 per-user（HKCU，免提权）与 machine-wide（HKLM）注册；FilterData 由系统 `IAMFilterData::CreateFilterData` 生成，不手工构造。
+
+### D057
+当前 scope x64-only；x86 DShow DLL 与 ARM64 未做。FFmpeg dshow demuxer 不支持 P010（不是 source bug）。
+
+### D058
+提交按阶段拆分（protocol / DShow management / DShow source / MF / migration / docs），不做一次性大提交。
 
 ## 29. 官方参考
 
