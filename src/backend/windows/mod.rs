@@ -108,6 +108,13 @@ impl Backend {
         }
     }
 
+    pub(crate) fn requested_format(&self) -> Option<virtualcam_protocol::VideoFormat> {
+        match self {
+            Self::ManagedDirectShow(backend) => backend.requested_format(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn write_host_frame(&mut self, frame: &[u8]) -> Result<WriteStatus> {
         self.write_frame(FrameSource::Host(frame))
     }

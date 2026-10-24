@@ -5,14 +5,20 @@
 //! generation, and publishes `{generation, format, pid}` in the fixed control
 //! mapping. All objects live in the session-local namespace (see
 //! `virtualcam_protocol::dshow`).
+//!
+//! Every published frame also sets the session's auto-reset frame event, so
+//! the (single) consumer graph delivers it immediately instead of on its
+//! own timer. The connected consumer's pixel format arrives through the
+//! request mapping; acting on it is the caller's decision.
 
 use virtualcam_protocol::ValidatedFormat;
-use virtualcam_protocol::dshow::{CONTROL_MAGIC, CONTROL_STATE_ACTIVE, CONTROL_STATE_STOPPED, CONTROL_VERSION, DshowControl, DshowNames};
+use virtualcam_protocol::VideoFormat;
+use virtualcam_protocol::dshow::{CONTROL_MAGIC, CONTROL_STATE_ACTIVE, CONTROL_STATE_STOPPED, CONTROL_VERSION, DshowControl, DshowNames, DshowRequest, REQUEST_STATE_CONNECTED};
 use virtualcam_protocol::registry::values;
 use virtualcam_protocol::ring::{DEFAULT_SLOT_COUNT, RingLayout, RingWriter};
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_ALL_ACCESS, PAGE_READWRITE};
-use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcessId};
+use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, SetEvent};
 
 use super::FrameSource;
 use crate::managed::metadata::history_path;
@@ -63,12 +69,22 @@ impl NamedMapping {
     }
 }
 
+/// One producer session's ring and its frame event.
+struct Session {
+    // Field order is drop order: unmap the ring before closing the event.
+    writer: RingWriter,
+    _mapping: NamedMapping,
+    frame_event: OwnedHandle,
+}
+
 pub(crate) struct ManagedDshowBackend {
     // Field order is drop order: ring, then control, then the lease last.
-    ring: Option<(RingWriter, NamedMapping)>,
+    ring: Option<Session>,
     control: Option<NamedMapping>,
+    request: Option<NamedMapping>,
     record: DshowControl,
-    _lease: OwnedHandle,
+    /// Released on close, so a new session may open right away.
+    lease: Option<OwnedHandle>,
     clock: QpcClock,
     history_id: Option<ManagedCameraId>,
     format: ValidatedFormat,
@@ -99,6 +115,8 @@ impl ManagedDshowBackend {
         let (generation, ring) = Self::create_ring(names, &format, layout, pid)?;
 
         let control = NamedMapping::create_or_open(&names.control, DshowControl::SIZE, "CreateFileMappingW(managed control)")?;
+        // A consumer that connected first may already have created it.
+        let request = NamedMapping::create_or_open(&names.request, DshowRequest::SIZE, "CreateFileMappingW(managed request)")?;
         let header = control.view().ptr_at::<DshowControl>(0).ok_or(Error::Protocol {
             backend: CameraType::ManagedDirectShow,
             detail: "control mapping is not aligned",
@@ -122,8 +140,9 @@ impl ManagedDshowBackend {
         Ok(Self {
             ring: Some(ring),
             control: Some(control),
+            request: Some(request),
             record,
-            _lease: lease,
+            lease: Some(lease),
             clock,
             history_id,
             format,
@@ -131,7 +150,7 @@ impl ManagedDshowBackend {
         })
     }
 
-    fn create_ring(names: &DshowNames, format: &ValidatedFormat, layout: RingLayout, pid: u32) -> Result<(u64, (RingWriter, NamedMapping))> {
+    fn create_ring(names: &DshowNames, format: &ValidatedFormat, layout: RingLayout, pid: u32) -> Result<(u64, Session)> {
         // A pre-existing object at a fresh random name is a collision or a
         // squatter; never reuse it, pick another generation.
         for _ in 0..4 {
@@ -139,13 +158,20 @@ impl ManagedDshowBackend {
             let Some(mapping) = NamedMapping::create_new(&names.ring(generation), layout.total_size, "CreateFileMappingW(managed ring)")? else {
                 continue;
             };
+            // SAFETY: NUL-terminated name, default security; auto-reset.
+            let raw = unsafe { CreateEventW(core::ptr::null(), 0, 0, names.frame_event(generation).as_ptr()) };
+            // SAFETY: A non-null CreateEventW result is one owned handle.
+            let frame_event = unsafe { OwnedHandle::from_result(raw, "CreateEventW(managed frame event)") }?;
+            if opened_existing_object() {
+                continue;
+            }
             // SAFETY: The freshly created view is exclusively ours and stays
             // mapped as long as the writer (they are stored together).
             let writer = unsafe { RingWriter::initialize(mapping.view().as_ptr(), mapping.view().accessible_len(), format, layout.slot_count, generation, pid) }.map_err(|_| Error::Protocol {
                 backend: CameraType::ManagedDirectShow,
                 detail: "could not initialize the frame ring",
             })?;
-            return Ok((generation, (writer, mapping)));
+            return Ok((generation, Session { writer, _mapping: mapping, frame_event }));
         }
         Err(Error::Protocol {
             backend: CameraType::ManagedDirectShow,
@@ -159,8 +185,19 @@ impl ManagedDshowBackend {
         self.ring.as_ref().map(|_| true).ok_or(Error::AlreadyClosed)
     }
 
+    /// The format the connected consumer graph negotiated, if any.
+    pub(crate) fn requested_format(&self) -> Option<VideoFormat> {
+        let header = self.request.as_ref()?.view().ptr_at::<DshowRequest>(0)?;
+        // SAFETY: Live, aligned request view of sufficient size.
+        let record = unsafe { DshowRequest::snapshot(header.as_ptr()) }?;
+        if record.state != REQUEST_STATE_CONNECTED {
+            return None;
+        }
+        record.format.decode().ok().filter(|format| format.validate().is_ok())
+    }
+
     pub(super) fn write_frame(&mut self, frame: FrameSource<'_>) -> Result<WriteStatus> {
-        let (writer, _) = self.ring.as_mut().ok_or(Error::AlreadyClosed)?;
+        let Session { writer, frame_event, .. } = self.ring.as_mut().ok_or(Error::AlreadyClosed)?;
         if frame.byte_len() != writer.frame_size() {
             return Err(Error::FrameSizeMismatch {
                 expected: writer.frame_size(),
@@ -173,6 +210,8 @@ impl ManagedDshowBackend {
             return Err(error);
         }
         writer.commit_frame(self.clock.now_100ns()?);
+        // SAFETY: Live event handle owned by this session.
+        unsafe { SetEvent(frame_event.raw()) };
         if !self.first_frame_published {
             self.first_frame_published = true;
             self.record_history();
@@ -198,8 +237,11 @@ impl ManagedDshowBackend {
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {
-        if let Some((writer, _)) = self.ring.as_mut() {
-            writer.stop();
+        if let Some(session) = self.ring.as_mut() {
+            session.writer.stop();
+            // Wake the consumer so it notices the stop without waiting.
+            // SAFETY: Live event handle owned by this session.
+            unsafe { SetEvent(session.frame_event.raw()) };
         }
         if let Some(control) = &self.control
             && let Some(header) = control.view().ptr_at::<DshowControl>(0)
@@ -213,6 +255,8 @@ impl ManagedDshowBackend {
         }
         self.ring = None;
         self.control = None;
+        self.request = None;
+        self.lease = None;
         Ok(())
     }
 }
@@ -269,7 +313,11 @@ mod tests {
         assert!(matches!(ManagedDshowBackend::open_named(&names, format(PixelFormat::Nv12, 64, 64), None), Err(Error::DeviceInUse)));
         first.close().expect("close");
         drop(first);
-        ManagedDshowBackend::open_named(&names, format(PixelFormat::Yuy2, 64, 64), None).expect("reopen after close");
+        let mut second = ManagedDshowBackend::open_named(&names, format(PixelFormat::Yuy2, 64, 64), None).expect("reopen after close and drop");
+        // Closing alone releases the lease; the closed object may still be alive.
+        second.close().expect("close");
+        let _third = ManagedDshowBackend::open_named(&names, format(PixelFormat::Nv12, 32, 32), None).expect("reopen after close only");
+        drop(second);
     }
 
     #[test]

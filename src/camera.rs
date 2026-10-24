@@ -183,6 +183,28 @@ impl VirtualCamera {
         }
     }
 
+    /// The format a connected consumer graph negotiated with a managed
+    /// DirectShow camera, or `None` (no consumer connected, closed, or any
+    /// other backend).
+    ///
+    /// A DirectShow graph's media type is fixed once connected; frames in any
+    /// other pixel format reach it as black. A producer that can convert
+    /// should reopen in the requested pixel format. Reading this is a few
+    /// shared-memory loads, cheap enough to check before every frame.
+    pub fn requested_format(&self) -> Option<VideoFormat> {
+        if self.closed {
+            return None;
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+        #[cfg(windows)]
+        {
+            self.backend.requested_format()
+        }
+    }
+
     /// Publishes one host-memory frame.
     ///
     /// `frame` must use [`Self::native_format`], include any configured Unity
