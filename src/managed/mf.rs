@@ -194,6 +194,7 @@ pub(super) fn register(app_id: Option<AppId>, request: MediaFoundationRegistrati
         name: request.name,
         app_id,
         format: Some(request.native_format),
+        pixel_formats: Vec::new(),
         source_path: None,
         rendezvous_id: Some(rendezvous_id),
         symbolic_link,

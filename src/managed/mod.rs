@@ -21,7 +21,7 @@ use std::path::PathBuf;
 pub use legacy::LegacyCamera;
 pub use virtualcam_protocol::CameraId as ManagedCameraId;
 
-use crate::{Error, Result, VideoFormat, VirtualCamera};
+use crate::{Error, PixelFormat, Result, VideoFormat, VirtualCamera};
 
 #[cfg(windows)]
 mod com;
@@ -99,9 +99,15 @@ pub struct DirectShowRegistration {
     pub name: String,
     /// Visibility of the camera.
     pub scope: RegistrationScope,
-    /// Format advertised by an idle camera before any producer has run for
-    /// this user. `None` falls back to NV12 640x480@30.
+    /// Format advertised while no producer runs. `None` falls back to the
+    /// user's last published format, then NV12 640x480@30.
     pub default_format: Option<VideoFormat>,
+    /// Pixel formats offered beside the current one, in preference order.
+    /// The connected graph's choice reaches the producer through
+    /// [`VirtualCamera::requested_format`](crate::VirtualCamera::requested_format);
+    /// list only formats the producer will switch to. Empty offers just the
+    /// current format.
+    pub pixel_formats: Vec<PixelFormat>,
 }
 
 impl DirectShowRegistration {
@@ -111,6 +117,7 @@ impl DirectShowRegistration {
             name: name.into(),
             scope: RegistrationScope::CurrentUser,
             default_format: None,
+            pixel_formats: Vec::new(),
         }
     }
 }
@@ -177,6 +184,9 @@ pub struct ManagedCameraInfo {
     pub app_id: Option<AppId>,
     /// DirectShow idle default format, or the Media Foundation native mode.
     pub format: Option<VideoFormat>,
+    /// DirectShow offered pixel formats (see
+    /// [`DirectShowRegistration::pixel_formats`]); empty for Media Foundation.
+    pub pixel_formats: Vec<PixelFormat>,
     /// Registration completeness.
     pub health: RegistrationHealth,
 }
@@ -225,6 +235,9 @@ impl ManagedCameraManager {
                 validate_name(&r.name)?;
                 if let Some(format) = r.default_format {
                     format.validate()?;
+                }
+                if r.pixel_formats.iter().any(|format| !format.is_managed()) || r.pixel_formats.len() > virtualcam_protocol::registry::MAX_PIXEL_FORMATS {
+                    return Err(virtualcam_protocol::FormatError::UnsupportedPixelFormat.into());
                 }
             }
             ManagedCameraRegistration::MediaFoundation(r) => {
@@ -452,6 +465,7 @@ mod imp {
             scope: scope_of(record.hive),
             app_id: record.app_id.clone(),
             format: record.format,
+            pixel_formats: record.pixel_formats.clone(),
             health: health(record),
         }
     }
@@ -512,6 +526,7 @@ mod imp {
                     name: request.name,
                     app_id: manager.app_id.clone(),
                     format: request.default_format,
+                    pixel_formats: request.pixel_formats,
                     source_path: Some(source.clone()),
                     rendezvous_id: None,
                     symbolic_link: None,

@@ -1,7 +1,7 @@
 //! Camera records in `{HKCU|HKLM}\Software\VirtualCamRs\Cameras\{ID}`.
 
-use virtualcam_protocol::registry::{BACKEND_DIRECTSHOW, BACKEND_MEDIA_FOUNDATION, CAMERAS_KEY, HISTORY_KEY, values};
-use virtualcam_protocol::{VideoFormat, WireVideoFormat};
+use virtualcam_protocol::registry::{BACKEND_DIRECTSHOW, BACKEND_MEDIA_FOUNDATION, CAMERAS_KEY, HISTORY_KEY, decode_pixel_formats, encode_pixel_formats, values};
+use virtualcam_protocol::{PixelFormat, VideoFormat, WireVideoFormat};
 
 use super::{AppId, ManagedBackend};
 use crate::platform::registry::{Hive, Key};
@@ -15,6 +15,7 @@ pub(crate) struct CameraRecord {
     pub(crate) name: String,
     pub(crate) app_id: Option<AppId>,
     pub(crate) format: Option<VideoFormat>,
+    pub(crate) pixel_formats: Vec<PixelFormat>,
     pub(crate) source_path: Option<String>,
     pub(crate) rendezvous_id: Option<String>,
     pub(crate) symbolic_link: Option<String>,
@@ -46,6 +47,9 @@ impl CameraRecord {
             }
             if let Some(format) = self.format {
                 key.set_binary(values::FORMAT, &format.to_wire()?.to_bytes())?;
+            }
+            if !self.pixel_formats.is_empty() {
+                key.set_binary(values::PIXEL_FORMATS, &encode_pixel_formats(&self.pixel_formats))?;
             }
             for (name, value) in [(values::SOURCE_PATH, &self.source_path), (values::RENDEZVOUS_ID, &self.rendezvous_id), (values::SYMBOLIC_LINK, &self.symbolic_link)] {
                 if let Some(value) = value {
@@ -82,6 +86,7 @@ impl CameraRecord {
             name: key.get_string(Some(values::NAME))?.unwrap_or_default(),
             app_id: key.get_string(Some(values::APP_ID))?.and_then(|value| AppId::new(value).ok()),
             format,
+            pixel_formats: key.get_binary(values::PIXEL_FORMATS)?.map(|bytes| decode_pixel_formats(&bytes)).unwrap_or_default(),
             source_path: key.get_string(Some(values::SOURCE_PATH))?,
             rendezvous_id: key.get_string(Some(values::RENDEZVOUS_ID))?,
             symbolic_link: key.get_string(Some(values::SYMBOLIC_LINK))?,
