@@ -175,7 +175,7 @@ fn every_managed_format_reaches_a_directshow_consumer_byte_exact() {
 
 #[test]
 #[ignore = "registers per-user DirectShow cameras and drives FFmpeg"]
-fn idle_camera_uses_last_format_and_returns_to_black_after_producer_crash() {
+fn idle_camera_uses_registered_default_then_history_and_returns_to_black_after_producer_crash() {
     if let Ok(id) = env::var("VIRTUALCAM_CRASH_HELPER_ID") {
         // Child mode: publish one frame, signal readiness, then die abruptly.
         let id: ManagedCameraId = id.parse().expect("id");
@@ -200,7 +200,7 @@ fn idle_camera_uses_last_format_and_returns_to_black_after_producer_crash() {
     let signal = env::temp_dir().join(format!("VirtualCamRs-CrashReady-{}", std::process::id()));
     let _ = fs::remove_file(&signal);
     let mut child = Command::new(env::current_exe().expect("test exe"))
-        .args(["--exact", "idle_camera_uses_last_format_and_returns_to_black_after_producer_crash", "--ignored", "--nocapture"])
+        .args(["--exact", "idle_camera_uses_registered_default_then_history_and_returns_to_black_after_producer_crash", "--ignored", "--nocapture"])
         .env("VIRTUALCAM_CRASH_HELPER_ID", camera.id.to_string())
         .env("VIRTUALCAM_CRASH_HELPER_SIGNAL", &signal)
         .spawn()
@@ -218,11 +218,19 @@ fn idle_camera_uses_last_format_and_returns_to_black_after_producer_crash() {
     child.kill().expect("kill helper");
     child.wait().expect("reap helper");
     // The producer died without closing: consumers fall back to black at
-    // the last published format (now the user's history).
-    let after = capture(&camera.name, "nv12", 1);
-    assert_eq!(after.len(), 64 * 48 * 3 / 2);
-    assert!(after[..64 * 48].iter().all(|y| *y == 16) && after[64 * 48..].iter().all(|uv| *uv == 128), "black after crash");
+    // the registered idle default, which outranks the user's history.
+    let after = capture(&camera.name, "yuyv422", 1);
+    assert_eq!(after.len(), 96 * 64 * 2);
+    assert!(after.chunks_exact(2).all(|pair| pair == [16, 128]), "black after crash");
     let _ = fs::remove_file(&signal);
+
+    // Without a registered default, the last published format is used.
+    let undefaulted = register(&source, "dev.virtualcam.test", &format!("VCRs History Test {}", std::process::id()), None);
+    let mut producer = undefaulted.manager.open(undefaulted.id, VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(30))).expect("producer");
+    producer.write_host(&vec![200; producer.frame_size()]).expect("frame");
+    producer.close().expect("close");
+    let idle = capture(&undefaulted.name, "nv12", 1);
+    assert_eq!(idle.len(), 64 * 48 * 3 / 2, "history format");
 }
 
 #[test]
@@ -248,4 +256,161 @@ fn app_scopes_isolate_registrations_and_unregister_removes_the_device() {
     camera.manager.unregister(camera.id).expect("unregister");
     assert_eq!(camera.manager.get(camera.id), Err(Error::CameraNotFound));
     assert!(!ffmpeg_devices().contains(&renamed.name), "device disappears");
+}
+
+/// Encodes `value` as 32 luma blocks (16x16, black/white) on the first rows.
+fn stamp(frame: &mut [u8], width: usize, value: u32) {
+    for bit in 0..32 {
+        let luma = if value >> bit & 1 == 1 { 235 } else { 16 };
+        for row in 0..16 {
+            let start = row * width + bit * 16;
+            frame[start..start + 16].fill(luma);
+        }
+    }
+}
+
+fn read_stamp(frame: &[u8], width: usize) -> u32 {
+    (0..32).fold(0, |value, bit| value | (u32::from(frame[8 * width + bit * 16 + 8] > 128) << bit))
+}
+
+#[test]
+#[ignore = "registers a per-user DirectShow camera and drives FFmpeg; prints latency"]
+fn directshow_delivery_latency() {
+    let source = staged_source();
+    let camera = register(&source, "dev.virtualcam.test", &format!("VCRs Latency Test {}", std::process::id()), None);
+    let parse = |key: &str, default: usize| env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+    let (width, height, fps) = (parse("LAT_W", 1920), parse("LAT_H", 1080), parse("LAT_FPS", 60) as u32);
+    let format = VideoFormat::new(PixelFormat::Nv12, width as u32, height as u32, FrameRate::fps(fps));
+    let mut producer = camera.manager.open(camera.id, format).expect("open producer");
+    let base = Instant::now();
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let writer_running = running.clone();
+    let writer = thread::spawn(move || {
+        let mut frame = vec![128_u8; width * height * 3 / 2];
+        frame[..width * height].fill(60);
+        let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
+        let mut next = Instant::now();
+        while writer_running.load(std::sync::atomic::Ordering::Relaxed) {
+            stamp(&mut frame, width, base.elapsed().as_micros() as u32);
+            producer.write_host(&frame).expect("write");
+            next += interval;
+            if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                thread::sleep(wait);
+            }
+        }
+        producer.close().expect("close");
+    });
+    let mut child = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-threads", "1", "-f", "dshow", "-i"])
+        .arg(format!("video={}", camera.name))
+        .args(["-threads", "1", "-fps_mode", "passthrough", "-frames:v", "600", "-f", "rawvideo", "-pix_fmt", "nv12", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ffmpeg");
+    let mut stdout = child.stdout.take().expect("stdout");
+    let mut frame = vec![0_u8; width * height * 3 / 2];
+    let mut latencies = Vec::new();
+    let mut repeats = 0;
+    let mut previous = None;
+    while std::io::Read::read_exact(&mut stdout, &mut frame).is_ok() {
+        let now = base.elapsed().as_micros() as u32;
+        let written = read_stamp(&frame, width);
+        if previous == Some(written) {
+            repeats += 1;
+        }
+        previous = Some(written);
+        latencies.push(f64::from(now.wrapping_sub(written)) / 1000.0);
+    }
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    writer.join().expect("writer");
+    let _ = child.wait();
+    let steady = &latencies[latencies.len().min(60)..];
+    let mut sorted = steady.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let pick = |q: f64| sorted[((sorted.len() - 1) as f64 * q) as usize];
+    println!(
+        "frames={} repeats={repeats} latency ms: min={:.1} p50={:.1} p90={:.1} max={:.1}",
+        latencies.len(),
+        pick(0.0),
+        pick(0.5),
+        pick(0.9),
+        pick(1.0)
+    );
+    println!("first 10: {:?}", &latencies[..latencies.len().min(10)]);
+    println!("last 10: {:?}", &latencies[latencies.len().saturating_sub(10)..]);
+}
+
+#[test]
+#[ignore = "registers a per-user DirectShow camera and drives FFmpeg"]
+fn single_consumer_requests_its_pixel_format_from_the_producer() {
+    let source = staged_source();
+    let default = VideoFormat::new(PixelFormat::Nv12, 320, 240, FrameRate::fps(30));
+    let manager = ManagedCameraManager::for_app(AppId::new("dev.virtualcam.test").expect("app id")).with_dshow_source(&source);
+    let name = format!("VCRs Request Test {}", std::process::id());
+    let info = manager
+        .register(DirectShowRegistration {
+            default_format: Some(default),
+            pixel_formats: vec![PixelFormat::Nv12, PixelFormat::Yuy2, PixelFormat::I420],
+            ..DirectShowRegistration::new(&name)
+        })
+        .expect("register");
+    assert_eq!(info.pixel_formats, [PixelFormat::Nv12, PixelFormat::Yuy2, PixelFormat::I420]);
+    let camera = Registration { manager, id: info.id, name };
+
+    let spawn = |frames: u32| {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "dshow", "-pixel_format", "yuyv422", "-i"])
+            .arg(format!("video={}", camera.name))
+            .args(["-frames:v", &frames.to_string(), "-f", "rawvideo", "-pix_fmt", "yuyv422", "-"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ffmpeg")
+    };
+
+    // The producer starts in the default NV12; the consumer picks YUY2.
+    let mut producer = camera.manager.open(camera.id, default).expect("open producer");
+    let mut first = spawn(90);
+    let mut stdout = first.stdout.take().expect("stdout");
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let requested = loop {
+        producer.write_host(&vec![16; producer.frame_size()]).expect("write NV12");
+        if let Some(format) = producer.requested_format() {
+            break format;
+        }
+        assert!(Instant::now() < deadline, "consumer never published its format");
+        thread::sleep(Duration::from_millis(30));
+    };
+    assert_eq!((requested.pixel_format, requested.width, requested.height), (PixelFormat::Yuy2, 320, 240));
+
+    // A second graph is refused while the first holds the lease.
+    let second = spawn(1).wait_with_output().expect("second consumer");
+    assert!(!second.status.success(), "second consumer must be refused");
+
+    // The producer switches to the requested format and real frames flow.
+    producer.close().expect("close NV12 producer");
+    drop(producer);
+    let yuy2 = VideoFormat::new(PixelFormat::Yuy2, 320, 240, FrameRate::fps(30));
+    let mut producer = camera.manager.open(camera.id, yuy2).expect("open YUY2 producer");
+    let frame = pattern(&yuy2);
+    while first.try_wait().expect("poll ffmpeg").is_none() {
+        producer.write_host(&frame).expect("write YUY2");
+        assert!(Instant::now() < deadline + Duration::from_secs(15), "first consumer never finished");
+        thread::sleep(Duration::from_millis(30));
+    }
+    let captured = reader.join().expect("reader").expect("read stdout");
+    assert_eq!(captured.len(), frame.len() * 90);
+    assert!(&captured[frame.len() * 89..] == frame.as_slice(), "last frame is the producer's YUY2 frame");
+    // Disconnecting releases the lease and clears the request.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while producer.requested_format().is_some() {
+        assert!(Instant::now() < deadline, "request was not cleared");
+        thread::sleep(Duration::from_millis(30));
+    }
+    producer.close().expect("close");
 }
