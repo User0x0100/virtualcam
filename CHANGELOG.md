@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- DirectShow cameras register an ordered `DirectShowRegistration::pixel_formats` list (`ManagedCameraInfo::pixel_formats`, registry `PixelFormats`) and advertise all of them at the current size and rate. Only one consumer graph may connect at a time; it publishes its negotiated format, which producers read with the new `VirtualCamera::requested_format()` to switch pixel format.
+- DirectShow delivery is frame-driven: producers set a per-session frame event and the source pushes each frame as it is published. Measured 1080p30 source latency dropped from a median of 31.2 ms (one frame interval) to 3.5 ms.
+- A registered DirectShow `default_format` now outranks the user's last published format for idle cameras.
+- Closing a managed DirectShow producer releases its single-writer lease immediately, so a new session can open before the old object is dropped.
 - **Breaking:** replaced the C++ managed DirectShow driver with pure Rust sources: `virtualcam_dshow.dll` (DirectShow) and `virtualcam_mf.dll` (Media Foundation / Frame Server), built from the new `virtualcam-dshow` and `virtualcam-mf` workspace crates. `native/managed-virtualcam` and the managed ABI v3 are gone.
 - Added multi-format managed cameras: `PixelFormat` NV12, I420, YUY2, UYVY, P010, BGRA32, RGB24; `ColorSpace` (matrix/range/primaries/transfer) signaled as VIDEOINFOHEADER2 / `MF_MT_*` metadata; any even resolution up to 16384 and rational frame rates. Sources copy pitch-aware without conversion.
 - Added `AppId` and `ManagedCameraManager::for_app`: a program-scoped namespace for registering and listing its own cameras (not authentication).

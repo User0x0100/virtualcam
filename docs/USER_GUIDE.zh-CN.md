@@ -179,7 +179,7 @@ MF 摄像头在 `stream` 时自动使用注册时的格式；`--format/--size/--
 | --- | --- |
 | `ManagedCameraManager` | 注册/列出/重命名/删除/打开自有摄像头；可廉价 clone |
 | `AppId` | 程序命名空间：`A-Z a-z 0-9 . _ -`，1–128 字符 |
-| `DirectShowRegistration` | DirectShow 注册参数：`name`、`scope`、`default_format` |
+| `DirectShowRegistration` | DirectShow 注册参数：`name`、`scope`、`default_format`、`pixel_formats`（按偏好排序的可选像素格式） |
 | `MediaFoundationRegistration` | MF 注册参数：`name`、`native_format` |
 | `ManagedCameraInfo` | 查询结果：`id`、`name`、`backend`、`scope`、`app_id`、`format`、`health` |
 | `ManagedCameraId` | 稳定 ID（GUID 形式），可 `Display`/`parse` |
@@ -218,8 +218,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => manager.register(DirectShowRegistration {
             name: "Studio Cam".into(),
             scope: RegistrationScope::CurrentUser, // 免管理员
-            // 没有生产者、也没有历史格式时，空闲黑帧使用此格式。
+            // 没有生产者时，空闲黑帧使用此格式。
             default_format: Some(VideoFormat::new(PixelFormat::Nv12, 1280, 720, FrameRate::fps(30))),
+            // 同时提供给应用的像素格式；应用的选择经 requested_format() 告知生产者。
+            pixel_formats: vec![PixelFormat::Nv12, PixelFormat::Yuy2],
         })?,
     };
 
@@ -376,10 +378,14 @@ let one = manager.get(id)?;
 - **空闲**（没有生产者）时输出黑帧。对外宣告的格式按以下优先级选取：
   1. 消费端通过 `IAMStreamConfig::SetFormat` 指定的格式；
   2. 正在运行的生产者的格式；
-  3. 当前用户对该摄像头最近一次成功推流的格式（历史记录）；
-  4. 注册时的 `default_format`；
+  3. 注册时的 `default_format`；
+  4. 当前用户对该摄像头最近一次成功推流的格式（历史记录）；
   5. NV12 640×480@30。
-- 已连接的 graph 会固定其协商格式。若之后的生产者使用不同格式，该 graph 显示黑帧，直到消费端重新连接；格式相同的生产者无需重连即可接入。
+
+  当前格式排在最前，其后是注册的 `pixel_formats` 中其余像素格式（同尺寸、同帧率）。
+- 同一时间只允许一个 graph 连接；第二个应用连接时返回 `ERROR_BUSY`。
+- 已连接的 graph 会固定其协商格式，并把它写给生产者：生产者调用 `VirtualCamera::requested_format()` 读取，可关闭后以该像素格式重开（`close()` 立即释放生产者租约）。生产者格式不同时该 graph 显示黑帧。
+- 帧驱动交付：生产者每写入一帧都会通知 source，source 立即推送，不再按自己的定时器节拍取帧。
 - 每台摄像头同一时间只能有一个生产者；第二个返回 `Error::DeviceInUse`。
 - 生产者崩溃或退出后，消费端在短时间内回到黑帧（source 通过进程句柄和进程创建时间检测存活）。
 - `is_ready()` 在打开后即为 `true`，因为 DirectShow 没有消费端在场握手。

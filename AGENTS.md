@@ -105,24 +105,30 @@ Namespace（`virtualcam-protocol/src/dshow.rs`）：
 Local\VirtualCamRs2-{ID}-Lease            event；存在即 single-writer lease，仅 producer 持有
 Local\VirtualCamRs2-{ID}-Control          128-byte DshowControl（magic "VCD2"，seqlock'd）
 Local\VirtualCamRs2-{ID}-Ring-{GEN:016X}  per-session VCR2 ring
+Local\VirtualCamRs2-{ID}-Frame-{GEN:016X} per-session auto-reset event，producer 每帧 commit 后 SetEvent
+Local\VirtualCamRs2-{ID}-Consumer        event；存在即 single-consumer lease，仅已连接的 graph 持有
+Local\VirtualCamRs2-{ID}-Request         64-byte DshowRequest（magic "VCQ2"，seqlock'd），consumer -> producer
 ```
 
 `DshowControl`：format（WireVideoFormat）、ring generation/slots/size、producer pid + process start time。
+`DshowRequest`：state（NONE/CONNECTED）+ 已连接 graph 的 format；只有 consumer lease 持有者写。
 
 Lifecycle：
 
-- one producer（第二个 -> `DeviceInUse`）。
-- producer decides runtime format；registration 只存可选 `default_format`。
-- idle advertised format 优先级：SetFormat > live producer > per-user last format（`HKCU\Software\VirtualCamRs\History\{ID}\LastFormat`）> registered default > NV12 640x480@30。
-- connected graph mode fixed；格式不同的 producer 在该 graph 上显示 black，同格式无需重连。
+- one producer（第二个 -> `DeviceInUse`）；`close()` 即释放 producer lease（不必等 drop），便于立即以新格式重开。
+- one consumer graph（2026-10-24 用户要求去掉多消费者）：output pin `Connect` 时取 consumer lease，第二个 graph `Connect` 返回 `HRESULT_FROM_WIN32(ERROR_BUSY)`；`Disconnect`/filter 释放时归还并把 request 置 NONE。
+- producer decides runtime format；registration 存可选 `default_format` 与 `pixel_formats`（offered 列表）。
+- advertised：当前格式（SetFormat > live producer > registered default > per-user last format（`HKCU\Software\VirtualCamRs\History\{ID}\LastFormat`）> NV12 640x480@30）在前，其后是其余 registered pixel formats（同尺寸/帧率）。显式注册的默认格式优先于历史（2026-10-24 改）；`pixel_formats` 为空的旧注册只宣告当前格式。
+- connected graph mode fixed；连接成功后 consumer 把格式写入 `DshowRequest`，producer 经 `VirtualCamera::requested_format()` 读到后自行决定是否以该 pixel format 重开（新 generation）。格式不同的 producer 在该 graph 上显示 black。
+- push thread 帧驱动：live producer 服务当前连接格式且有 frame event 时，等待 frame event，新 sequence 立即交付（速率上限约 0.75 interval，停滞时每 2 interval 重复最后一帧）；无 producer/格式不符/旧 producer 无 frame event 时，按 negotiated interval 定时器节拍发黑帧/帧。实测（`directshow_delivery_latency`，FFmpeg 低延迟参数，1080p30）中位延迟 31.2 ms -> 3.5 ms。
 - producer liveness = 打开 producer 进程（SYNCHRONIZE）+ 比对 creation time；死亡 -> black。
-- source 不做格式转换；RGB 自上而下输入，source 翻转为 bottom-up DIB 并处理 RGB24 DWORD 行对齐。
+- source 不做格式转换（像素格式切换由 producer 完成）；RGB 自上而下输入，source 翻转为 bottom-up DIB 并处理 RGB24 DWORD 行对齐。
 
 ## 7. DShow source / registration contract
 
 实现接口：IClassFactory、IBaseFilter/IMediaFilter/IPersist（raw HRESULT，paused `GetState` 返回 `VFW_S_CANT_CUE`）、IPin、IAMStreamConfig、IKsPropertySet、IEnumPins、IEnumMediaTypes、IMemInputPin downstream query、IMemAllocator negotiation（downstream 优先，`CLSID_MemoryAllocator` fallback）、Receive（尊重 `S_FALSE`）。
 
-Filter strong-own pin，pin weak-ref filter。media types 同时提供 VIH 与 VIH2（DXVA colorimetry bits）。push thread 用 high-resolution waitable timer，无 catch-up burst。
+Filter strong-own pin，pin weak-ref filter。media types 同时提供 VIH 与 VIH2（DXVA colorimetry bits），每个 offered format 各一组；`GetNumberOfCapabilities`/`GetStreamCaps` 枚举全部 offered format；`SetFormat`/`Connect` 只接受 offered pixel format。push thread 见 §6，无 catch-up burst。
 
 Registration contract：
 
@@ -645,7 +651,7 @@ CUDA producer仍直接 D2H到 shared slot。
 当前 API：
 
 ```rust
-ManagedCameraRegistration::DirectShow(DirectShowRegistration { name, scope, default_format })
+ManagedCameraRegistration::DirectShow(DirectShowRegistration { name, scope, default_format, pixel_formats })
 ManagedCameraRegistration::MediaFoundation(MediaFoundationRegistration { name, native_format })
 ```
 
