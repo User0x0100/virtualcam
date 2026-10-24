@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use virtualcam_protocol::VideoFormat;
-use virtualcam_protocol::dshow::{PIN_NAME, guids};
-use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_POINTER, E_UNEXPECTED, S_FALSE, S_OK, SIZE};
+use virtualcam_protocol::dshow::{DshowNames, PIN_NAME, guids};
+use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_POINTER, E_UNEXPECTED, ERROR_BUSY, S_FALSE, S_OK, SIZE};
 use windows::Win32::Media::DirectShow::{
     ALLOCATOR_PROPERTIES, IAMStreamConfig, IAMStreamConfig_Impl, IBaseFilter, IEnumMediaTypes, IEnumMediaTypes_Impl, IEnumPins, IEnumPins_Impl, IMemAllocator, IMemInputPin, IPin, IPin_Impl, PIN_DIRECTION, PIN_INFO, PINDIR_OUTPUT,
     State_Stopped, VFW_E_ALREADY_CONNECTED, VFW_E_INVALIDMEDIATYPE, VFW_E_NO_ACCEPTABLE_TYPES, VFW_E_NOT_CONNECTED, VFW_E_NOT_STOPPED, VIDEO_STREAM_CONFIG_CAPS,
@@ -15,8 +15,9 @@ use windows::Win32::Media::MediaFoundation::AM_MEDIA_TYPE;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemAlloc};
 use windows_core::{GUID, HRESULT, IUnknown, IUnknownImpl, Interface, OutRef, PWSTR, Ref, Weak, implement};
 
+use crate::consumer::{ConsumerLease, LeaseError};
 use crate::filter::{Agile, Connection, Shared};
-use crate::media_type::{HEADERS, Header, MediaType, parse, sample_layout};
+use crate::media_type::{HEADERS, Header, MediaType, Parsed, parse, sample_layout};
 use crate::{ModuleRef, guard, guard_hr};
 
 /// `AMPROPERTY_PIN_CATEGORY`.
@@ -62,8 +63,7 @@ impl OutputPin {
         if let Some(connection) = &self.shared.state().connection {
             return vec![connection.media_type.clone()];
         }
-        let format = self.shared.advertised();
-        HEADERS.iter().filter_map(|header| MediaType::new(&format, *header)).collect()
+        self.shared.offered().iter().flat_map(|format| HEADERS.iter().filter_map(|header| MediaType::new(format, *header))).collect()
     }
 
     /// Negotiates an allocator with the downstream input pin.
@@ -103,17 +103,20 @@ impl OutputPin {
 }
 
 impl OutputPin_Impl {
-    /// Attempts one media type against `receiver`.
-    fn try_connect(&self, receiver: &IPin, mt: MediaType) -> windows_core::Result<()> {
+    /// Attempts one media type against `receiver`; on success the lease
+    /// moves into the connection.
+    fn try_connect(&self, receiver: &IPin, mt: MediaType, offered: &[VideoFormat], lease: &mut Option<ConsumerLease>) -> windows_core::Result<()> {
         // SAFETY: `mt` is one of our valid media types.
         let parsed = unsafe { parse(&mt.0) }.ok_or(windows_core::Error::from(VFW_E_INVALIDMEDIATYPE))?;
-        let format = parsed.to_format(&self.shared.advertised());
+        let format = parsed.to_format(base_for(offered, &parsed).ok_or(windows_core::Error::from(VFW_E_INVALIDMEDIATYPE))?);
         let layout = sample_layout(&format).ok_or(windows_core::Error::from(VFW_E_INVALIDMEDIATYPE))?;
         let this: IPin = self.to_interface();
         // SAFETY: Valid interfaces; `mt` outlives the call.
         unsafe { receiver.ReceiveConnection(&this, &mt.0) }?;
         match OutputPin::decide_allocator(receiver, layout.size()) {
             Ok((input, allocator)) => {
+                let mut lease = lease.take().ok_or(windows_core::Error::from(E_UNEXPECTED))?;
+                lease.publish(&format);
                 self.shared.state().connection = Some(Connection {
                     peer: Agile(receiver.clone()),
                     input: Agile(input),
@@ -122,6 +125,7 @@ impl OutputPin_Impl {
                     format,
                     layout,
                     flip: !format.pixel_format.is_yuv() && !parsed.top_down,
+                    _lease: lease,
                 });
                 Ok(())
             }
@@ -134,9 +138,15 @@ impl OutputPin_Impl {
     }
 }
 
+/// The offered format a consumer type builds on: the one with its pixel
+/// format. `None` for pixel formats this camera does not offer.
+fn base_for<'a>(offered: &'a [VideoFormat], parsed: &Parsed) -> Option<&'a VideoFormat> {
+    offered.iter().find(|format| format.pixel_format == parsed.pixel_format)
+}
+
 /// Deep-copies a caller media type when it fully specifies a format we can
 /// produce; partially specified types are matched against our own.
-fn candidate_types(requested: *const AM_MEDIA_TYPE, ours: Vec<MediaType>, advertised: &VideoFormat) -> Vec<MediaType> {
+fn candidate_types(requested: *const AM_MEDIA_TYPE, ours: Vec<MediaType>, offered: &[VideoFormat]) -> Vec<MediaType> {
     // SAFETY: COM passes null or a valid AM_MEDIA_TYPE.
     let Some(request) = (unsafe { requested.as_ref() }) else { return ours };
     // SAFETY: As above.
@@ -146,7 +156,8 @@ fn candidate_types(requested: *const AM_MEDIA_TYPE, ours: Vec<MediaType>, advert
         } else {
             Header::VideoInfo
         };
-        let format = parsed.to_format(advertised);
+        let Some(base) = base_for(offered, &parsed) else { return Vec::new() };
+        let format = parsed.to_format(base);
         return MediaType::new(&format, header)
             .map(|mut mt| {
                 if parsed.top_down {
@@ -194,9 +205,15 @@ impl IPin_Impl for OutputPin_Impl {
                     return Err(VFW_E_ALREADY_CONNECTED.into());
                 }
             }
-            let advertised = self.shared.advertised();
-            for mt in candidate_types(pmt, self.offered_types(), &advertised) {
-                if self.try_connect(receiver, mt).is_ok() {
+            // One graph at a time: a second consumer sees a busy device.
+            let mut lease = match ConsumerLease::acquire(&DshowNames::for_camera(self.shared.camera.id)) {
+                Ok(lease) => Some(lease),
+                Err(LeaseError::Busy) => return Err(ERROR_BUSY.to_hresult().into()),
+                Err(LeaseError::Unavailable) => return Err(E_UNEXPECTED.into()),
+            };
+            let offered = self.shared.offered();
+            for mt in candidate_types(pmt, self.offered_types(), &offered) {
+                if self.try_connect(receiver, mt, &offered, &mut lease).is_ok() {
                     return Ok(());
                 }
             }
@@ -316,7 +333,8 @@ impl IAMStreamConfig_Impl for OutputPin_Impl {
             }
             // SAFETY: COM passes a valid media type.
             let parsed = unsafe { parse(pmt) }.ok_or(windows_core::Error::from(VFW_E_INVALIDMEDIATYPE))?;
-            let base = self.shared.advertised();
+            let offered = self.shared.offered();
+            let base = *base_for(&offered, &parsed).ok_or(windows_core::Error::from(VFW_E_INVALIDMEDIATYPE))?;
             let mut state = self.shared.state();
             if let Some(connection) = &state.connection {
                 return if parsed.matches(&connection.format) { Ok(()) } else { Err(VFW_E_ALREADY_CONNECTED.into()) };
@@ -340,9 +358,11 @@ impl IAMStreamConfig_Impl for OutputPin_Impl {
         if picount.is_null() || pisize.is_null() {
             return Err(E_POINTER.into());
         }
+        let connected = self.shared.state().connection.is_some();
+        let count = if connected { 1 } else { self.shared.offered().len() as i32 };
         // SAFETY: Non-null caller out pointers.
         unsafe {
-            *picount = 1;
+            *picount = count;
             *pisize = core::mem::size_of::<VIDEO_STREAM_CONFIG_CAPS>() as i32;
         }
         Ok(())
@@ -353,13 +373,11 @@ impl IAMStreamConfig_Impl for OutputPin_Impl {
             if ppmt.is_null() || pscc.is_null() {
                 return Err(E_POINTER.into());
             }
-            if iindex != 0 {
-                return Err(E_INVALIDARG.into());
-            }
             // Bind first: the state guard must be released before
-            // `advertised()` locks the state again.
+            // `offered()` locks the state again.
             let connected = self.shared.state().connection.as_ref().map(|c| c.format);
-            let format = connected.unwrap_or_else(|| self.shared.advertised());
+            let formats = connected.map_or_else(|| self.shared.offered(), |format| vec![format]);
+            let format = *usize::try_from(iindex).ok().and_then(|index| formats.get(index)).ok_or(windows_core::Error::from(E_INVALIDARG))?;
             let mt = MediaType::new(&format, Header::VideoInfo).ok_or(windows_core::Error::from(E_UNEXPECTED))?;
             let size = SIZE {
                 cx: format.width as i32,

@@ -2,10 +2,13 @@
 //!
 //! One DLL serves every registered DirectShow camera: the requested CLSID is
 //! the camera id, validated against the camera records written by the
-//! manager. The filter exposes one capture output pin, advertises exactly one
-//! format at a time (the live producer's, else the user's last one, else the
-//! registered default), and pushes frames at the negotiated rate from the
-//! producer's transport v2 ring — black while no producer is attached.
+//! manager. The filter exposes one capture output pin and advertises the
+//! current format (the live producer's, else the registered idle default,
+//! else the user's last one) plus every other registered pixel format at the
+//! same size and rate. One graph at a time may connect; it publishes its
+//! negotiated format so the producer can switch pixel format. Frames are
+//! pushed as the producer publishes them from its transport v2 ring — black
+//! while no producer (or one in another format) is attached.
 //!
 //! Loader-lock discipline: there is no `DllMain` work at all; everything is
 //! initialized lazily through normal COM activation. Every exported function
@@ -17,6 +20,7 @@
 #![allow(linker_messages)]
 
 mod config;
+mod consumer;
 mod factory;
 mod filter;
 mod media_type;
@@ -138,6 +142,8 @@ mod tests {
         let name: Vec<u8> = wide("Unit Test Cam").iter().flat_map(|u| u.to_le_bytes()).collect();
         set(values::NAME, REG_SZ, &name);
         set(values::FORMAT, REG_BINARY, &format.to_wire().expect("wire").to_bytes());
+        let formats = virtualcam_protocol::registry::encode_pixel_formats(&[PixelFormat::Nv12, PixelFormat::Uyvy, PixelFormat::Rgb24]);
+        set(values::PIXEL_FORMATS, REG_BINARY, &formats);
         // SAFETY: Closes the key opened above.
         let _ = unsafe { RegCloseKey(key) };
         Record(path)
@@ -178,7 +184,7 @@ mod tests {
             let mut size = 0;
             // SAFETY: Valid out pointers.
             unsafe { config.GetNumberOfCapabilities(&mut count, &mut size) }.expect("caps count");
-            assert_eq!((count, size as usize), (1, size_of::<VIDEO_STREAM_CONFIG_CAPS>()));
+            assert_eq!((count, size as usize), (3, size_of::<VIDEO_STREAM_CONFIG_CAPS>()));
             let mut mt: *mut AM_MEDIA_TYPE = core::ptr::null_mut();
             let mut caps = VIDEO_STREAM_CONFIG_CAPS::default();
             // SAFETY: Valid out pointers; `caps` has the reported size.
@@ -191,6 +197,20 @@ mod tests {
             unsafe {
                 drop(MediaType(core::ptr::read(mt)));
                 CoTaskMemFree(Some(mt.cast()));
+            }
+            // The other registered formats follow at the same size and rate.
+            for (index, expected) in [(1, PixelFormat::Nv12), (2, PixelFormat::Rgb24)] {
+                let mut mt: *mut AM_MEDIA_TYPE = core::ptr::null_mut();
+                // SAFETY: Valid out pointers; `caps` has the reported size.
+                unsafe { config.GetStreamCaps(index, &mut mt, (&raw mut caps).cast()) }.expect("stream caps");
+                // SAFETY: `mt` is a valid heap media type we now own.
+                let parsed = unsafe { parse(mt) }.expect("parse caps type");
+                assert_eq!((parsed.pixel_format, parsed.width, parsed.height), (expected, 352, 288));
+                // SAFETY: Frees the caller-owned type (format block, then struct).
+                unsafe {
+                    drop(MediaType(core::ptr::read(mt)));
+                    CoTaskMemFree(Some(mt.cast()));
+                }
             }
 
             // A live source reports VFW_S_CANT_CUE while paused.

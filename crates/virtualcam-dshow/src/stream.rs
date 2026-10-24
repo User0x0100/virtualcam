@@ -1,13 +1,22 @@
-//! The push thread: paces samples at the negotiated rate and delivers them.
+//! The push thread: delivers producer frames as they are published.
 //!
-//! Each tick takes one allocator buffer, copies the newest producer frame
-//! straight into it (or writes black), stamps stream times, and calls
+//! While a live producer serves the connected format, the thread waits on
+//! the session's frame event and delivers each new frame immediately, so
+//! the source adds no pacing latency and never beats against the
+//! producer's cadence (duplicated / skipped frames). Delivery is capped
+//! near the negotiated rate, and a stalled producer's last frame is
+//! repeated every two intervals. Without a live producer (black) or with a
+//! producer lacking a frame event, a timer paces at the negotiated rate.
+//!
+//! Each delivery takes one allocator buffer, copies the newest producer
+//! frame straight into it (or writes black), stamps stream times, and calls
 //! `IMemInputPin::Receive`. Missed deadlines are skipped instead of being
 //! caught up in a burst. Paused graphs receive nothing (live source).
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use virtualcam_protocol::VideoFormat;
 use virtualcam_protocol::planes::fill_black;
 use windows::Win32::Foundation::{HANDLE, S_OK, WAIT_OBJECT_0};
 use windows::Win32::Media::DirectShow::{IMediaSample, State_Running, State_Stopped};
@@ -71,6 +80,49 @@ fn stopped(stop: &Handle) -> bool {
     unsafe { WaitForSingleObject(stop.0, 0) == WAIT_OBJECT_0 }
 }
 
+/// What woke a frame-event wait.
+enum Wake {
+    Stop,
+    Frame,
+    Timeout,
+}
+
+/// Waits for the frame event, stop, or `due` (QPC 100 ns).
+fn wait_frame(stop: &Handle, frame: &Handle, due: u64) -> Wake {
+    let timeout_ms = due.saturating_sub(now_100ns()).div_ceil(10_000).min(u64::from(u32::MAX - 1)) as u32;
+    let handles: [HANDLE; 2] = [stop.0, frame.0];
+    // SAFETY: Two live handles.
+    match unsafe { WaitForMultipleObjects(&handles, false, timeout_ms) } {
+        WAIT_OBJECT_0 => Wake::Stop,
+        result if result.0 == WAIT_OBJECT_0.0 + 1 => Wake::Frame,
+        _ => Wake::Timeout,
+    }
+}
+
+/// Waits for the next delivery while a frame-event producer serves the
+/// connection: a new frame (not before `earliest`), or `repeat_at` for a
+/// stalled one. Returns `None` on stop, `Some(false)` when the producer
+/// went away (fall back to the timer), `Some(true)` to deliver.
+fn wait_for_frame(shared: &Shared, format: &VideoFormat, stop: &Handle, timer: &Handle, delivered: u64, earliest: u64, repeat_at: u64) -> Option<bool> {
+    loop {
+        let Some((event, latest)) = shared.transport().live_signal(format) else { return Some(false) };
+        if latest != delivered {
+            // New frame: respect the rate cap, then deliver the newest.
+            return wait_until(stop, timer, earliest).then_some(true);
+        }
+        match wait_frame(stop, &event, repeat_at) {
+            Wake::Stop => return None,
+            // The event may still be set for the frame already delivered;
+            // the sequence check above filters that out.
+            Wake::Frame => {}
+            Wake::Timeout => return Some(true),
+        }
+        if now_100ns() >= repeat_at {
+            return Some(true);
+        }
+    }
+}
+
 /// Waits until `due` (QPC 100 ns) or stop; returns `false` on stop.
 fn wait_until(stop: &Handle, timer: &Handle, due: u64) -> bool {
     let now = now_100ns();
@@ -100,6 +152,9 @@ fn run(shared: &Shared, stop: &Handle, wake: &Handle, timer: &Handle) {
     let mut next_due: Option<u64> = None;
     let mut discontinuity = true;
     let mut downstream_refused = false;
+    // Sequence and QPC time of the last delivered producer frame.
+    let mut delivered_sequence = 0_u64;
+    let mut delivered_at = 0_u64;
 
     while !stopped(stop) {
         let (filter_state, start_time, run_qpc, clock) = {
@@ -119,14 +174,24 @@ fn run(shared: &Shared, stop: &Handle, wake: &Handle, timer: &Handle) {
             continue;
         }
 
-        let due = next_due.unwrap_or_else(now_100ns);
-        if !wait_until(stop, timer, due) {
-            return;
+        // Frame-driven while a live producer serves this connection; the
+        // cap tolerates a quarter interval of producer jitter.
+        let earliest = delivered_at + interval - interval / 4;
+        let repeat_at = delivered_at + 2 * interval;
+        match wait_for_frame(shared, &format, stop, timer, delivered_sequence, earliest, repeat_at) {
+            None => return,
+            Some(true) => next_due = None,
+            Some(false) => {
+                let due = next_due.unwrap_or_else(now_100ns);
+                if !wait_until(stop, timer, due) {
+                    return;
+                }
+                let now = now_100ns();
+                // Skip missed slots rather than bursting to catch up.
+                let next = due + interval;
+                next_due = Some(if next <= now { now + interval } else { next });
+            }
         }
-        let now = now_100ns();
-        // Skip missed slots rather than bursting to catch up.
-        let next = due + interval;
-        next_due = Some(if next <= now { now + interval } else { next });
 
         let mut sample: Option<IMediaSample> = None;
         // SAFETY: Valid allocator; blocks until a buffer is free or decommit.
@@ -144,9 +209,13 @@ fn run(shared: &Shared, stop: &Handle, wake: &Handle, timer: &Handle) {
         }
         // SAFETY: The allocator buffer spans `size` writable bytes while we hold the sample.
         let buffer = unsafe { core::slice::from_raw_parts_mut(pointer, size as usize) };
-        if !shared.transport().fill(buffer, &layout, &format, flip) {
-            let _ = fill_black(buffer, &layout, format.pixel_format, full_range);
+        match shared.transport().fill(buffer, &layout, &format, flip) {
+            Some(sequence) => delivered_sequence = sequence,
+            None => {
+                let _ = fill_black(buffer, &layout, format.pixel_format, full_range);
+            }
         }
+        delivered_at = now_100ns();
 
         // Stream time: reference clock relative to tStart, else QPC since Run.
         // SAFETY: Valid clock interface.

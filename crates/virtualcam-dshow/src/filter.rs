@@ -20,6 +20,7 @@ use windows::Win32::Media::IReferenceClock;
 use windows_core::{GUID, HRESULT, IUnknown, Interface, PCWSTR, PWSTR, implement};
 
 use crate::config::CameraConfig;
+use crate::consumer::ConsumerLease;
 use crate::media_type::MediaType;
 use crate::pin::{OutputPin, PinEnumerator};
 use crate::stream::Worker;
@@ -78,6 +79,8 @@ pub(crate) struct Connection {
     pub(crate) layout: FrameLayout,
     /// Bottom-up RGB DIB: rows are written in reverse order.
     pub(crate) flip: bool,
+    /// Held while connected; publishes `format` to the producer.
+    pub(crate) _lease: ConsumerLease,
 }
 
 pub(crate) struct State {
@@ -112,13 +115,18 @@ impl Shared {
         self.transport.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The single format offered while unconnected: an explicit
-    /// `SetFormat`, else the live producer's, else the idle format.
+    /// The current format: an explicit `SetFormat`, else the live
+    /// producer's, else the idle format.
     pub(crate) fn advertised(&self) -> VideoFormat {
         if let Some(preferred) = self.state().preferred {
             return preferred;
         }
         self.transport().live_format().unwrap_or_else(|| self.camera.idle_format())
+    }
+
+    /// Every format offered while unconnected, the current one first.
+    pub(crate) fn offered(&self) -> Vec<VideoFormat> {
+        self.camera.offered(self.advertised())
     }
 }
 

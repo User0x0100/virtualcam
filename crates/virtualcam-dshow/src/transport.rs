@@ -5,13 +5,19 @@
 //! and at most one zero-timeout wait on the producer process every 200 ms.
 //! Kernel objects are opened only when a producer session (generation)
 //! changes, and missing objects are re-probed at most twice per second.
+//!
+//! Each session also exposes the producer's auto-reset frame event, which
+//! the push thread waits on to deliver every frame as soon as it exists.
+
+use std::sync::Arc;
 
 use virtualcam_protocol::dshow::{CONTROL_STATE_ACTIVE, DshowControl, DshowNames};
 use virtualcam_protocol::planes::copy_frame;
 use virtualcam_protocol::ring::{RING_STATE_STOPPED, ReadOutcome, RingReader};
 use virtualcam_protocol::{CameraId, FrameLayout, VideoFormat};
 use windows::Win32::Foundation::{FILETIME, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+use windows::Win32::System::Threading::{GetProcessTimes, OpenEventW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject};
+use windows_core::PCWSTR;
 
 use crate::win::{Handle, ReadView, now_100ns};
 
@@ -27,8 +33,16 @@ struct Session {
     reader: RingReader,
     _view: ReadView,
     producer: Option<Handle>,
+    /// `None` for producers that predate frame events: timer pacing.
+    frame_event: Option<Arc<Handle>>,
     next_liveness_check: u64,
     alive: bool,
+}
+
+impl Session {
+    fn serves(&self, want: &VideoFormat) -> bool {
+        self.alive && self.format.pixel_format == want.pixel_format && self.format.width == want.width && self.format.height == want.height
+    }
 }
 
 /// Lazily attached view of one camera's producer sessions.
@@ -61,21 +75,31 @@ impl Transport {
         self.session.as_ref().filter(|s| s.alive && s.reader.state() != RING_STATE_STOPPED).map(|s| s.format)
     }
 
-    /// Copies the newest producer frame into `dst` when a live session
-    /// carries `want`'s pixel format and size. Returns `false` when the
-    /// caller should deliver black instead.
-    pub(crate) fn fill(&mut self, dst: &mut [u8], dst_layout: &FrameLayout, want: &VideoFormat, flip: bool) -> bool {
+    /// The frame event and latest sequence of a live session that carries
+    /// `want`'s pixel format and size, if it has a frame event.
+    pub(crate) fn live_signal(&mut self, want: &VideoFormat) -> Option<(Arc<Handle>, u64)> {
         self.refresh(now_100ns());
-        let Some(session) = self.session.as_ref() else { return false };
-        if !session.alive || session.format.pixel_format != want.pixel_format || session.format.width != want.width || session.format.height != want.height {
-            return false;
-        }
+        let session = self.session.as_ref().filter(|s| s.serves(want) && s.reader.state() != RING_STATE_STOPPED)?;
+        Some((Arc::clone(session.frame_event.as_ref()?), session.reader.latest_sequence()))
+    }
+
+    /// Copies the newest producer frame into `dst` when a live session
+    /// carries `want`'s pixel format and size, returning its sequence.
+    /// `None` means the caller should deliver black instead.
+    pub(crate) fn fill(&mut self, dst: &mut [u8], dst_layout: &FrameLayout, want: &VideoFormat, flip: bool) -> Option<u64> {
+        self.refresh(now_100ns());
+        let session = self.session.as_ref().filter(|s| s.serves(want))?;
         let mut copied = true;
         let outcome = session.reader.read_latest(|src| {
             // SAFETY: `src` spans the ring's validated tight frame layout.
             copied = unsafe { copy_frame(src, &session.source_layout, dst, dst_layout, flip) }.is_ok();
         });
-        copied && !matches!(outcome, ReadOutcome::Empty)
+        match outcome {
+            ReadOutcome::Frame { sequence, .. } if copied => Some(sequence),
+            // A torn read still beats black; it is superseded next frame.
+            ReadOutcome::Contended if copied => Some(session.reader.latest_sequence()),
+            _ => None,
+        }
     }
 
     fn refresh(&mut self, now: u64) {
@@ -126,6 +150,9 @@ impl Transport {
             return None;
         }
         let (producer, alive) = open_producer(snapshot.producer_pid, snapshot.producer_start_time);
+        let event_name = self.names.frame_event(snapshot.generation);
+        // SAFETY: NUL-terminated name; the handle is owned on success.
+        let frame_event = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(event_name.as_ptr())) }.ok().map(|raw| Arc::new(Handle(raw)));
         Some(Session {
             generation: snapshot.generation,
             format,
@@ -133,6 +160,7 @@ impl Transport {
             reader,
             _view: view,
             producer,
+            frame_event,
             next_liveness_check: now + LIVENESS_PERIOD_100NS,
             alive,
         })
