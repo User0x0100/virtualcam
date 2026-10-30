@@ -103,6 +103,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     scope: if args.scope == "machine" { RegistrationScope::AllUsers } else { RegistrationScope::CurrentUser },
                     default_format: Some(format),
                     pixel_formats: PixelFormat::MANAGED.to_vec(),
+                    frame_rates: [15, 24, 25, 30, 50, 60].map(FrameRate::fps).to_vec(),
                 })?,
                 "mf" => manager.register(MediaFoundationRegistration::new(name, format))?,
                 other => return Err(format!("unknown backend {other}").into()),

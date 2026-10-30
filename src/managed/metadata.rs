@@ -1,7 +1,7 @@
 //! Camera records in `{HKCU|HKLM}\Software\VirtualCamRs\Cameras\{ID}`.
 
-use virtualcam_protocol::registry::{BACKEND_DIRECTSHOW, BACKEND_MEDIA_FOUNDATION, CAMERAS_KEY, HISTORY_KEY, decode_pixel_formats, encode_pixel_formats, values};
-use virtualcam_protocol::{PixelFormat, VideoFormat, WireVideoFormat};
+use virtualcam_protocol::registry::{BACKEND_DIRECTSHOW, BACKEND_MEDIA_FOUNDATION, CAMERAS_KEY, HISTORY_KEY, decode_frame_rates, decode_pixel_formats, encode_frame_rates, encode_pixel_formats, values};
+use virtualcam_protocol::{FrameRate, PixelFormat, VideoFormat, WireVideoFormat};
 
 use super::{AppId, ManagedBackend};
 use crate::platform::registry::{Hive, Key};
@@ -16,6 +16,7 @@ pub(crate) struct CameraRecord {
     pub(crate) app_id: Option<AppId>,
     pub(crate) format: Option<VideoFormat>,
     pub(crate) pixel_formats: Vec<PixelFormat>,
+    pub(crate) frame_rates: Vec<FrameRate>,
     pub(crate) source_path: Option<String>,
     pub(crate) rendezvous_id: Option<String>,
     pub(crate) symbolic_link: Option<String>,
@@ -50,6 +51,9 @@ impl CameraRecord {
             }
             if !self.pixel_formats.is_empty() {
                 key.set_binary(values::PIXEL_FORMATS, &encode_pixel_formats(&self.pixel_formats))?;
+            }
+            if !self.frame_rates.is_empty() {
+                key.set_binary(values::FRAME_RATES, &encode_frame_rates(&self.frame_rates))?;
             }
             for (name, value) in [(values::SOURCE_PATH, &self.source_path), (values::RENDEZVOUS_ID, &self.rendezvous_id), (values::SYMBOLIC_LINK, &self.symbolic_link)] {
                 if let Some(value) = value {
@@ -87,6 +91,7 @@ impl CameraRecord {
             app_id: key.get_string(Some(values::APP_ID))?.and_then(|value| AppId::new(value).ok()),
             format,
             pixel_formats: key.get_binary(values::PIXEL_FORMATS)?.map(|bytes| decode_pixel_formats(&bytes)).unwrap_or_default(),
+            frame_rates: key.get_binary(values::FRAME_RATES)?.map(|bytes| decode_frame_rates(&bytes)).unwrap_or_default(),
             source_path: key.get_string(Some(values::SOURCE_PATH))?,
             rendezvous_id: key.get_string(Some(values::RENDEZVOUS_ID))?,
             symbolic_link: key.get_string(Some(values::SYMBOLIC_LINK))?,

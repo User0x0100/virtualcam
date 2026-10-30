@@ -117,8 +117,8 @@ Lifecycle：
 
 - one producer（第二个 -> `DeviceInUse`）；`close()` 即释放 producer lease（不必等 drop），便于立即以新格式重开。
 - one consumer graph（2026-10-24 用户要求去掉多消费者）：output pin `Connect` 时取 consumer lease，第二个 graph `Connect` 返回 `HRESULT_FROM_WIN32(ERROR_BUSY)`；`Disconnect`/filter 释放时归还并把 request 置 NONE。
-- producer decides runtime format；registration 存可选 `default_format` 与 `pixel_formats`（offered 列表）。
-- advertised：当前格式（SetFormat > live producer > registered default > per-user last format（`HKCU\Software\VirtualCamRs\History\{ID}\LastFormat`）> NV12 640x480@30）在前，其后是其余 registered pixel formats（同尺寸/帧率）。显式注册的默认格式优先于历史（2026-10-24 改）；`pixel_formats` 为空的旧注册只宣告当前格式。
+- producer decides runtime format；registration 存可选 `default_format`、`pixel_formats` 与 `frame_rates`（offered 列表，registry `FrameRates` 为 u32 分子/分母对，至多 16）。
+- advertised：当前格式（SetFormat > live producer > registered default > per-user last format（`HKCU\Software\VirtualCamRs\History\{ID}\LastFormat`）> NV12 640x480@30）在前，其后是其余 registered pixel formats（同尺寸）；每种 pixel format 依次按当前帧率与各 registered frame rate 宣告（pixel 外层、rate 内层）。显式注册的默认格式优先于历史（2026-10-24 改）；`pixel_formats` 为空的旧注册只宣告当前格式。
 - connected graph mode fixed；连接成功后 consumer 把格式写入 `DshowRequest`，producer 经 `VirtualCamera::requested_format()` 读到后自行决定是否以该 pixel format 重开（新 generation）。格式不同的 producer 在该 graph 上显示 black。
 - push thread 帧驱动：live producer 服务当前连接格式且有 frame event 时，等待 frame event，新 sequence 立即交付（速率上限约 0.75 interval，停滞时每 2 interval 重复最后一帧）；无 producer/格式不符/旧 producer 无 frame event 时，按 negotiated interval 定时器节拍发黑帧/帧。实测（`directshow_delivery_latency`，FFmpeg 低延迟参数，1080p30）中位延迟 31.2 ms -> 3.5 ms。
 - producer liveness = 打开 producer 进程（SYNCHRONIZE）+ 比对 creation time；死亡 -> black。
@@ -651,7 +651,7 @@ CUDA producer仍直接 D2H到 shared slot。CUDA Runtime 不在链接期绑定�
 当前 API：
 
 ```rust
-ManagedCameraRegistration::DirectShow(DirectShowRegistration { name, scope, default_format, pixel_formats })
+ManagedCameraRegistration::DirectShow(DirectShowRegistration { name, scope, default_format, pixel_formats, frame_rates })
 ManagedCameraRegistration::MediaFoundation(MediaFoundationRegistration { name, native_format })
 ```
 

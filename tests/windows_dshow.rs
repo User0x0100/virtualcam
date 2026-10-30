@@ -343,6 +343,57 @@ fn directshow_delivery_latency() {
 
 #[test]
 #[ignore = "registers a per-user DirectShow camera and drives FFmpeg"]
+fn consumer_requests_an_offered_frame_rate_and_the_source_paces_to_it() {
+    let source = staged_source();
+    let default = VideoFormat::new(PixelFormat::Nv12, 320, 240, FrameRate::fps(30));
+    let manager = ManagedCameraManager::for_app(AppId::new("dev.virtualcam.test").expect("app id")).with_dshow_source(&source);
+    let name = format!("VCRs Rate Test {}", std::process::id());
+    let info = manager
+        .register(DirectShowRegistration {
+            default_format: Some(default),
+            frame_rates: vec![FrameRate::fps(15), FrameRate::fps(60)],
+            ..DirectShowRegistration::new(&name)
+        })
+        .expect("register");
+    assert_eq!(info.frame_rates, [FrameRate::fps(15), FrameRate::fps(60)]);
+    let camera = Registration { manager, id: info.id, name };
+
+    // The consumer picks 15 FPS while the producer writes at about 60 FPS.
+    let mut producer = camera.manager.open(camera.id, default).expect("open producer");
+    let frames = 30_u32;
+    let mut consumer = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-f", "dshow", "-framerate", "15", "-i"])
+        .arg(format!("video={}", camera.name))
+        .args(["-frames:v", &frames.to_string(), "-f", "rawvideo", "-"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffmpeg");
+    let frame = pattern(&default);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut requested = None;
+    let mut first_request = None;
+    while consumer.try_wait().expect("poll ffmpeg").is_none() {
+        producer.write_host(&frame).expect("write NV12");
+        if requested.is_none() {
+            requested = producer.requested_format();
+            first_request = requested.map(|_| Instant::now());
+        }
+        assert!(Instant::now() < deadline, "consumer never finished");
+        thread::sleep(Duration::from_millis(16));
+    }
+    let elapsed = first_request.expect("consumer published its format").elapsed();
+    let output = consumer.wait_with_output().expect("ffmpeg");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requested = requested.expect("requested format");
+    assert_eq!((requested.pixel_format, requested.frame_rate.interval_100ns()), (PixelFormat::Nv12, Some(666_666)));
+    // 30 frames at 15 FPS take about two seconds, not the half second at 60 FPS.
+    assert!(elapsed >= Duration::from_millis(1500), "delivery was not paced to 15 FPS: {elapsed:?}");
+    producer.close().expect("close");
+}
+
+#[test]
+#[ignore = "registers a per-user DirectShow camera and drives FFmpeg"]
 fn single_consumer_requests_its_pixel_format_from_the_producer() {
     let source = staged_source();
     let default = VideoFormat::new(PixelFormat::Nv12, 320, 240, FrameRate::fps(30));

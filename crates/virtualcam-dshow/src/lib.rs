@@ -144,6 +144,8 @@ mod tests {
         set(values::FORMAT, REG_BINARY, &format.to_wire().expect("wire").to_bytes());
         let formats = virtualcam_protocol::registry::encode_pixel_formats(&[PixelFormat::Nv12, PixelFormat::Uyvy, PixelFormat::Rgb24]);
         set(values::PIXEL_FORMATS, REG_BINARY, &formats);
+        let rates = virtualcam_protocol::registry::encode_frame_rates(&[FrameRate::fps(25), FrameRate::fps(60)]);
+        set(values::FRAME_RATES, REG_BINARY, &rates);
         // SAFETY: Closes the key opened above.
         let _ = unsafe { RegCloseKey(key) };
         Record(path)
@@ -184,7 +186,8 @@ mod tests {
             let mut size = 0;
             // SAFETY: Valid out pointers.
             unsafe { config.GetNumberOfCapabilities(&mut count, &mut size) }.expect("caps count");
-            assert_eq!((count, size as usize), (3, size_of::<VIDEO_STREAM_CONFIG_CAPS>()));
+            // UYVY (current), NV12 and RGB24, each at 25 (current) and 60 FPS; the registered 25 is not repeated.
+            assert_eq!((count, size as usize), (6, size_of::<VIDEO_STREAM_CONFIG_CAPS>()));
             let mut mt: *mut AM_MEDIA_TYPE = core::ptr::null_mut();
             let mut caps = VIDEO_STREAM_CONFIG_CAPS::default();
             // SAFETY: Valid out pointers; `caps` has the reported size.
@@ -198,14 +201,21 @@ mod tests {
                 drop(MediaType(core::ptr::read(mt)));
                 CoTaskMemFree(Some(mt.cast()));
             }
-            // The other registered formats follow at the same size and rate.
-            for (index, expected) in [(1, PixelFormat::Nv12), (2, PixelFormat::Rgb24)] {
+            // Each pixel format is offered at every registered rate, current rate first.
+            for (index, expected, interval) in [
+                (1, PixelFormat::Uyvy, 166_666),
+                (2, PixelFormat::Nv12, 400_000),
+                (3, PixelFormat::Nv12, 166_666),
+                (4, PixelFormat::Rgb24, 400_000),
+                (5, PixelFormat::Rgb24, 166_666),
+            ] {
                 let mut mt: *mut AM_MEDIA_TYPE = core::ptr::null_mut();
                 // SAFETY: Valid out pointers; `caps` has the reported size.
                 unsafe { config.GetStreamCaps(index, &mut mt, (&raw mut caps).cast()) }.expect("stream caps");
                 // SAFETY: `mt` is a valid heap media type we now own.
                 let parsed = unsafe { parse(mt) }.expect("parse caps type");
-                assert_eq!((parsed.pixel_format, parsed.width, parsed.height), (expected, 352, 288));
+                assert_eq!((parsed.pixel_format, parsed.width, parsed.height, parsed.interval_100ns), (expected, 352, 288, interval));
+                assert_eq!((caps.MinFrameInterval, caps.MaxFrameInterval), (interval, interval));
                 // SAFETY: Frees the caller-owned type (format block, then struct).
                 unsafe {
                     drop(MediaType(core::ptr::read(mt)));

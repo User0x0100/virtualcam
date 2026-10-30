@@ -95,7 +95,7 @@ let _status: WriteStatus = camera.write_host(&frame)?;
 
 ### Runtime behavior
 
-- **Idle cameras** emit black. A DirectShow camera advertises its current format — the live producer's, else the registered `default_format`, else this user's last published format for that camera, else NV12 640x480@30 — followed by every other registered `pixel_formats` entry at the same size and rate. `IAMStreamConfig::SetFormat` lets a consumer pick an offered pixel format before connecting.
+- **Idle cameras** emit black. A DirectShow camera advertises its current format — the live producer's, else the registered `default_format`, else this user's last published format for that camera, else NV12 640x480@30 — followed by every other registered `pixel_formats` entry at the same size; each pixel format is offered at the current rate and then at every registered `frame_rates` entry. The connected rate reaches the producer through `requested_format()`, and the source paces delivery to it. `IAMStreamConfig::SetFormat` lets a consumer pick an offered pixel format before connecting.
 - **One consumer graph** may connect a DirectShow camera at a time (a second one gets `ERROR_BUSY`). It publishes its negotiated format; a producer reads it with `VirtualCamera::requested_format()` and may reopen in that pixel format.
 - **Frame-driven delivery:** each published frame signals the DirectShow source, which delivers it immediately instead of on its own timer (no pacing latency, no beat against the producer's cadence).
 - A connected DirectShow graph keeps its negotiated format; a producer with another format shows black there until the graph reconnects. Producers with the same format attach without reconnecting.

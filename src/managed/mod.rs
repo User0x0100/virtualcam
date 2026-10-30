@@ -21,7 +21,7 @@ use std::path::PathBuf;
 pub use legacy::LegacyCamera;
 pub use virtualcam_protocol::CameraId as ManagedCameraId;
 
-use crate::{Error, PixelFormat, Result, VideoFormat, VirtualCamera};
+use crate::{Error, FrameRate, PixelFormat, Result, VideoFormat, VirtualCamera};
 
 #[cfg(windows)]
 mod com;
@@ -108,6 +108,13 @@ pub struct DirectShowRegistration {
     /// list only formats the producer will switch to. Empty offers just the
     /// current format.
     pub pixel_formats: Vec<PixelFormat>,
+    /// Frame rates offered beside the current one, in preference order; every
+    /// offered pixel format is advertised at each rate. The connected graph's
+    /// rate reaches the producer through
+    /// [`VirtualCamera::requested_format`](crate::VirtualCamera::requested_format)
+    /// like its pixel format. The source paces delivery to the connected rate
+    /// whatever rate the producer writes at. Empty offers just the current rate.
+    pub frame_rates: Vec<FrameRate>,
 }
 
 impl DirectShowRegistration {
@@ -118,6 +125,7 @@ impl DirectShowRegistration {
             scope: RegistrationScope::CurrentUser,
             default_format: None,
             pixel_formats: Vec::new(),
+            frame_rates: Vec::new(),
         }
     }
 }
@@ -187,6 +195,9 @@ pub struct ManagedCameraInfo {
     /// DirectShow offered pixel formats (see
     /// [`DirectShowRegistration::pixel_formats`]); empty for Media Foundation.
     pub pixel_formats: Vec<PixelFormat>,
+    /// DirectShow offered frame rates (see
+    /// [`DirectShowRegistration::frame_rates`]); empty for Media Foundation.
+    pub frame_rates: Vec<FrameRate>,
     /// Registration completeness.
     pub health: RegistrationHealth,
 }
@@ -238,6 +249,9 @@ impl ManagedCameraManager {
                 }
                 if r.pixel_formats.iter().any(|format| !format.is_managed()) || r.pixel_formats.len() > virtualcam_protocol::registry::MAX_PIXEL_FORMATS {
                     return Err(virtualcam_protocol::FormatError::UnsupportedPixelFormat.into());
+                }
+                if r.frame_rates.len() > virtualcam_protocol::registry::MAX_FRAME_RATES || r.frame_rates.iter().any(|rate| !rate.interval_100ns().is_some_and(|interval| interval > 0)) {
+                    return Err(virtualcam_protocol::FormatError::InvalidFrameRate.into());
                 }
             }
             ManagedCameraRegistration::MediaFoundation(r) => {
@@ -466,6 +480,7 @@ mod imp {
             app_id: record.app_id.clone(),
             format: record.format,
             pixel_formats: record.pixel_formats.clone(),
+            frame_rates: record.frame_rates.clone(),
             health: health(record),
         }
     }
@@ -527,6 +542,7 @@ mod imp {
                     app_id: manager.app_id.clone(),
                     format: request.default_format,
                     pixel_formats: request.pixel_formats,
+                    frame_rates: request.frame_rates,
                     source_path: Some(source.clone()),
                     rendezvous_id: None,
                     symbolic_link: None,
