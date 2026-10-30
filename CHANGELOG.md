@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The `cuda` feature no longer links `cudart`: `write_cuda` resolves its two CUDA Runtime functions at runtime from the Runtime DLL the application loaded (else the standard DLL search). Fixes duplicate-symbol link errors in applications that link the CUDA Runtime themselves (for example through `raw-dylib`) and removes the CUDA major-version pin. A missing Runtime surfaces as `Error::Windows`.
 - DirectShow cameras register an ordered `DirectShowRegistration::pixel_formats` list (`ManagedCameraInfo::pixel_formats`, registry `PixelFormats`) and advertise all of them at the current size and rate. Only one consumer graph may connect at a time; it publishes its negotiated format, which producers read with the new `VirtualCamera::requested_format()` to switch pixel format.
 - DirectShow delivery is frame-driven: producers set a per-session frame event and the source pushes each frame as it is published. Measured 1080p30 source latency dropped from a median of 31.2 ms (one frame interval) to 3.5 ms.
 - A registered DirectShow `default_format` now outranks the user's last published format for idle cameras.

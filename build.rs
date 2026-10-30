@@ -2,6 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    // 库本身不链接 CUDA；该搜索路径只供自行链接 cudart.lib 的 CUDA 示例使用。
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() || env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {

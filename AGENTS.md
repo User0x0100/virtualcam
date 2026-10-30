@@ -634,7 +634,7 @@ API最终宜返回新 `ManagedCameraInfo`。
 - unnecessary staging。
 - catch-up burst。
 
-CUDA producer仍直接 D2H到 shared slot。
+CUDA producer仍直接 D2H到 shared slot。CUDA Runtime 不在链接期绑定：运行时从应用已加载的 `cudart64_*.dll` 解析 `cudaMemcpyAsync`/`cudaStreamSynchronize`（固定模块，找不到再按系统搜索加载），避免与自行链接 Runtime 的应用符号重复，也不锁定 CUDA 主版本。
 
 ## 25. 未完成工作
 

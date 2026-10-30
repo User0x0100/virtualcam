@@ -431,6 +431,7 @@ let status = unsafe { camera.write_cuda(device_ptr, camera.frame_size(), Some(st
 
 - 显存数据直接 D2H 拷贝到共享内存，库内部不分配中间缓冲。
 - 这是同步调用：返回时拷贝和 `cudaStreamSynchronize` 已完成，帧已经发布。
+- 本库不链接任何 CUDA 库：首次调用时从应用已加载的 CUDA Runtime DLL（依次 `cudart64_13.dll`、`_12`、`_110`、`_101`，找到后固定在进程内）取 `cudaMemcpyAsync` 与 `cudaStreamSynchronize`，找不到再按系统 DLL 搜索加载；因此应用以何种方式链接 CUDA Runtime 都不会符号重复，也不绑定 CUDA 主版本。缺少 Runtime 时返回 `Error::Windows`。
 - 显存中的数据必须已经是目标格式的紧密排列；不接受 CUDA array、texture 或带 pitch 的分配。
 
 ## 11. 旧版 C++ 驱动摄像头迁移

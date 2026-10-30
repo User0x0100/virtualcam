@@ -312,7 +312,7 @@ affinity. The crate never calls `cudaSetDevice`, context APIs,
 the failing operation and exact numeric `cudaError_t`; the minimal binding does
 not call `cudaGetErrorString`.
 
-On Windows, linking uses the toolkit's `cudart.lib`; `build.rs` adds `%CUDA_PATH%\lib\x64` (or `Win32`) when that environment variable is present. The library is linked as an unbundled static library: CUDA 13 ships `cudart.lib` as a loader shim without `__imp_` import thunks, and plain-symbol references resolve against both that shim and older import-library toolkits. The default build never compiles or links CUDA code.
+The library links no CUDA library. On first use `write_cuda` resolves `cudaMemcpyAsync` and `cudaStreamSynchronize` from the CUDA Runtime DLL the application already loaded (`cudart64_13.dll`, then `_12`, `_110`, `_101`; the module is pinned), falling back to the standard DLL search. Applications may therefore link the Runtime however they like (import library, CUDA 13's static `cudart.lib` loader, or `raw-dylib`) without duplicate symbols, and no CUDA major version is pinned. A missing Runtime is reported as `Error::Windows`. `build.rs` still adds `%CUDA_PATH%\lib\x64` (or `Win32`) for the CUDA example, which links `cudart.lib` itself. The default build never compiles CUDA code.
 
 ## `force_open`
 
