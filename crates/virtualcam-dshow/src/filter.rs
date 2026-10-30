@@ -9,6 +9,7 @@
 use core::ffi::c_void;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub(crate) use raw::{IBaseFilterRaw, IBaseFilterRaw_Impl, IMediaFilterRaw_Impl, IPersistRaw_Impl};
 use virtualcam_protocol::dshow::PIN_NAME;
 use virtualcam_protocol::{FrameLayout, VideoFormat};
 use windows::Win32::Foundation::{E_NOTIMPL, E_POINTER, S_OK};
@@ -26,8 +27,6 @@ use crate::pin::{OutputPin, PinEnumerator};
 use crate::stream::Worker;
 use crate::transport::Transport;
 use crate::{ModuleRef, guard_hr};
-
-pub(crate) use raw::{IBaseFilterRaw, IBaseFilterRaw_Impl, IMediaFilterRaw_Impl, IPersistRaw_Impl};
 
 #[allow(non_snake_case)]
 mod raw {

@@ -11,11 +11,10 @@
 //! own timer. The connected consumer's pixel format arrives through the
 //! request mapping; acting on it is the caller's decision.
 
-use virtualcam_protocol::ValidatedFormat;
-use virtualcam_protocol::VideoFormat;
 use virtualcam_protocol::dshow::{CONTROL_MAGIC, CONTROL_STATE_ACTIVE, CONTROL_STATE_STOPPED, CONTROL_VERSION, DshowControl, DshowNames, DshowRequest, REQUEST_STATE_CONNECTED};
 use virtualcam_protocol::registry::values;
 use virtualcam_protocol::ring::{DEFAULT_SLOT_COUNT, RingLayout, RingWriter};
+use virtualcam_protocol::{ValidatedFormat, VideoFormat};
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_ALL_ACCESS, PAGE_READWRITE};
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, SetEvent};

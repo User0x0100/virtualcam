@@ -17,13 +17,13 @@ mod protocol;
 mod queue_writer;
 mod unity_capture;
 
+use virtualcam_protocol::ValidatedFormat;
+
 use self::managed_dshow::ManagedDshowBackend;
 use self::managed_mf::ManagedMfBackend;
 use self::obs::ObsBackend;
 use self::protocol::unity_capture::ObjectNames;
 use self::unity_capture::UnityCaptureBackend;
-use virtualcam_protocol::ValidatedFormat;
-
 use crate::config::{ValidatedObsOptions, ValidatedUnityCaptureOptions};
 use crate::platform::windows::registry_key_exists;
 use crate::{CameraType, Error, ManagedCameraId, Result, WriteStatus};

@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use virtualcam_protocol::ValidatedFormat;
-use windows::Win32::Foundation::ERROR_SET_NOT_FOUND;
-use windows::Win32::Foundation::{E_NOTIMPL, E_POINTER, S_OK};
+use windows::Win32::Foundation::{E_NOTIMPL, E_POINTER, ERROR_SET_NOT_FOUND, S_OK};
 use windows::Win32::Media::KernelStreaming::{IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE};
 use windows::Win32::Media::MediaFoundation::{
     IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFGetService, IMFGetService_Impl, IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource_Impl, IMFMediaSourceEx, IMFMediaSourceEx_Impl, IMFMediaType,
@@ -20,10 +19,9 @@ use windows::Win32::Media::MediaFoundation::{
     MFCreatePresentationDescriptor, MFCreateStreamDescriptor, MFFrameSourceTypes_Color, MFGetSystemTime, MFMEDIASOURCE_IS_LIVE, MFMediaType_Video, MFSampleAllocatorUsage, MFSampleAllocatorUsage_UsesProvidedAllocator,
     MFVideoInterlace_Progressive,
 };
-use windows::Win32::System::Com::IAgileObject;
-use windows::Win32::System::Com::IAgileObject_Impl;
 use windows::Win32::System::Com::Marshal::IMarshal;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows::Win32::System::Com::{IAgileObject, IAgileObject_Impl};
 use windows::Win32::System::Variant::{VT_EMPTY, VT_I8};
 use windows_core::{ComObject, GUID, HRESULT, IUnknown, Interface, Ref, implement};
 

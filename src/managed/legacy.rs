@@ -33,8 +33,12 @@ pub(super) fn list() -> Result<Vec<LegacyCamera>> {
     let mut cameras = Vec::new();
     for subkey in root.subkeys()? {
         let Ok(id) = subkey.parse::<ManagedCameraId>() else { continue };
-        let name = Key::open(Hive::LocalMachine, &format!("{LEGACY_ROOT}\\{subkey}"))?.and_then(|key| key.get_string(Some("Name")).ok().flatten()).unwrap_or_default();
-        let driver_path = Key::open(Hive::LocalMachine, &format!("Software\\Classes\\CLSID\\{id}\\InprocServer32"))?.and_then(|key| key.get_string(None).ok().flatten()).map(PathBuf::from);
+        let name = Key::open(Hive::LocalMachine, &format!("{LEGACY_ROOT}\\{subkey}"))?
+            .and_then(|key| key.get_string(Some("Name")).ok().flatten())
+            .unwrap_or_default();
+        let driver_path = Key::open(Hive::LocalMachine, &format!("Software\\Classes\\CLSID\\{id}\\InprocServer32"))?
+            .and_then(|key| key.get_string(None).ok().flatten())
+            .map(PathBuf::from);
         cameras.push(LegacyCamera { id, name, driver_path });
     }
     Ok(cameras)

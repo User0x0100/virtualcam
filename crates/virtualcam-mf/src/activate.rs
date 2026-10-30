@@ -10,10 +10,9 @@ use std::sync::Mutex;
 
 use windows::Win32::Foundation::E_NOTIMPL;
 use windows::Win32::Media::MediaFoundation::{IMFActivate, IMFActivate_Impl, IMFAttributes, IMFAttributes_Impl, MF_ATTRIBUTE_TYPE, MF_ATTRIBUTES_MATCH_TYPE, MFCreateAttributes};
-use windows::Win32::System::Com::IAgileObject;
-use windows::Win32::System::Com::IAgileObject_Impl;
 use windows::Win32::System::Com::Marshal::IMarshal;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows::Win32::System::Com::{IAgileObject, IAgileObject_Impl};
 use windows_core::{BOOL, ComObject, GUID, IUnknown, Interface, PCWSTR, PWSTR, Ref, implement};
 
 use crate::config::SourceConfig;

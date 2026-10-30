@@ -6,10 +6,9 @@ use virtualcam_protocol::VideoFormat;
 use virtualcam_protocol::dshow::{DshowNames, PIN_NAME, guids};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_POINTER, E_UNEXPECTED, ERROR_BUSY, S_FALSE, S_OK, SIZE};
 use windows::Win32::Media::DirectShow::{
-    ALLOCATOR_PROPERTIES, IAMStreamConfig, IAMStreamConfig_Impl, IBaseFilter, IEnumMediaTypes, IEnumMediaTypes_Impl, IEnumPins, IEnumPins_Impl, IMemAllocator, IMemInputPin, IPin, IPin_Impl, PIN_DIRECTION, PIN_INFO, PINDIR_OUTPUT,
-    State_Stopped, VFW_E_ALREADY_CONNECTED, VFW_E_INVALIDMEDIATYPE, VFW_E_NO_ACCEPTABLE_TYPES, VFW_E_NOT_CONNECTED, VFW_E_NOT_STOPPED, VIDEO_STREAM_CONFIG_CAPS,
+    ALLOCATOR_PROPERTIES, E_PROP_ID_UNSUPPORTED, E_PROP_SET_UNSUPPORTED, IAMStreamConfig, IAMStreamConfig_Impl, IBaseFilter, IEnumMediaTypes, IEnumMediaTypes_Impl, IEnumPins, IEnumPins_Impl, IMemAllocator, IMemInputPin, IPin,
+    IPin_Impl, PIN_DIRECTION, PIN_INFO, PINDIR_OUTPUT, State_Stopped, VFW_E_ALREADY_CONNECTED, VFW_E_INVALIDMEDIATYPE, VFW_E_NO_ACCEPTABLE_TYPES, VFW_E_NOT_CONNECTED, VFW_E_NOT_STOPPED, VIDEO_STREAM_CONFIG_CAPS,
 };
-use windows::Win32::Media::DirectShow::{E_PROP_ID_UNSUPPORTED, E_PROP_SET_UNSUPPORTED};
 use windows::Win32::Media::KernelStreaming::{IKsPropertySet, IKsPropertySet_Impl};
 use windows::Win32::Media::MediaFoundation::AM_MEDIA_TYPE;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemAlloc};

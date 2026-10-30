@@ -2,14 +2,15 @@ use core::cell::Cell;
 use core::marker::PhantomData;
 
 #[cfg(windows)]
+use virtualcam_protocol::ValidatedFormat;
+
+#[cfg(windows)]
 use crate::ManagedCameraId;
 #[cfg(windows)]
 use crate::backend::Backend;
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaStream;
 use crate::{CameraType, Error, ObsOptions, PixelFormat, Result, UnityCaptureOptions, VideoFormat, WriteStatus};
-#[cfg(windows)]
-use virtualcam_protocol::ValidatedFormat;
 
 /// Unified producer facade for a selected virtual-camera backend.
 ///
