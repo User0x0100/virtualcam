@@ -1,4 +1,7 @@
-//! The media source: one immutable native mode, live, request-driven.
+//! The media source: live and request-driven. It offers the conversions it
+//! performs itself, then the immutable native mode the producer writes
+//! (`virtualcam_protocol::convert`), so consumers never depend on Windows'
+//! own conversion in Frame Server's DirectShow bridge.
 //!
 //! Lock hierarchy is Source -> Stream only: source methods may call stream
 //! methods while holding the source lock; stream methods never call back
@@ -7,7 +10,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use virtualcam_protocol::ValidatedFormat;
+use virtualcam_protocol::convert::conversions_from;
+use virtualcam_protocol::{ValidatedFormat, VideoFormat};
 use windows::Win32::Foundation::{E_NOTIMPL, E_POINTER, ERROR_SET_NOT_FOUND, S_OK};
 use windows::Win32::Media::KernelStreaming::{IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE};
 use windows::Win32::Media::MediaFoundation::{
@@ -57,8 +61,16 @@ pub(crate) struct MediaSource {
     _module: ModuleRef,
 }
 
-/// Builds the media type of the immutable native mode.
-pub(crate) fn native_media_type(format: &ValidatedFormat) -> windows_core::Result<IMFMediaType> {
+/// The offered modes: `native` first, then each conversion from it with the
+/// same size, rate and colorimetry.
+pub(crate) fn offered_formats(native: &ValidatedFormat) -> Vec<ValidatedFormat> {
+    let base = native.format();
+    let converted = conversions_from(base.pixel_format).iter().filter_map(|&pixel_format| VideoFormat { pixel_format, ..base }.validate().ok());
+    core::iter::once(*native).chain(converted).collect()
+}
+
+/// Builds the media type of one offered mode.
+pub(crate) fn mode_media_type(format: &ValidatedFormat) -> windows_core::Result<IMFMediaType> {
     let video = format.format();
     let subtype = video.pixel_format.mf_subtype().ok_or_else(|| windows_core::Error::from(MF_E_INVALIDREQUEST))?;
     // SAFETY: Plain MF object creation and attribute writes.
@@ -105,11 +117,21 @@ fn set_stream_attributes(target: &IMFAttributes) -> windows_core::Result<()> {
 
 impl MediaSource {
     pub(crate) fn create(config: SourceConfig) -> windows_core::Result<ComObject<Self>> {
-        let media_type = native_media_type(&config.format)?;
+        let offers = offered_formats(&config.format)
+            .into_iter()
+            .map(|format| mode_media_type(&format).map(|media_type| (format, media_type)))
+            .collect::<windows_core::Result<Vec<_>>>()?;
+        // Converted modes are listed before the native one. Frame Server's
+        // DirectShow bridge serves a DirectShow request from the first listed
+        // type it can convert from, so with NV12 first it answered YUY2
+        // requests with its own (shearing) conversion even though our YUY2
+        // was offered; with YUY2 first it passes every listed type through.
+        let types: Vec<Option<IMFMediaType>> = offers[1..].iter().chain(&offers[..1]).map(|(_, media_type)| Some(media_type.clone())).collect();
         // SAFETY: Plain MF object creation.
         let (descriptor, presentation, source_queue, stream_queue) = unsafe {
-            let descriptor = MFCreateStreamDescriptor(0, &[Some(media_type.clone())])?;
-            descriptor.GetMediaTypeHandler()?.SetCurrentMediaType(&media_type)?;
+            let descriptor = MFCreateStreamDescriptor(0, &types)?;
+            // The native mode is current until a consumer selects another.
+            descriptor.GetMediaTypeHandler()?.SetCurrentMediaType(&offers[0].1)?;
             let presentation = MFCreatePresentationDescriptor(Some(&[Some(descriptor.clone())]))?;
             presentation.SelectStream(0)?;
             (descriptor, presentation, MFCreateEventQueue()?, MFCreateEventQueue()?)
@@ -125,7 +147,7 @@ impl MediaSource {
         set_stream_attributes(&descriptor.cast()?)?;
 
         let transport = Arc::new(TransportSlot::default());
-        let stream = ComObject::new(MediaStream::new(stream_queue, descriptor, stream_attributes, media_type, config.format, Arc::clone(&transport)));
+        let stream = ComObject::new(MediaStream::new(stream_queue, descriptor, stream_attributes, offers, Arc::clone(&transport)));
         let rendezvous = Rendezvous::spawn(&config, transport);
         let source = ComObject::new(Self {
             queue: source_queue,
@@ -243,12 +265,16 @@ impl IMFMediaSource_Impl for MediaSource_Impl {
             // SAFETY: Plain clock read.
             let now = unsafe { MFGetSystemTime() };
             if selected.as_bool() {
+                let descriptor = descriptor.ok_or_else(|| windows_core::Error::from(E_POINTER))?;
+                // SAFETY: Valid descriptor.
+                let current = unsafe { descriptor.GetMediaTypeHandler()?.GetCurrentMediaType() }?;
+                let output = stream.offer_of(&current)?;
                 let event = if inner.announced { MEUpdatedStream } else { MENewStream };
                 let unknown: IUnknown = stream.to_interface();
                 // SAFETY: Valid queue and stream.
                 unsafe { self.queue.QueueEventParamUnk(event.0 as u32, &GUID::zeroed(), S_OK, &unknown) }?;
                 inner.announced = true;
-                stream.start(now)?;
+                stream.start(now, output)?;
             } else if stream.is_running() {
                 stream.stop()?;
             }

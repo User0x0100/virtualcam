@@ -2,7 +2,8 @@
 //!
 //! Producers always supply *tightly packed* frames in the layout described by
 //! [`PixelFormat::layout`]. Sources copy them plane-by-plane into whatever
-//! pitch the consumer's buffer uses; no source ever converts pixels.
+//! pitch the consumer's buffer uses. The only conversions are the ones a Media
+//! Foundation source offers besides its native mode ([`crate::convert`]).
 
 use core::fmt;
 use core::mem::{align_of, offset_of, size_of};
@@ -454,7 +455,7 @@ wire_enum!(
 
 /// Colorimetry signaled to consumers alongside the pixel format.
 ///
-/// It is metadata only: sources never convert pixels. Each field maps 1:1 to
+/// It is metadata only: no colorimetry conversion ever happens. Each field maps 1:1 to
 /// the Media Foundation `MF_MT_*` attribute and the DirectShow
 /// `DXVA_ExtendedFormat` bits of `VIDEOINFOHEADER2::dwControlFlags`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]

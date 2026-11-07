@@ -3,8 +3,9 @@
 //! Frame Server (Local Service, session 0) activates the fixed
 //! [`SOURCE_CLSID`](virtualcam_protocol::mf::SOURCE_CLSID) once per virtual
 //! camera and copies that camera's vendor attributes into our
-//! `IMFActivate`. The source advertises exactly the immutable native mode
-//! from those attributes, produces samples synchronously on `RequestSample`
+//! `IMFActivate`. The source advertises the immutable native mode from
+//! those attributes plus the conversions it performs itself (NV12/I420 to
+//! YUY2, see `virtualcam_protocol::convert`), produces samples synchronously on `RequestSample`
 //! (black until a producer attaches), and lazily authenticates producers on a
 //! named pipe before handing them a freshly created, DACL-protected ring.
 //!

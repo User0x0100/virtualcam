@@ -231,3 +231,153 @@ fn attributes_forward_to_the_activation_store() {
         assert_eq!(activate.DetachObject().map_err(|e| e.code()), Err(windows::Win32::Foundation::E_NOTIMPL));
     }
 }
+
+/// Raw layout of a delivered sample's buffer: the pitch its memory really
+/// uses (a 2D buffer's own pitch, or the media type's stride for a linear one).
+fn raw_pitch(sample: &IMFSample) -> i32 {
+    use windows::Win32::Media::MediaFoundation::IMF2DBuffer;
+    // SAFETY: Valid sample with one buffer; the lock is balanced.
+    unsafe {
+        let buffer = sample.GetBufferByIndex(0).expect("buffer");
+        let Ok(buffer2d) = buffer.cast::<IMF2DBuffer>() else { return 0 };
+        let (mut scanline0, mut pitch) = (core::ptr::null_mut(), 0_i32);
+        buffer2d.Lock2D(&mut scanline0, &mut pitch).expect("lock2d");
+        buffer2d.Unlock2D().expect("unlock2d");
+        pitch
+    }
+}
+
+/// Frame Server and the DirectShow bridge read a sample as a tight frame of
+/// `MF_MT_DEFAULT_STRIDE`; a 2D buffer whose rows are padded for alignment
+/// (NV12 1080 wide -> 1088) is sheared on that path. Every delivered buffer
+/// must therefore be tight, with or without a pipeline allocator.
+#[test]
+fn delivered_buffers_are_tight_for_unaligned_widths() {
+    use windows::Win32::Media::MediaFoundation::{IMFSampleAllocatorControl, IMFVideoSampleAllocator, MFCreateVideoSampleAllocatorEx};
+    init();
+    let format = VideoFormat::new(PixelFormat::Nv12, 1080, 8, FrameRate::fps(30));
+    for with_allocator in [false, true] {
+        let activate = configured(&format);
+        let source = source(&activate).expect("source");
+        // SAFETY: Valid source for the rest of the iteration.
+        unsafe {
+            if with_allocator {
+                let mut raw: *mut c_void = core::ptr::null_mut();
+                MFCreateVideoSampleAllocatorEx(&IMFVideoSampleAllocator::IID, &mut raw).expect("allocator");
+                let allocator = IMFVideoSampleAllocator::from_raw(raw);
+                source.cast::<IMFSampleAllocatorControl>().expect("allocator control").SetDefaultAllocator(0, &allocator).expect("set allocator");
+            }
+            let pd = source.CreatePresentationDescriptor().expect("pd");
+            let generator: IMFMediaEventGenerator = source.cast().expect("generator");
+            source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
+            let stream: IMFMediaStream2 = events(&generator)
+                .into_iter()
+                .find(|(kind, _)| *kind as i32 == MENewStream.0)
+                .and_then(|(_, unk)| unk)
+                .expect("stream")
+                .cast()
+                .expect("IMFMediaStream2");
+            let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
+            let _ = events(&stream_events);
+            for _ in 0..2 {
+                stream.RequestSample(None).expect("request");
+                let delivered = events(&stream_events);
+                let sample: IMFSample = delivered
+                    .into_iter()
+                    .find(|(kind, _)| *kind as i32 == MEMediaSample.0)
+                    .and_then(|(_, unk)| unk)
+                    .expect("sample")
+                    .cast()
+                    .expect("IMFSample");
+                let pitch = raw_pitch(&sample);
+                assert!(pitch == 0 || pitch == 1080, "allocator={with_allocator}: delivered pitch {pitch}, expected a tight 1080");
+                // The raw (not converted) memory holds limited-range black.
+                let buffer = sample.GetBufferByIndex(0).expect("buffer");
+                let (mut data, mut length) = (core::ptr::null_mut(), 0_u32);
+                buffer.Lock(&mut data, None, Some(&mut length)).expect("lock");
+                let bytes = core::slice::from_raw_parts(data, length as usize).to_vec();
+                buffer.Unlock().expect("unlock");
+                assert_eq!(bytes.len(), 1080 * 8 * 3 / 2);
+                assert!(bytes[..1080 * 8].iter().all(|&y| y == 16) && bytes[1080 * 8..].iter().all(|&c| c == 128), "allocator={with_allocator}: black frame");
+            }
+            source.Shutdown().expect("shutdown");
+        }
+    }
+}
+
+/// An NV12 camera also offers YUY2, converted by the source itself, so the
+/// DirectShow bridge never converts; the selected type takes effect at start
+/// and can change across restarts.
+#[test]
+fn consumers_select_a_converted_mode() {
+    use windows::Win32::Media::MediaFoundation::{IMFSampleAllocatorControl, IMFVideoSampleAllocator, MFCreateVideoSampleAllocatorEx};
+    init();
+    let format = VideoFormat::new(PixelFormat::Nv12, 1080, 8, FrameRate::fps(30));
+    let subtype = |format: PixelFormat| GUID::from_u128(format.mf_subtype().expect("subtype"));
+    for with_allocator in [false, true] {
+        let source = source(&configured(&format)).expect("source");
+        // SAFETY: Valid source for the rest of the iteration.
+        unsafe {
+            if with_allocator {
+                let mut raw: *mut c_void = core::ptr::null_mut();
+                MFCreateVideoSampleAllocatorEx(&IMFVideoSampleAllocator::IID, &mut raw).expect("allocator");
+                source.cast::<IMFSampleAllocatorControl>().expect("control").SetDefaultAllocator(0, &IMFVideoSampleAllocator::from_raw(raw)).expect("set");
+            }
+            let pd = source.CreatePresentationDescriptor().expect("pd");
+            let mut selected = windows_core::BOOL::default();
+            let mut sd = None;
+            pd.GetStreamDescriptorByIndex(0, &mut selected, &mut sd).expect("sd");
+            let handler = sd.expect("sd").GetMediaTypeHandler().expect("handler");
+            let offered: Vec<GUID> = (0..handler.GetMediaTypeCount().expect("count"))
+                .map(|i| handler.GetMediaTypeByIndex(i).expect("type").GetGUID(&MF_MT_SUBTYPE).expect("subtype"))
+                .collect();
+            assert_eq!(
+                offered,
+                [subtype(PixelFormat::Yuy2), subtype(PixelFormat::Nv12)],
+                "conversions first (the DirectShow bridge takes the first type it can convert from), native last"
+            );
+            assert_eq!(handler.GetCurrentMediaType().expect("current").GetGUID(&MF_MT_SUBTYPE).expect("subtype"), subtype(PixelFormat::Nv12));
+            let yuy2 = handler.GetMediaTypeByIndex(0).expect("yuy2");
+            assert_eq!(yuy2.GetUINT64(&MF_MT_FRAME_SIZE).expect("size"), 1080 << 32 | 8);
+            assert_eq!(yuy2.GetUINT32(&windows::Win32::Media::MediaFoundation::MF_MT_DEFAULT_STRIDE).expect("stride"), 2160);
+
+            let generator: IMFMediaEventGenerator = source.cast().expect("generator");
+            let mut stream: Option<IMFMediaStream2> = None;
+            for (pick, pitch_bytes, bytes, black) in [(0, 2160, 1080 * 8 * 2, [16_u8, 128]), (1, 1080, 1080 * 8 * 3 / 2, [16, 16])] {
+                handler.SetCurrentMediaType(&handler.GetMediaTypeByIndex(pick).expect("type")).expect("select");
+                source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
+                let started = events(&generator);
+                if stream.is_none() {
+                    stream = started
+                        .iter()
+                        .find(|(kind, _)| *kind as i32 == MENewStream.0)
+                        .and_then(|(_, unk)| unk.clone())
+                        .map(|unk| unk.cast().expect("IMFMediaStream2"));
+                }
+                let stream = stream.as_ref().expect("stream");
+                let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
+                let _ = events(&stream_events);
+                stream.RequestSample(None).expect("request");
+                let sample: IMFSample = events(&stream_events)
+                    .into_iter()
+                    .find(|(kind, _)| *kind as i32 == MEMediaSample.0)
+                    .and_then(|(_, unk)| unk)
+                    .expect("sample")
+                    .cast()
+                    .expect("IMFSample");
+                let pitch = raw_pitch(&sample);
+                assert!(pitch == 0 || pitch == pitch_bytes, "allocator={with_allocator} pick={pick}: pitch {pitch}");
+                let buffer = sample.GetBufferByIndex(0).expect("buffer");
+                let (mut data, mut length) = (core::ptr::null_mut(), 0_u32);
+                buffer.Lock(&mut data, None, Some(&mut length)).expect("lock");
+                let frame = core::slice::from_raw_parts(data, length as usize).to_vec();
+                buffer.Unlock().expect("unlock");
+                assert_eq!(frame.len(), bytes, "allocator={with_allocator} pick={pick}");
+                assert_eq!(&frame[..2], &black, "allocator={with_allocator} pick={pick}: black");
+                source.Stop().expect("stop");
+                let _ = events(&generator);
+            }
+            source.Shutdown().expect("shutdown");
+        }
+    }
+}

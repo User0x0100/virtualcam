@@ -5,13 +5,13 @@
 | Backend | Input formats | Layout |
 | --- | --- | --- |
 | Managed DirectShow camera | NV12, I420, YUY2, UYVY, P010, BGRA32, RGB24 | tightly packed (see `PixelFormat::layout`) |
-| Managed Media Foundation camera | same set; one immutable native mode per camera | tightly packed |
+| Managed Media Foundation camera | same set; one immutable native mode per camera (NV12/I420 cameras also offer YUY2, converted by the source) | tightly packed |
 | OBS Virtual Camera | NV12 | tightly packed Y plane, then interleaved UV |
 | Unity Capture | RGBA8, RGBA FP16 gamma, or RGBA FP16 linear | tight or explicitly padded rows |
 
 中文使用说明书 / Chinese user guide: [docs/USER_GUIDE.zh-CN.md](docs/USER_GUIDE.zh-CN.md).
 
-Producers never scale or convert pixels. Sources copy each tightly packed frame straight into the consumer's buffer, honoring its pitch row by row (one `memcpy` when the layouts match); colorimetry is signaled as metadata only.
+Producers never scale or convert pixels. Sources copy each tightly packed frame straight into the consumer's buffer, honoring its pitch row by row (one `memcpy` when the layouts match); colorimetry is signaled as metadata only. The one exception: a Media Foundation camera whose native mode is NV12 or I420 also offers YUY2 and converts it in the source, because Frame Server's own DirectShow-bridge conversion shears frames whose width is not a multiple of 32 pixels.
 
 ## Managed cameras
 
@@ -22,7 +22,7 @@ The workspace builds two COM source DLLs and the library that manages them:
 | Seen by | DirectShow apps: FFmpeg `dshow`, OpenCV `CAP_DSHOW`, OBS, legacy conferencing apps | Frame Server apps: Windows Camera, browsers, Teams, WinRT `MediaCapture`, `IMFSourceReader` |
 | Install | none; each registration points at the DLL | once per machine, elevated: `install_media_foundation_source` |
 | Registration | `CurrentUser` (no elevation) or `AllUsers` (elevated) | per-user (`CurrentUser` access, `System` lifetime), no elevation |
-| Format | chosen by the producer for each session | one immutable native mode fixed at registration |
+| Format | chosen by the producer for each session | one immutable native mode fixed at registration, plus source-side YUY2 for NV12/I420 |
 | Transport | producer-owned, session-local | source-owned, authenticated, cross-session |
 
 ```powershell

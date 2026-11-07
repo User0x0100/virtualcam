@@ -159,7 +159,9 @@ MF source 在 producer 不存在时也必须能被 Frame Server 枚举 media typ
 
 **每台 MF camera 一个持久化 native mode**（任一 managed `PixelFormat` + width/height + fps num/den + `ColorSpace`），以 `WireVideoFormat` blob 存于 vendor attribute。
 
-- source 只 advertise 这个 mode；producer open 必须匹配（否则 `FormatMismatch`）。
+- source 还 advertise 自己能转换出的 mode（`virtualcam_protocol::convert::conversions_from`：NV12/I420 → YUY2，同尺寸/帧率/色彩）；consumer 在 Start 前选定当前 type，source 在 `RequestSample` 中转换。stream descriptor 中**转换 mode 排在前、native 排最后**，当前 type 默认仍是 native：DShow bridge 用列表中第一个它能转换的 type 响应 DShow 请求，native NV12 排第一时它对 YUY2 请求仍自行转换（错位），YUY2 排第一时每种 type 都直通（真机实测；`tests/windows_mf.rs` 的 `directshow_bridge_delivers_native_and_converted_modes_unsheared` 守护）。代价：Frame Server 把列表第一个 type 作为 MF client 的默认 type（不理会 source 设的 current type），未显式选择的 MF client 拿到 source 转换的 YUY2（1080×1920 每帧约 2 ms CPU）；显式选 native 仍逐字节直通（`frame_server_camera_delivers_producer_frames` 两者都验证）。producer 只写 native mode，open 必须匹配（否则 `FormatMismatch`）。
+- 原因：只有 native NV12 时 DirectShow app（OBS「视频采集设备」）选 YUY2 会走 Frame Server DShow bridge 自带的转换，宽度不是 32 像素倍数时（如 1080）行跨度对齐到 1088 却按紧密交付，画面斜向错位；source 自己提供 YUY2 后 bridge 直通。
+- source 交付的样本缓冲必须紧密（行跨度 = `MF_MT_DEFAULT_STRIDE`）：bridge 读原始内存、忽略 2D buffer 自身 pitch；分配器给出带填充的 buffer 时本次运行改用线性 buffer。
 - 禁止 producer 改变 runtime mode、dynamic capability mutation、implicit resize/fps convert。
 - native mode immutable。修改 = recreate camera，不能只更新 metadata/attributes，否则与已激活 FrameServer source 的旧 descriptor split-brain。
 - future multi-mode 由 source/client selection 驱动，再通知 producer。
@@ -839,7 +841,7 @@ CurrentUser/System cameras must be cleaned before source uninstall; if multi-use
 ~~first version NV12-only~~ 被 D053 取代。
 
 ### D053
-Managed cameras 支持 NV12/I420/YUY2/UYVY/P010/BGRA32/RGB24；`ColorSpace` 只作 metadata（VIH2 DXVA bits / `MF_MT_*`），source 不做转换，按 pitch 逐行 copy。
+Managed cameras 支持 NV12/I420/YUY2/UYVY/P010/BGRA32/RGB24；`ColorSpace` 只作 metadata（VIH2 DXVA bits / `MF_MT_*`），source 不做转换，按 pitch 逐行 copy。（2026-11-07 修订：MF source 额外提供 NV12/I420 → YUY2 自行转换，见 §8；DShow source 仍只 copy。）
 
 ### D054
 Managed transport v2：per-slot seqlock ring（VCR2），writer 不等待、reader 不接受 torn frame。DShow namespace `Local\VirtualCamRs2-{ID}-{Lease,Control,Ring-{GEN}}`；producer liveness = process handle + creation time。
