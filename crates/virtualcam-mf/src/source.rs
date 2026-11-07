@@ -149,7 +149,7 @@ impl MediaSource {
         set_stream_attributes(&stream_attributes)?;
         set_stream_attributes(&descriptor.cast()?)?;
 
-        let transport = Arc::new(TransportSlot::new());
+        let transport = Arc::new(TransportSlot::new()?);
         let stream = ComObject::new(MediaStream::new(stream_queue, descriptor, stream_attributes, offers, Arc::clone(&transport)));
         let rendezvous = Rendezvous::spawn(&config, transport);
         let source = ComObject::new(Self {

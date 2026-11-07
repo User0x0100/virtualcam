@@ -5,9 +5,9 @@
 //! camera and copies that camera's vendor attributes into our
 //! `IMFActivate`. The source advertises the immutable native mode from
 //! those attributes plus the conversions it performs itself (NV12/I420 to
-//! YUY2, see `virtualcam_protocol::convert`), produces samples synchronously on `RequestSample`
+//! YUY2, see `virtualcam_protocol::convert`), produces samples on `RequestSample`
 //! (black until a producer attaches), and lazily authenticates producers on a
-//! named pipe before handing them a freshly created, DACL-protected ring.
+//! named pipe before handing them a freshly created, DACL-protected ring and frame event.
 //!
 //! No work happens in `DllMain`; every export and COM method is
 //! panic-guarded; activate and source aggregate the free-threaded marshaler.

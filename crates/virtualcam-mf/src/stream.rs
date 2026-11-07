@@ -6,25 +6,25 @@
 //! per second) and burn its CPU. A request is therefore answered only when it
 //! is due:
 //!
-//! - a producer frame newer than the last delivered one is available
-//!   (frame-driven, no added latency);
+//! - a producer frame newer than the last delivered one is available,
+//!   subject to the shared cadence cap;
 //! - no producer frame exists (no producer, or none written yet): black at the
 //!   native frame interval;
 //! - a producer is attached but stalled: the newest frame again after
-//!   [`KEEPALIVE`], so consumers do not time out.
+//!   one second, so consumers do not time out.
 //!
 //! A request that is not due is queued and answered by the stream's pacing
-//! worker, which polls the ring every [`POLL`] while requests wait.
+//! worker, which waits for the frame event, state changes or the delivery deadline.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use virtualcam_protocol::convert::{can_convert, convert_frame};
+use virtualcam_protocol::delivery::Delivery;
 use virtualcam_protocol::planes::{CopyError, copy_frame, fill_black};
 use virtualcam_protocol::ring::ReadOutcome;
 use virtualcam_protocol::{FrameLayout, ValidatedFormat};
-use windows::Win32::Foundation::{E_POINTER, E_UNEXPECTED, S_OK};
+use windows::Win32::Foundation::{E_POINTER, E_UNEXPECTED, S_OK, WAIT_FAILED};
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMF2DBuffer2, IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaBuffer, IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource, IMFMediaStream_Impl, IMFMediaStream2,
     IMFMediaStream2_Impl, IMFMediaType, IMFSample, IMFStreamDescriptor, IMFVideoSampleAllocator, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MEError, MEMediaSample, MEStreamStarted, MEStreamStopped, MF_E_INVALIDMEDIATYPE,
@@ -33,6 +33,7 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 use windows_core::{ComObject, GUID, IUnknown, IUnknownImpl, Interface, Ref, implement};
 
 use crate::rendezvous::TransportSlot;
@@ -40,17 +41,9 @@ use crate::{ModuleRef, guard};
 
 /// Frames requested from a provided allocator.
 const ALLOCATOR_FRAMES: u32 = 10;
-/// How often the pacing worker checks the ring for a new producer frame
-/// while requests wait.
-const POLL: Duration = Duration::from_millis(1);
-/// Longest wait for a new frame from an attached producer before the newest
-/// one is delivered again.
-const KEEPALIVE: Duration = Duration::from_secs(1);
-
-/// When the oldest pending request may be answered.
-enum Due {
-    Now,
-    At(Instant),
+fn now_100ns() -> u64 {
+    // SAFETY: Plain monotonic MF clock read.
+    unsafe { MFGetSystemTime() }.max(0) as u64
 }
 
 pub(crate) struct StreamInner {
@@ -65,10 +58,7 @@ pub(crate) struct StreamInner {
     output: usize,
     /// Tokens of requests not answered yet, oldest first.
     pending: VecDeque<Option<IUnknown>>,
-    /// `(ring generation, sequence)` of the last processed producer frame.
-    delivered_frame: Option<(u64, u64)>,
-    /// When the last sample was delivered.
-    delivered_at: Option<Instant>,
+    delivery: Delivery,
     /// The pacing worker thread is running.
     worker: bool,
 }
@@ -86,8 +76,6 @@ pub(crate) struct MediaStream {
     offers: Vec<(ValidatedFormat, IMFMediaType)>,
     transport: Arc<TransportSlot>,
     inner: Mutex<StreamInner>,
-    /// Wakes the pacing worker on new requests, state changes and shutdown.
-    wake: Condvar,
     _module: ModuleRef,
 }
 
@@ -121,11 +109,9 @@ impl MediaStream {
                 allocator_ready: false,
                 output: 0,
                 pending: VecDeque::new(),
-                delivered_frame: None,
-                delivered_at: None,
+                delivery: Delivery::default(),
                 worker: false,
             }),
-            wake: Condvar::new(),
             _module: ModuleRef::new(),
         }
     }
@@ -207,7 +193,7 @@ impl MediaStream {
             }
         }
         inner.state = MF_STREAM_STATE_RUNNING;
-        self.wake.notify_all();
+        self.transport.wake();
         // SAFETY: Valid queue; the variant outlives the call.
         unsafe { self.queue.QueueEventParamVar(MEStreamStarted.0 as u32, &GUID::zeroed(), S_OK, &variant_i64(time)) }
     }
@@ -219,7 +205,7 @@ impl MediaStream {
         inner.state = MF_STREAM_STATE_STOPPED;
         // Requests of a stopped stream are never answered.
         inner.pending.clear();
-        self.wake.notify_all();
+        self.transport.wake();
         if inner.allocator_ready
             && let Some(allocator) = &inner.allocator
         {
@@ -252,7 +238,7 @@ impl MediaStream {
         inner.source = None;
         inner.pending.clear();
         // The pacing worker exits and drops its reference to this stream.
-        self.wake.notify_all();
+        self.transport.wake();
         // SAFETY: Valid queue; later queue calls report MF_E_SHUTDOWN.
         let _ = unsafe { self.queue.Shutdown() };
     }
@@ -400,18 +386,8 @@ impl MediaStream {
     }
 
     /// When the oldest pending request may be answered (see the module docs).
-    fn due(&self, inner: &StreamInner, now: Instant) -> Due {
-        let Some(last) = inner.delivered_at else { return Due::Now };
-        let at = match self.transport.latest_frame() {
-            Some(frame @ (_, sequence)) if sequence != 0 => {
-                if inner.delivered_frame != Some(frame) {
-                    return Due::Now;
-                }
-                last + KEEPALIVE
-            }
-            _ => last + Duration::from_nanos(self.native.interval_100ns().saturating_mul(100)),
-        };
-        if now >= at { Due::Now } else { Due::At(at) }
+    fn due(&self, inner: &StreamInner, now: u64) -> u64 {
+        inner.delivery.due(now, self.transport.latest_frame(), self.native.interval_100ns())
     }
 
     /// Answers the oldest pending request with a filled sample.
@@ -421,10 +397,8 @@ impl MediaStream {
         let sample = Self::allocate(inner, &output)?;
         // SAFETY: Valid sample with at least one buffer.
         let buffer = unsafe { sample.GetBufferByIndex(0) }?;
-        if let Some(frame) = self.fill(&buffer, &output)? {
-            inner.delivered_frame = Some(frame);
-        }
-        inner.delivered_at = Some(Instant::now());
+        let frame = self.fill(&buffer, &output)?;
+        inner.delivery.delivered(now_100ns(), frame);
         // SAFETY: Valid sample.
         unsafe {
             sample.SetSampleTime(MFGetSystemTime())?;
@@ -445,25 +419,35 @@ impl MediaStream {
                 inner.worker = false;
                 return;
             }
-            if inner.state != MF_STREAM_STATE_RUNNING || inner.pending.is_empty() {
-                inner = self.wake.wait(inner).unwrap_or_else(std::sync::PoisonError::into_inner);
-                continue;
-            }
-            let now = Instant::now();
-            match self.due(&inner, now) {
-                Due::Now => {
+            let (frame, timeout) = if inner.state == MF_STREAM_STATE_RUNNING && !inner.pending.is_empty() {
+                // Keep this session's event alive across the wait, even on detach.
+                let frame = self.transport.frame_event();
+                let now = now_100ns();
+                let due = self.due(&inner, now);
+                if due <= now {
                     if let Err(error) = self.deliver(&mut inner) {
                         // Asynchronous failure: reported as a stream error.
                         // SAFETY: Valid queue.
                         let _ = unsafe { self.queue.QueueEventParamVar(MEError.0 as u32, &GUID::zeroed(), error.code(), &PROPVARIANT::default()) };
                     }
+                    continue;
                 }
-                Due::At(at) => {
-                    // Release the lock while waiting; new requests only queue.
-                    drop(inner);
-                    std::thread::sleep(at.saturating_duration_since(now).min(POLL));
-                    inner = self.inner();
-                }
+                (frame, due.saturating_sub(now).div_ceil(10_000).min(u64::from(INFINITE - 1)) as u32)
+            } else {
+                (None, INFINITE)
+            };
+            let wake = self.transport.wake.0;
+            let handles = [wake, frame.as_ref().map_or(wake, |event| event.0)];
+            drop(inner);
+            // SAFETY: Distinct live handles; `frame` retains a detached session's event.
+            let waited = unsafe { WaitForMultipleObjects(&handles[..if frame.is_some() { 2 } else { 1 }], false, timeout) };
+            let error = (waited == WAIT_FAILED).then(windows_core::Error::from_thread);
+            inner = self.inner();
+            if let Some(error) = error {
+                inner.worker = false;
+                // SAFETY: Valid queue, or shutdown reports its own error.
+                let _ = unsafe { self.queue.QueueEventParamVar(MEError.0 as u32, &GUID::zeroed(), error.code(), &PROPVARIANT::default()) };
+                return;
             }
         }
     }
@@ -552,11 +536,12 @@ impl IMFMediaStream_Impl for MediaStream_Impl {
             inner.pending.push_back(token.as_ref().cloned());
             // Answer at once when due and nothing older waits; failures then
             // return their HRESULT here and are never also queued as MEError.
-            if inner.pending.len() == 1 && matches!(self.due(&inner, Instant::now()), Due::Now) {
+            let now = now_100ns();
+            if inner.pending.len() == 1 && self.due(&inner, now) <= now {
                 return self.deliver(&mut inner);
             }
             self.ensure_worker(&mut inner);
-            self.wake.notify_all();
+            self.transport.wake();
             Ok(())
         })
     }
@@ -571,7 +556,7 @@ impl IMFMediaStream2_Impl for MediaStream_Impl {
                 if value == MF_STREAM_STATE_STOPPED {
                     inner.pending.clear();
                 }
-                self.wake.notify_all();
+                self.transport.wake();
                 Ok(())
             }
             // Running is entered only through the source's Start, which

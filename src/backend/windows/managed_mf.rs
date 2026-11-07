@@ -19,7 +19,7 @@ use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED,
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Memory::{FILE_MAP_READ, FILE_MAP_WRITE, OpenFileMappingW};
 use windows_sys::Win32::System::Pipes::{PIPE_READMODE_MESSAGE, PeekNamedPipe, SetNamedPipeHandleState};
-use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{CreateEventW, EVENT_MODIFY_STATE, OpenEventW, WaitForSingleObject};
 
 use super::FrameSource;
 use crate::platform::windows::{MappedView, OwnedHandle, QpcClock, wide_nul};
@@ -39,6 +39,7 @@ struct Session {
     _view: MappedView,
     _section: OwnedHandle,
     pipe: OwnedHandle,
+    frame_event: OwnedHandle,
     next_liveness_check: Instant,
     /// The mode the source last asked for.
     requested: Option<VideoFormat>,
@@ -178,11 +179,15 @@ impl ManagedMfBackend {
             backend: CameraType::ManagedMediaFoundation,
             detail: "Media Foundation ring does not match the native format",
         })?;
+        let event_name = wide_nul(&welcome.frame_event_name);
+        // SAFETY: Source-owned event, producer needs only EVENT_MODIFY_STATE.
+        let frame_event = unsafe { OwnedHandle::from_result(OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr()), "OpenEventW(MF frame)") }?;
         Ok(Some(Session {
             writer,
             _view: view,
             _section: section,
             pipe,
+            frame_event,
             next_liveness_check: Instant::now() + LIVENESS_PERIOD,
             requested: None,
         }))
@@ -225,7 +230,7 @@ impl ManagedMfBackend {
 
     /// The mode the source asked for, when it differs from the one written.
     pub(crate) fn requested_format(&self) -> Option<VideoFormat> {
-        self.session.as_ref().and_then(|session| session.requested).filter(|requested| *requested != self.format.format())
+        virtualcam_protocol::delivery::requested_format(self.format.format(), self.session.as_ref().and_then(|session| session.requested))
     }
 
     pub(crate) fn is_ready(&mut self) -> Result<bool> {
@@ -253,13 +258,7 @@ impl ManagedMfBackend {
         let Some(session) = self.session.as_mut() else {
             return Ok(WriteStatus::ConsumerInactive);
         };
-        let payload = session.writer.begin_frame();
-        if let Err(error) = frame.copy_to(payload) {
-            session.writer.abort_frame();
-            return Err(error);
-        }
-        session.writer.commit_frame(timestamp);
-        Ok(WriteStatus::Written)
+        super::managed_frame::write_frame(&mut session.writer, &session.frame_event, frame, timestamp)
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {

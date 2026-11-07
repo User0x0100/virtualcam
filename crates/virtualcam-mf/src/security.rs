@@ -163,6 +163,11 @@ pub(crate) fn mapping_sddl(source: &Sid, owner: &Sid) -> Option<String> {
     Some(format!("D:P(A;;0xF001F;;;{})(A;;0x6;;;{})S:(ML;;NW;;;ME)", source.to_text()?, owner.to_text()?))
 }
 
+/// Same principals as the ring, with event-specific wait/signal rights.
+pub(crate) fn event_sddl(source: &Sid, owner: &Sid) -> Option<String> {
+    Some(format!("D:P(A;;0x1F0003;;;{})(A;;0x100002;;;{})S:(ML;;NW;;;ME)", source.to_text()?, owner.to_text()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +190,7 @@ mod tests {
         let service = Sid::parse("S-1-5-19").expect("local service");
         assert!(SecurityDescriptor::from_sddl(&pipe_sddl(&service, &me).expect("sddl")).is_some());
         assert!(SecurityDescriptor::from_sddl(&mapping_sddl(&service, &me).expect("sddl")).is_some());
+        assert!(SecurityDescriptor::from_sddl(&event_sddl(&service, &me).expect("sddl")).is_some());
         assert!(SecurityDescriptor::from_sddl("D:(garbage").is_none());
     }
 }

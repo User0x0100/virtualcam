@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use virtualcam_protocol::convert::is_offered;
-use virtualcam_protocol::mf::{Hello, Request, Welcome, WelcomeStatus, pipe_name, ring_name};
+use virtualcam_protocol::mf::{Hello, Request, Welcome, WelcomeStatus, frame_event_name, pipe_name, ring_name};
 use virtualcam_protocol::ring::{DEFAULT_SLOT_COUNT, ReadOutcome, RingLayout, RingReader, RingWriter};
 use virtualcam_protocol::{ValidatedFormat, VideoFormat};
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_HANDLE, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WIN32_ERROR};
@@ -36,7 +36,7 @@ use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, INFIN
 use windows_core::PCWSTR;
 
 use crate::config::{Rendezvous as RendezvousConfig, SourceConfig};
-use crate::security::{SecurityDescriptor, Sid, mapping_sddl, pipe_client_user, pipe_sddl, process_user};
+use crate::security::{SecurityDescriptor, Sid, event_sddl, mapping_sddl, pipe_client_user, pipe_sddl, process_user};
 use crate::{ModuleRef, guard};
 
 const HANDSHAKE_TIMEOUT_MS: u32 = 2_000;
@@ -81,6 +81,7 @@ struct Attached {
     _mapping: RingMapping,
     /// The mode the producer writes.
     format: ValidatedFormat,
+    frame_event: Arc<Handle>,
 }
 
 /// The currently attached producer ring and the consumers' selected mode,
@@ -89,19 +90,22 @@ pub(crate) struct TransportSlot {
     attached: Mutex<Option<Attached>>,
     selected: Mutex<Option<VideoFormat>>,
     /// Auto-reset event set on every selection; wakes the parked worker.
-    selected_event: Option<Handle>,
+    selected_event: Handle,
+    /// Wakes the stream on requests, state changes and transport replacement.
+    pub(crate) wake: Handle,
 }
 
 impl TransportSlot {
-    pub(crate) fn new() -> Self {
-        // SAFETY: Anonymous auto-reset event; without it the worker simply
-        // never sends requests.
-        let selected_event = unsafe { CreateEventW(None, false, false, None) }.ok().map(Handle);
-        Self {
+    pub(crate) fn new() -> windows_core::Result<Self> {
+        // SAFETY: Anonymous auto-reset events owned by this transport slot.
+        let selected_event = Handle(unsafe { CreateEventW(None, false, false, None) }?);
+        let wake = Handle(unsafe { CreateEventW(None, false, false, None) }?);
+        Ok(Self {
             attached: Mutex::new(None),
             selected: Mutex::new(None),
             selected_event,
-        }
+            wake,
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Attached>> {
@@ -123,13 +127,20 @@ impl TransportSlot {
         self.lock().as_ref().map(|attached| (attached.reader.generation(), attached.reader.latest_sequence()))
     }
 
+    pub(crate) fn frame_event(&self) -> Option<Arc<Handle>> {
+        self.lock().as_ref().map(|attached| Arc::clone(&attached.frame_event))
+    }
+
+    pub(crate) fn wake(&self) {
+        // SAFETY: Live slot-owned auto-reset event; signals coalesce.
+        let _ = unsafe { SetEvent(self.wake.0) };
+    }
+
     /// Records the mode consumers selected and wakes the worker.
     pub(crate) fn select(&self, format: VideoFormat) {
         *self.selected.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format);
-        if let Some(event) = &self.selected_event {
-            // SAFETY: Live event.
-            let _ = unsafe { SetEvent(event.0) };
-        }
+        // SAFETY: Live event.
+        let _ = unsafe { SetEvent(self.selected_event.0) };
     }
 
     fn selected(&self) -> Option<VideoFormat> {
@@ -138,10 +149,12 @@ impl TransportSlot {
 
     fn attach(&self, attached: Attached) {
         *self.lock() = Some(attached);
+        self.wake();
     }
 
     fn detach(&self) {
         *self.lock() = None;
+        self.wake();
     }
 }
 
@@ -368,8 +381,7 @@ fn park(slot: &TransportSlot, pipe: HANDLE, event: &Handle, cancel: &Handle, pro
             }
         };
         loop {
-            let selected = slot.selected_event.as_ref().map_or(cancel.0, |selected| selected.0);
-            let handles = [cancel.0, event.0, selected];
+            let handles = [cancel.0, event.0, slot.selected_event.0];
             // SAFETY: Three live handles.
             let waited = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
             match waited.0.wrapping_sub(WAIT_OBJECT_0.0) {
@@ -401,6 +413,8 @@ fn create_ring(format: &ValidatedFormat, me: &Sid, owner: &Sid, pipe: HANDLE) ->
     let layout = RingLayout::for_format(format, DEFAULT_SLOT_COUNT).ok()?;
     let descriptor = SecurityDescriptor::from_sddl(&mapping_sddl(me, owner)?)?;
     let attributes = descriptor.attributes();
+    let event_descriptor = SecurityDescriptor::from_sddl(&event_sddl(me, owner)?)?;
+    let event_attributes = event_descriptor.attributes();
     let mut client_pid = 0;
     // SAFETY: Connected pipe; writable output.
     let _ = unsafe { GetNamedPipeClientProcessId(pipe, &mut client_pid) };
@@ -438,6 +452,9 @@ fn create_ring(format: &ValidatedFormat, me: &Sid, owner: &Sid, pipe: HANDLE) ->
                 // Never reuse an object someone else created at our name.
                 break;
             }
+            let frame_name = frame_event_name(global, nonce);
+            let frame_wide: Vec<u16> = frame_name.encode_utf16().chain(core::iter::once(0)).collect();
+            let Some(frame_event) = create_fresh_event(&frame_wide, &event_attributes) else { break };
             // SAFETY: Whole-section read/write view.
             let view = unsafe { MapViewOfFile(handle.0, FILE_MAP_ALL_ACCESS, 0, 0, 0) };
             if view.Value.is_null() {
@@ -459,16 +476,139 @@ fn create_ring(format: &ValidatedFormat, me: &Sid, owner: &Sid, pipe: HANDLE) ->
                 ring_size: size,
                 generation,
                 ring_name: name,
+                frame_event_name: frame_name,
             };
             return Some((
                 Attached {
                     reader,
                     _mapping: mapping,
                     format: *format,
+                    frame_event: Arc::new(frame_event),
                 },
                 welcome,
             ));
         }
     }
     None
+}
+
+/// Refuses both same-type and different-type pre-existing named objects.
+fn create_fresh_event(name: &[u16], attributes: &windows::Win32::Security::SECURITY_ATTRIBUTES) -> Option<Handle> {
+    // SAFETY: NUL-terminated name and live explicit security descriptor.
+    let created = unsafe { CreateEventW(Some(attributes), false, false, PCWSTR(name.as_ptr())) };
+    // SAFETY: Must read immediately after creation to detect collisions.
+    let error = unsafe { GetLastError() };
+    let handle = Handle(created.ok()?);
+    if error == ERROR_ALREADY_EXISTS || error == ERROR_INVALID_HANDLE {
+        return None;
+    }
+    Some(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use virtualcam_protocol::{FrameRate, PixelFormat};
+    use windows::Win32::Media::MediaFoundation::{IMFMediaEventGenerator, IMFMediaStream2, MFCreateAttributes, MFCreateEventQueue, MFCreateStreamDescriptor};
+    use windows::Win32::System::Threading::{EVENT_ALL_ACCESS, EVENT_MODIFY_STATE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject};
+    use windows_core::{ComObject, Interface};
+
+    #[test]
+    fn queued_requests_wait_for_frame_events_and_detach_wakes_them() {
+        // SAFETY: Test thread joins the MTA and starts MF before creating objects.
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+            windows::Win32::Media::MediaFoundation::MFStartup(windows::Win32::Media::MediaFoundation::MF_VERSION, 0).expect("MF");
+        }
+        let format = VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(30)).validate().expect("format");
+        let layout = RingLayout::for_format(&format, DEFAULT_SLOT_COUNT).expect("layout");
+        // SAFETY: Anonymous test objects; each returned handle/view is owned below.
+        let handle = Handle(unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, None, PAGE_READWRITE, 0, layout.total_size as u32, None) }.expect("mapping"));
+        let view = unsafe { MapViewOfFile(handle.0, FILE_MAP_ALL_ACCESS, 0, 0, 0) };
+        assert!(!view.Value.is_null());
+        let mapping = RingMapping {
+            ptr: view.Value.cast(),
+            len: layout.total_size,
+            _handle: handle,
+        };
+        // SAFETY: Fresh exclusive mapping, retained by `slot` until the writer is dropped.
+        let mut writer = unsafe { RingWriter::initialize(mapping.ptr, mapping.len, &format, layout.slot_count, 1, 0) }.expect("writer");
+        let reader = unsafe { RingReader::open(mapping.ptr, mapping.len) }.expect("reader");
+        let frame_event = Arc::new(Handle(unsafe { CreateEventW(None, false, false, None) }.expect("frame event")));
+        let slot = Arc::new(TransportSlot::new().expect("slot"));
+        slot.attach(Attached {
+            reader,
+            _mapping: mapping,
+            format,
+            frame_event: Arc::clone(&frame_event),
+        });
+        let media_type = crate::source::mode_media_type(&format).expect("media type");
+        // SAFETY: Valid MF types, descriptors and queues for this test stream.
+        let (queue, descriptor, attributes) = unsafe {
+            let mut attributes = None;
+            MFCreateAttributes(&mut attributes, 1).expect("attributes");
+            (
+                MFCreateEventQueue().expect("queue"),
+                MFCreateStreamDescriptor(0, &[Some(media_type.clone())]).expect("descriptor"),
+                attributes.expect("attributes"),
+            )
+        };
+        let stream = ComObject::new(crate::stream::MediaStream::new(queue, descriptor, attributes, vec![(format, media_type)], Arc::clone(&slot)));
+        let interface: IMFMediaStream2 = stream.to_interface();
+        let events: IMFMediaEventGenerator = interface.cast().expect("generator");
+        stream.start(0, 0).expect("start");
+        let _ = crate::tests::events(&events);
+        // SAFETY: Writer's slot spans this tight frame. Deliberately omit notification.
+        unsafe { core::ptr::write_bytes(writer.begin_frame(), 16, format.frame_size()) };
+        writer.commit_frame(0);
+        unsafe { interface.RequestSample(None) }.expect("first request");
+        let _ = crate::tests::next_sample(&events);
+        unsafe { interface.RequestSample(None) }.expect("pending request");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        unsafe { core::ptr::write_bytes(writer.begin_frame(), 123, format.frame_size()) };
+        writer.commit_frame(1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(crate::tests::events(&events).is_empty(), "a queued request must not poll the ring");
+        let notified = std::time::Instant::now();
+        unsafe { SetEvent(frame_event.0) }.expect("notify");
+        let sample = crate::tests::next_sample(&events);
+        assert!(notified.elapsed() < std::time::Duration::from_millis(250), "new frame wakes immediately, before the one-second repeat");
+        // SAFETY: Valid sample with a linear frame buffer.
+        unsafe {
+            let buffer = sample.GetBufferByIndex(0).expect("buffer");
+            let mut data = core::ptr::null_mut();
+            buffer.Lock(&mut data, None, None).expect("lock");
+            assert_eq!(*data, 123, "event delivered the newest committed frame");
+            buffer.Unlock().expect("unlock");
+            interface.RequestSample(None).expect("pending request before detach");
+        }
+        drop(writer);
+        let detached = std::time::Instant::now();
+        slot.detach();
+        let _ = crate::tests::next_sample(&events);
+        assert!(detached.elapsed() < std::time::Duration::from_millis(250), "detach wakes the worker waiting on the old event");
+        stream.shutdown();
+    }
+
+    #[test]
+    fn frame_event_has_owner_rights_and_rejects_name_collisions() {
+        let owner = process_user().expect("owner");
+        let source = Sid::parse("S-1-5-19").expect("service");
+        let descriptor = SecurityDescriptor::from_sddl(&event_sddl(&source, &owner).expect("sddl")).expect("descriptor");
+        let name: Vec<u16> = frame_event_name(false, random_u128().expect("nonce")).encode_utf16().chain(core::iter::once(0)).collect();
+        let event = create_fresh_event(&name, &descriptor.attributes()).expect("fresh event");
+        // SAFETY: Live explicit descriptor, NUL-terminated name and owned handles.
+        unsafe {
+            let producer = Handle(OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())).expect("owner signal/wait rights"));
+            assert!(OpenEventW(EVENT_ALL_ACCESS, false, PCWSTR(name.as_ptr())).is_err(), "owner is not granted full event access");
+            SetEvent(producer.0).expect("signal");
+            assert!(create_fresh_event(&name, &descriptor.attributes()).is_none(), "never reuse an existing event");
+            assert_eq!(WaitForSingleObject(event.0, 0), WAIT_OBJECT_0, "collision did not reset the existing event");
+        }
+        drop(event);
+        let mapping_descriptor = SecurityDescriptor::from_sddl(&mapping_sddl(&source, &owner).expect("sddl")).expect("descriptor");
+        // SAFETY: Fresh page-file mapping at the former event name.
+        let _mapping = Handle(unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, Some(&mapping_descriptor.attributes()), PAGE_READWRITE, 0, 4096, PCWSTR(name.as_ptr())) }.expect("mapping"));
+        assert!(create_fresh_event(&name, &descriptor.attributes()).is_none(), "never reuse a different object type");
+    }
 }

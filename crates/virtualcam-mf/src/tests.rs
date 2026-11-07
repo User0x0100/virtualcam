@@ -57,7 +57,7 @@ fn source(activate: &IMFActivate) -> windows_core::Result<IMFMediaSourceEx> {
 }
 
 /// Drains every queued event type without blocking.
-fn events(generator: &IMFMediaEventGenerator) -> Vec<(u32, Option<IUnknown>)> {
+pub(crate) fn events(generator: &IMFMediaEventGenerator) -> Vec<(u32, Option<IUnknown>)> {
     let mut out = Vec::new();
     // SAFETY: Non-blocking reads from a live generator.
     while let Ok(event) = unsafe { generator.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
@@ -77,7 +77,7 @@ fn events(generator: &IMFMediaEventGenerator) -> Vec<(u32, Option<IUnknown>)> {
 
 /// Waits (up to a second) for the next delivered sample; requests that are
 /// not due yet are answered by the pacing worker.
-fn next_sample(generator: &IMFMediaEventGenerator) -> IMFSample {
+pub(crate) fn next_sample(generator: &IMFMediaEventGenerator) -> IMFSample {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
         if let Some(sample) = events(generator).into_iter().find(|(kind, _)| *kind as i32 == MEMediaSample.0).and_then(|(_, unk)| unk) {
@@ -446,7 +446,7 @@ fn restart_wakes_a_paused_pending_request() {
         let token: IUnknown = source.GetSourceAttributes().expect("attributes").cast().expect("token");
         stream.RequestSample(&token).expect("pending request");
         stream.SetStreamState(windows::Win32::Media::MediaFoundation::MF_STREAM_STATE_PAUSED).expect("pause");
-        // Let the worker enter its condition-variable wait before restarting.
+        // Let the worker enter its state-event wait before restarting.
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!kinds(&events(&stream_events)).contains(&MEMediaSample.0), "no sample while paused");
         source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("restart");
