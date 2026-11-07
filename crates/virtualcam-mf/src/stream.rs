@@ -7,7 +7,7 @@
 //! is due:
 //!
 //! - a producer frame newer than the last delivered one is available,
-//!   subject to the shared cadence cap;
+//!   subject to the shared GCRA rate limit (see `virtualcam_protocol::delivery`);
 //! - no producer frame exists (no producer, or none written yet): black at the
 //!   native frame interval;
 //! - a producer is attached but stalled: the newest frame again after
@@ -28,14 +28,15 @@ use windows::Win32::Foundation::{E_POINTER, E_UNEXPECTED, S_OK, WAIT_FAILED};
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMF2DBuffer2, IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaBuffer, IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource, IMFMediaStream_Impl, IMFMediaStream2,
     IMFMediaStream2_Impl, IMFMediaType, IMFSample, IMFStreamDescriptor, IMFVideoSampleAllocator, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MEError, MEMediaSample, MEStreamStarted, MEStreamStopped, MF_E_INVALIDMEDIATYPE,
-    MF_E_INVALIDREQUEST, MF_E_MEDIA_SOURCE_WRONGSTATE, MF_E_SHUTDOWN, MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_PAUSED, MF_STREAM_STATE_RUNNING, MF_STREAM_STATE_STOPPED, MF2DBuffer_LockFlags_Write, MFCreateMemoryBuffer,
-    MFCreateSample, MFGetSystemTime, MFSampleExtension_Token,
+    MF_E_INVALIDREQUEST, MF_E_MEDIA_SOURCE_WRONGSTATE, MF_E_SHUTDOWN, MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_PAUSED, MF_STREAM_STATE_RUNNING, MF_STREAM_STATE_STOPPED, MF2DBuffer_LockFlags_Write, MFGetSystemTime,
+    MFSampleExtension_Token,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Threading::{CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, INFINITE, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects};
 use windows_core::{ComObject, GUID, IUnknown, IUnknownImpl, Interface, Ref, implement};
 
+use crate::pool::SamplePool;
 use crate::rendezvous::{Handle, TransportSlot};
 use crate::{ModuleRef, guard};
 
@@ -75,6 +76,8 @@ pub(crate) struct MediaStream {
     /// descriptor lists them in a different order, see `MediaSource::create`).
     offers: Vec<(ValidatedFormat, IMFMediaType)>,
     transport: Arc<TransportSlot>,
+    /// Reused linear samples when no pipeline allocator is usable.
+    samples: SamplePool,
     inner: Mutex<StreamInner>,
     _module: ModuleRef,
 }
@@ -101,6 +104,7 @@ impl MediaStream {
             native: offers[0].0,
             offers,
             transport,
+            samples: SamplePool::new(),
             inner: Mutex::new(StreamInner {
                 state: MF_STREAM_STATE_STOPPED,
                 shutdown: false,
@@ -249,7 +253,7 @@ impl MediaStream {
     /// pitch, so rows padded for alignment (NV12 1080 wide -> 1088) arrive
     /// sheared. A pipeline allocator that hands out padded buffers is
     /// therefore dropped for the rest of this run in favor of linear buffers.
-    fn allocate(inner: &mut StreamInner, output: &ValidatedFormat) -> windows_core::Result<IMFSample> {
+    fn allocate(inner: &mut StreamInner, samples: &SamplePool, output: &ValidatedFormat) -> windows_core::Result<IMFSample> {
         if inner.allocator_ready
             && let Some(allocator) = inner.allocator.clone()
         {
@@ -265,14 +269,8 @@ impl MediaStream {
             inner.allocator = None;
             inner.allocator_ready = false;
         }
-        // SAFETY: Plain MF object creation.
-        let sample = unsafe { MFCreateSample() }?;
         // A linear buffer: its memory is the tight frame by construction.
-        // SAFETY: Plain MF object creation.
-        let buffer = unsafe { MFCreateMemoryBuffer(output.frame_size() as u32) }?;
-        // SAFETY: Valid sample and buffer.
-        unsafe { sample.AddBuffer(&buffer) }?;
-        Ok(sample)
+        samples.take(output.frame_size())
     }
 
     /// Whether the sample's first buffer is linear or a 2D buffer whose pitch
@@ -394,11 +392,11 @@ impl MediaStream {
     fn deliver(&self, inner: &mut StreamInner) -> windows_core::Result<()> {
         let Some(token) = inner.pending.pop_front() else { return Ok(()) };
         let output = self.offers[inner.output].0;
-        let sample = Self::allocate(inner, &output)?;
+        let sample = Self::allocate(inner, &self.samples, &output)?;
         // SAFETY: Valid sample with at least one buffer.
         let buffer = unsafe { sample.GetBufferByIndex(0) }?;
         let frame = self.fill(&buffer, &output)?;
-        inner.delivery.delivered(now_100ns(), frame);
+        inner.delivery.delivered(now_100ns(), frame, self.native.interval_100ns());
         // SAFETY: Valid sample.
         unsafe {
             sample.SetSampleTime(MFGetSystemTime())?;

@@ -92,6 +92,7 @@ fn frame_server_idle_delivery_follows_native_rate() {
             frames += u32::from(read());
         }
         let fps = f64::from(frames) / started.elapsed().as_secs_f64();
+        println!("idle delivery: {fps:.2} FPS");
         let _ = source.Shutdown();
         assert!((27.0..=33.0).contains(&fps), "idle 30 FPS camera delivered {fps:.2} FPS; coarse wait timeouts round to ~21 FPS in Session 0");
     }

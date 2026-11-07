@@ -4,7 +4,7 @@
 //! the session's frame event and delivers each new frame immediately, so
 //! the source adds no pacing latency and never beats against the
 //! producer's cadence (duplicated / skipped frames). Delivery is capped
-//! near the negotiated rate, and a stalled producer's last frame is
+//! at the negotiated rate (shared GCRA schedule), and a stalled producer's last frame is
 //! repeated every second. Without a live producer (black) or with a
 //! producer lacking a frame event, a timer paces at the negotiated rate.
 //!
@@ -171,7 +171,7 @@ fn run(shared: &Shared, stop: &Handle, wake: &Handle, timer: &Handle) {
         if frame.is_none() {
             let _ = fill_black(buffer, &layout, format.pixel_format, full_range);
         }
-        delivery.delivered(now_100ns(), frame);
+        delivery.delivered(now_100ns(), frame, interval);
 
         // Stream time: reference clock relative to tStart, else QPC since Run.
         // SAFETY: Valid clock interface.

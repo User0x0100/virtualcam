@@ -20,6 +20,7 @@ mod activate;
 mod config;
 mod factory;
 mod ftm;
+mod pool;
 mod rendezvous;
 mod security;
 mod source;
