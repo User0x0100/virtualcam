@@ -162,6 +162,7 @@ MF source 在 producer 不存在时也必须能被 Frame Server 枚举 media typ
 - source 还 advertise 自己能转换出的 mode（`virtualcam_protocol::convert::conversions_from`：NV12/I420 → YUY2，同尺寸/帧率/色彩）；consumer 在 Start 前选定当前 type，source 在 `RequestSample` 中转换。stream descriptor 中**转换 mode 排在前、native 排最后**，当前 type 默认仍是 native：DShow bridge 用列表中第一个它能转换的 type 响应 DShow 请求，native NV12 排第一时它对 YUY2 请求仍自行转换（错位），YUY2 排第一时每种 type 都直通（真机实测；`tests/windows_mf.rs` 的 `directshow_bridge_delivers_native_and_converted_modes_unsheared` 守护）。代价：Frame Server 把列表第一个 type 作为 MF client 的默认 type（不理会 source 设的 current type），未显式选择的 MF client 拿到 source 转换的 YUY2（1080×1920 每帧约 2 ms CPU）；显式选 native 仍逐字节直通（`frame_server_camera_delivers_producer_frames` 两者都验证）。producer 写 native mode 或任一 offered mode（`convert::is_offered`，否则 `FormatMismatch`）；source 按 producer 实际写入的 mode 建 ring，与所选 type 相同则复制，不同时能转换则转换，否则黑帧。
 - 原因：只有 native NV12 时 DirectShow app（OBS「视频采集设备」）选 YUY2 会走 Frame Server DShow bridge 自带的转换，宽度不是 32 像素倍数时（如 1080）行跨度对齐到 1088 却按紧密交付，画面斜向错位；source 自己提供 YUY2 后 bridge 直通。
 - 交付必须节流（2026-11-07）：Frame Server/consumer 拿到样本就立即再 `RequestSample`，逐个立即应答会空转到约 1900 FPS。现规则：有比上次交付更新的 producer 帧（按 ring generation + sequence 判定）立即交付；无 producer 帧时按 native 帧间隔交黑帧；producer 在但停滞时 1 s 后重交最新帧；其余请求排队，由每流一个 pacing worker 以 1 ms 轮询 ring 应答（MF transport 暂无跨进程帧事件）。`requests_are_answered_at_the_frame_rate`、`delivery_follows_the_producer_rate` 守护。
+- 稳定读到但无法转换而填黑的帧也必须记录 generation + sequence，避免同一帧反复被判定为新帧；Contended 仍填黑且不记为成功处理。`unconvertible_frames_are_paced` 守护。
 - RGB 行序（2026-11-07 实测）：MF RGB 以正 `MF_MT_DEFAULT_STRIDE`（自上而下）声明时，FFmpeg 经 DShow bridge 方向正确，但 OBS「视频采集设备」上下颠倒；改为负 stride（自下而上）后 FFmpeg 经 bridge 读取即进程崩溃（0xC0000005，无 producer 亦然），已撤回。保持正 stride；需要 RGB 的 DShow 应用应使用 managed DShow camera（LiveSwapFace 的 MF 后端只提供 YUV）。
 - source 交付的样本缓冲必须紧密（行跨度 = `MF_MT_DEFAULT_STRIDE`）：bridge 读原始内存、忽略 2D buffer 自身 pitch；分配器给出带填充的 buffer 时本次运行改用线性 buffer。
 - 禁止 producer 改变 runtime mode、dynamic capability mutation、implicit resize/fps convert。
@@ -562,6 +563,7 @@ IMFMediaStream2 state：
 - RUNNING -> RequestSample 可产出 sample。
 - STOPPED -> RequestSample 必须 `MF_E_MEDIA_SOURCE_WRONGSTATE`。
 - `SetStreamState(PAUSED)` 被接受并记录；RequestSample 只在 RUNNING 产出（PAUSED 同样 `MF_E_MEDIA_SOURCE_WRONGSTATE`）。RUNNING 只能经 source Start 进入。
+- PAUSED 保留已有 pending 请求，Start 恢复 RUNNING 时必须唤醒 pacing worker；STOPPED（包括 `SetStreamState` 入口）清空 pending 请求。`restart_wakes_a_paused_pending_request`、`stream_stop_drops_old_request_tokens` 守护。
 - source-level Pause 返回 `MF_E_INVALID_STATE_TRANSITION`。
 
 Source/Stream ownership 与锁顺序：

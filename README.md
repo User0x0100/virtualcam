@@ -102,6 +102,7 @@ let _status: WriteStatus = camera.write_host(&frame)?;
 - **One producer per camera** (`Error::DeviceInUse` otherwise). A crashed producer is detected (process handle + creation time / pipe closure) and consumers fall back to black.
 - **Transport v2**: every session writes a fresh ring whose slots are guarded by a sequence lock, so consumers never accept a torn frame and the writer never waits. DirectShow delivery is paced by a high-resolution timer without catch-up bursts.
 - **Media Foundation producers** attach lazily: `write_host` returns `ConsumerInactive` (and `is_ready` is `false`) until a client starts the camera. The source authenticates the producer's Windows token against the camera owner on a DACL-protected pipe and hands it a ring created with an owner-only DACL; another user cannot inject frames.
+- **Media Foundation delivery** follows new producer frames, including frames replaced with black when their format cannot be converted. With no producer frames, black follows the native rate; a stalled producer's last frame repeats once per second. Stream pause preserves pending requests for the next Start; stream stop cancels them.
 - Every exported function and COM method is panic-guarded; `DllMain` does nothing.
 
 ### Migrating cameras of the retired C++ driver
