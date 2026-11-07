@@ -64,13 +64,14 @@ FrameServer / Local Service / Session 0
 
 两个 backend **不是同一个 transport lifecycle 换个 consumer API**。
 
-## 4. Common protocol 只共享 frame ring
+## 4. Common protocol 共享 frame ring 与交付判断
 
 `virtualcam-protocol` 两个 backend 共享：
 
 - ring layout、slot/sequence、seqlock。
 - format/payload validation、plane layout、pitch-aware copy/black。
 - publication ordering（`sync.rs`）。
+- `delivery.rs`：generation + sequence 帧标识、统一交付期限、格式请求差异判断。生产端 `src/backend/windows/managed_frame.rs` 共用校验/写入/commit/SetEvent；protocol 仍不持有 OS handle。
 
 不共享：
 
@@ -120,7 +121,7 @@ Lifecycle：
 - producer decides runtime format；registration 存可选 `default_format`、`pixel_formats` 与 `frame_rates`（offered 列表，registry `FrameRates` 为 u32 分子/分母对，至多 16）。
 - advertised：当前格式（SetFormat > live producer > registered default > per-user last format（`HKCU\Software\VirtualCamRs\History\{ID}\LastFormat`）> NV12 640x480@30）在前，其后是其余 registered pixel formats（同尺寸）；每种 pixel format 依次按当前帧率与各 registered frame rate 宣告（pixel 外层、rate 内层）。显式注册的默认格式优先于历史（2026-10-24 改）；`pixel_formats` 为空的旧注册只宣告当前格式。
 - connected graph mode fixed；连接成功后 consumer 把格式写入 `DshowRequest`，producer 经 `VirtualCamera::requested_format()` 读到后自行决定是否以该 pixel format 重开（新 generation）。格式不同的 producer 在该 graph 上显示 black。
-- push thread 帧驱动：live producer 服务当前连接格式且有 frame event 时，等待 frame event，新 sequence 立即交付（速率上限约 0.75 interval，停滞时每 2 interval 重复最后一帧）；无 producer/格式不符/旧 producer 无 frame event 时，按 negotiated interval 定时器节拍发黑帧/帧。实测（`directshow_delivery_latency`，FFmpeg 低延迟参数，1080p30）中位延迟 31.2 ms -> 3.5 ms。
+- push thread 帧驱动：等待 frame event/producer 进程退出/状态变化，按共享 `Delivery` 判断交付时机；新帧最短间隔 0.75 negotiated interval，停滞时每秒重复最后一帧；无 producer/格式不符/旧 producer 无 frame event 时按 negotiated interval 交黑帧/帧。事件仅作唤醒，generation + sequence 才是帧标识；Contended 填黑，禁止交付 torn frame。历史测量（`directshow_delivery_latency`，FFmpeg 低延迟参数，1080p30）中位延迟 31.2 ms -> 3.5 ms。
 - producer liveness = 打开 producer 进程（SYNCHRONIZE）+ 比对 creation time；死亡 -> black。
 - source 不做格式转换（像素格式切换由 producer 完成）；RGB 自上而下输入，source 翻转为 bottom-up DIB 并处理 RGB24 DWORD 行对齐。
 
@@ -161,7 +162,7 @@ MF source 在 producer 不存在时也必须能被 Frame Server 枚举 media typ
 
 - source 还 advertise 自己能转换出的 mode（`virtualcam_protocol::convert::conversions_from`：NV12/I420 → YUY2，同尺寸/帧率/色彩）；consumer 在 Start 前选定当前 type，source 在 `RequestSample` 中转换。stream descriptor 中**转换 mode 排在前、native 排最后**，当前 type 默认仍是 native：DShow bridge 用列表中第一个它能转换的 type 响应 DShow 请求，native NV12 排第一时它对 YUY2 请求仍自行转换（错位），YUY2 排第一时每种 type 都直通（真机实测；`tests/windows_mf.rs` 的 `directshow_bridge_delivers_native_and_converted_modes_unsheared` 守护）。代价：Frame Server 把列表第一个 type 作为 MF client 的默认 type（不理会 source 设的 current type），未显式选择的 MF client 拿到 source 转换的 YUY2（1080×1920 每帧约 2 ms CPU）；显式选 native 仍逐字节直通（`frame_server_camera_delivers_producer_frames` 两者都验证）。producer 写 native mode 或任一 offered mode（`convert::is_offered`，否则 `FormatMismatch`）；source 按 producer 实际写入的 mode 建 ring，与所选 type 相同则复制，不同时能转换则转换，否则黑帧。
 - 原因：只有 native NV12 时 DirectShow app（OBS「视频采集设备」）选 YUY2 会走 Frame Server DShow bridge 自带的转换，宽度不是 32 像素倍数时（如 1080）行跨度对齐到 1088 却按紧密交付，画面斜向错位；source 自己提供 YUY2 后 bridge 直通。
-- 交付必须节流（2026-11-07）：Frame Server/consumer 拿到样本就立即再 `RequestSample`，逐个立即应答会空转到约 1900 FPS。现规则：有比上次交付更新的 producer 帧（按 ring generation + sequence 判定）立即交付；无 producer 帧时按 native 帧间隔交黑帧；producer 在但停滞时 1 s 后重交最新帧；其余请求排队，由每流一个 pacing worker 以 1 ms 轮询 ring 应答（MF transport 暂无跨进程帧事件）。`requests_are_answered_at_the_frame_rate`、`delivery_follows_the_producer_rate` 守护。
+- 交付必须节流（2026-11-07）：Frame Server/consumer 拿到样本就立即再 `RequestSample`，逐个立即应答会空转到约 1900 FPS。现共用 `Delivery`：有更新的 generation + sequence 且满足 0.75 native interval 最短间隔时交付；无 producer 帧时按 native 帧间隔交黑帧；producer 停滞时 1 s 后重交最新帧；其余请求排队，worker 等待 source 创建的跨进程帧事件、slot/state 唤醒或交付期限，禁止 1 ms ring 轮询。attach/detach 必须唤醒，等待期间保留旧事件 handle 的 Arc。`requests_are_answered_at_the_frame_rate`、`delivery_follows_the_producer_rate`、`queued_requests_wait_for_frame_events_and_detach_wakes_them` 守护。
 - 稳定读到但无法转换而填黑的帧也必须记录 generation + sequence，避免同一帧反复被判定为新帧；Contended 仍填黑且不记为成功处理。`unconvertible_frames_are_paced` 守护。
 - RGB 行序（2026-11-07 实测）：MF RGB 以正 `MF_MT_DEFAULT_STRIDE`（自上而下）声明时，FFmpeg 经 DShow bridge 方向正确，但 OBS「视频采集设备」上下颠倒；改为负 stride（自下而上）后 FFmpeg 经 bridge 读取即进程崩溃（0xC0000005，无 producer 亦然），已撤回。保持正 stride；需要 RGB 的 DShow 应用应使用 managed DShow camera（LiveSwapFace 的 MF 后端只提供 YUV）。
 - source 交付的样本缓冲必须紧密（行跨度 = `MF_MT_DEFAULT_STRIDE`）：bridge 读原始内存、忽略 2D buffer 自身 pitch；分配器给出带填充的 buffer 时本次运行改用线性 buffer。
@@ -188,6 +189,7 @@ Local\VirtualCamRs-*
 
 ```text
 source 在 producer 认证成功后创建 Global\VirtualCamRs-MF-{GenerationNonce:032X}
+以及同名加 -Frame 的 auto-reset event（相同身份、object-specific DACL）
 （同 session 时 fallback Local\），owner-only DACL，经 pipe Welcome 返回名字
 ```
 
@@ -298,7 +300,7 @@ ATTR_PROTOCOL_VERSION
 ATTR_NATIVE_FORMAT         # WireVideoFormat blob
 ```
 
-Rendezvous pipe：`\\.\pipe\VirtualCamRs-MF-{RID}`；Hello 64 B / Welcome 232 B fixed-size messages；handshake deadline 2 s。
+Rendezvous pipe：`\\.\pipe\VirtualCamRs-MF-{RID}`；wire version 2（`RENDEZVOUS_VERSION`）：Hello 64 B / Welcome 424 B（ring/event 名各 96 UTF-16 units），Request 48 B；handshake deadline 2 s。持久化 attributes `PROTOCOL_VERSION` 仍为 1，现有注册无需重建；producer/source DLL 必须同步升级。
 
 不要把 `OWNER_SID` vendor attribute 当 production authorization input。所有 custom attributes 都是 untrusted configuration：必须 bounds/version/overflow validation，不能直接决定 DACL。
 
@@ -394,13 +396,15 @@ mutex if used:
 
 RequestSample 必须 request-driven，不主动按 DShow pacing thread push。
 
-**v1 同步优先。不要未经测量就实现 FIFO pending queue / async work queue。**
+**到期请求同步交付；其余请求按 FIFO 排队，由每流一个事件驱动 worker 应答。** 原因见 §8 的实测：逐请求立即交付会让 consumer 空转。
 
 默认路径：
 
 ```text
 RequestSample
  -> validate running
+ -> enqueue token
+ -> shared Delivery 判断是否到期；未到期则唤醒 worker 并返回
  -> allocator AllocateSample
  -> lock destination
  -> copy latest frame or black
@@ -412,22 +416,22 @@ RequestSample
 
 要求：
 
-- non-null token 在调用期间保持有效，并原样挂到 output sample。
+- non-null token 在排队期间持有引用，并原样挂到对应 output sample。
 - failure path 不泄漏 sample/buffer/token reference。
 - source/stream stopped 时 `RequestSample -> MF_E_MEDIA_SOURCE_WRONGSTATE`。
 - source/stream shutdown 时 `RequestSample -> MF_E_SHUTDOWN`。
 - 不用 generic `E_FAIL`/近似 HRESULT 替代 stopped-state contract。
-- no producer 不等待，直接 black。
+- no producer 不等待 attach；按共享交付期限返回 black。
 
 RequestSample error signaling：
 
 - 调用内检测到 active transport corruption / allocator / frame validation failure -> 直接返回 HRESULT，不同时 queue `MEError`。
-- 没有对应 RequestSample 的后台/控制路径发现 fatal error -> 才 queue `MEError`。
+- 已接受请求的异步交付或后台/控制路径发现 fatal error -> queue `MEError`。
 - no producer/stale producer -> black fallback，不是 fatal error。
 
 RequestSample latency 尚未专门测量；真机 640x360@30 端到端正常。
 
-只有同步路径确实阻塞 Frame Server/超过预算时，才单独引入 async：届时才需要 FIFO、Start generation、Stop/Shutdown cancellation 和 stale-work protection。
+worker 不跨越 stream lock 执行交付；Stop/Shutdown 清空 pending，PAUSED 保留 pending，Start/attach/detach/Shutdown 必须唤醒等待。传输事件只作唤醒，帧身份与期限由共享 `Delivery` 判定。
 
 ## 17. MF allocator + pitch copy
 
@@ -648,7 +652,7 @@ CUDA producer仍直接 D2H到 shared slot。CUDA Runtime 不在链接期绑定�
 - x86 DirectShow DLL（见 §7）；ARM64 构建。
 - `Auto` backend 选择 / 更高层统一 API。
 - MF multi-mode（§8 future）。
-- 若需要：RequestSample latency 超预算时才引入 async work queue（§16）。
+- RequestSample latency 与事件驱动交付的真机测量（§16）。
 
 ## 26. API 不要伪统一
 
@@ -728,7 +732,7 @@ MF source-owned cross-session transport先 spike再冻结。
 ACL = actual source principal + owner，禁止 Everyone write。
 
 ### D014
-MF RequestSample v1 同步优先；token echo 必须正确，async 只有 latency gate 证明必要才加入。
+MF RequestSample 到期同步交付，未到期 FIFO 排队由事件驱动 worker 应答；token echo/cancellation 必须正确（2026-11-07 根据 §8 的节流实测修订）。
 
 ### D015
 MF destination copy必须 pitch-aware。

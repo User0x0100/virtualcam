@@ -270,7 +270,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let native = VideoFormat::new(PixelFormat::Nv12, 1920, 1080, FrameRate::fps(30));
     let info = manager.register(MediaFoundationRegistration::new("Studio MF Cam", native))?;
 
-    // 必须使用注册时的格式；open(id, 其他格式) 返回 Error::FormatMismatch。
+    // 使用原生格式；open(id, format) 也接受 source 提供的 YUY2 mode。
     let mut camera = manager.open_registered(info.id)?;
     let frame = vec![0x10_u8; camera.frame_size()];
     loop {
@@ -393,12 +393,14 @@ let one = manager.get(id)?;
 
 ### 8.2 Media Foundation
 
-- 应用请求帧时由 source 按节奏交付：生产者有新帧就立即交付；没有生产者帧时按原生帧率交黑帧；生产者停滞时每秒重交一次最新帧。应用连续请求也不会超过这个节奏。
+- 两个 managed 后端共用交付判断：按 generation + sequence 识别新帧，最短交付间隔为协商帧间隔的 0.75 倍（容忍生产者抖动）；没有生产者帧时按协商帧率交黑帧；生产者停滞时每秒重交一次最新帧。应用连续请求也不会超过这个节奏。
+- 生产端写入并提交帧后触发新帧事件。MF source 在认证成功后创建 ring 和跨进程帧事件，经握手返回两者名字；二者使用相同的授权身份，事件使用独立的等待/触发权限。source 等待事件、状态变化或交付期限，不再每 1 ms 轮询 ring。
 - 生产者格式无法转换时输出的黑帧也遵守同样的节流规则。stream 暂停后恢复会继续处理待交付请求；停止会取消待交付请求，重启后不再交付旧请求。
 - 时间戳使用系统 QPC 时钟（`MFGetSystemTime`），时长等于原生帧间隔。
 - 生产者断开（管道关闭）时立即回到黑帧；正常停止不会发送流结束事件，应用可以继续使用摄像头。
 - 原生 NV12/I420 的摄像头还提供 YUY2。应用选定的格式经管道告知生产者，生产者用 `VirtualCamera::requested_format()` 读取（随存活检查约每 100 ms 更新），可关闭后以 `ManagedCameraManager::open(id, requested)` 重开并自己产出该格式，source 此后只复制；重开之前 source 能转换就自行转换（NV12/I420 → YUY2），不能转换则输出黑帧。
 - 摄像头是 System lifetime：重启后仍然存在，直到 `unregister`。
+- MF 握手已升级到 wire version 2（Welcome 424 字节）：生产端库与 source DLL 需一起升级。持久化摄像头配置仍为 version 1，无需重建已有注册。两个 managed 后端的 `requested_format()` 都只在所选格式与当前写入格式不同时返回 `Some`。
 
 ## 9. OBS Virtual Camera 与 Unity Capture
 
@@ -477,7 +479,7 @@ let status = unsafe { camera.write_cuda(device_ptr, camera.frame_size(), Some(st
 | `CameraNotFound` | ID 不存在，或不属于当前 AppId | 检查 `list()`；或改用 `ManagedCameraManager::new()` |
 | `InvalidDimensions` / `InvalidFrameRate` | 超出范围或违反奇偶要求 | 见第 7 节 |
 | `UnsupportedFormat` | 该后端不支持此像素格式 | 自有摄像头使用第 7.1 节列出的格式 |
-| `FormatMismatch` | MF 摄像头以非注册格式打开 | 用 `open_registered`，或重新注册 |
+| `FormatMismatch` | MF 摄像头以原生及 offered 列表以外的格式打开 | 用 `open_registered`，或 `requested_format()` 返回的 offered mode |
 | `FrameSizeMismatch` | `write_host` 长度 ≠ `frame_size()` | 按 `frame_size()` 分配缓冲 |
 | `DeviceInUse` | 已有另一个生产者 | 关闭另一个生产者 |
 | `BackendUnavailable(..)` | DLL 未找到、MF source 未安装、路径为网络盘等 | 检查第 4 节 |

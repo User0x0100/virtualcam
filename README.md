@@ -72,7 +72,7 @@ use virtualcam::{FrameRate, ManagedCameraManager, MediaFoundationRegistration, P
 let manager = ManagedCameraManager::new();
 let native = VideoFormat::new(PixelFormat::Nv12, 1920, 1080, FrameRate::fps(30));
 let info = manager.register(MediaFoundationRegistration::new("Studio MF Cam", native))?;
-let mut camera = manager.open_registered(info.id)?; // `open` with any other format: FormatMismatch
+let mut camera = manager.open_registered(info.id)?; // `open` also accepts offered YUY2
 let frame = vec![0_u8; camera.frame_size()];
 // ConsumerInactive until an application starts the camera; then Written.
 let _status: WriteStatus = camera.write_host(&frame)?;
@@ -102,7 +102,8 @@ let _status: WriteStatus = camera.write_host(&frame)?;
 - **One producer per camera** (`Error::DeviceInUse` otherwise). A crashed producer is detected (process handle + creation time / pipe closure) and consumers fall back to black.
 - **Transport v2**: every session writes a fresh ring whose slots are guarded by a sequence lock, so consumers never accept a torn frame and the writer never waits. DirectShow delivery is paced by a high-resolution timer without catch-up bursts.
 - **Media Foundation producers** attach lazily: `write_host` returns `ConsumerInactive` (and `is_ready` is `false`) until a client starts the camera. The source authenticates the producer's Windows token against the camera owner on a DACL-protected pipe and hands it a ring created with an owner-only DACL; another user cannot inject frames.
-- **Media Foundation delivery** follows new producer frames, including frames replaced with black when their format cannot be converted. With no producer frames, black follows the native rate; a stalled producer's last frame repeats once per second. Stream pause preserves pending requests for the next Start; stream stop cancels them.
+- **Managed delivery** shares one timing policy: new frames are identified by generation and sequence, with a minimum spacing of 0.75 negotiated frame intervals to tolerate jitter; without producer frames, black follows the negotiated rate; a stalled producer's last frame repeats once per second. Both producers commit then signal an auto-reset frame event. Media Foundation waits for this event, state changes or the delivery deadline, with no ring polling; incompatible frames replaced with black are paced too. Stream pause preserves pending requests for the next Start; stream stop cancels them. `requested_format()` returns a selected mode only when it differs from the mode being written.
+- **MF source upgrades:** rendezvous wire version 2 requires both ring and frame-event names. Update the producer library and source DLL together. The persisted configuration version remains 1, so existing camera registrations do not need recreation.
 - Every exported function and COM method is panic-guarded; `DllMain` does nothing.
 
 ### Migrating cameras of the retired C++ driver
