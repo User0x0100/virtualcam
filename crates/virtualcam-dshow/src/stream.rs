@@ -81,7 +81,7 @@ fn stopped(stop: &Handle) -> bool {
 
 /// Waits for the shared delivery deadline, a new frame, or a state change.
 /// `None` stops the worker; `Some(false)` rechecks the filter state.
-fn wait_for_delivery(shared: &Shared, format: &VideoFormat, stop: &Handle, wake: &Handle, timer: &Handle, delivery: &Delivery, interval: u64) -> Option<bool> {
+fn wait_for_delivery(shared: &Shared, format: &VideoFormat, stop: &Handle, wake: &Handle, timer: &Handle, delivery: &mut Delivery, interval: u64) -> Option<bool> {
     loop {
         let live = shared.transport().live_signal(format);
         let now = now_100ns();
@@ -145,7 +145,7 @@ fn run(shared: &Shared, stop: &Handle, wake: &Handle, timer: &Handle) {
             continue;
         }
 
-        match wait_for_delivery(shared, &format, stop, wake, timer, &delivery, interval) {
+        match wait_for_delivery(shared, &format, stop, wake, timer, &mut delivery, interval) {
             None => return,
             Some(true) => {}
             Some(false) => continue,

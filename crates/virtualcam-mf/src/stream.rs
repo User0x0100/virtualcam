@@ -384,7 +384,7 @@ impl MediaStream {
     }
 
     /// When the oldest pending request may be answered (see the module docs).
-    fn due(&self, inner: &StreamInner, now: u64) -> u64 {
+    fn due(&self, inner: &mut StreamInner, now: u64) -> u64 {
         inner.delivery.due(now, self.transport.latest_frame(), self.native.interval_100ns())
     }
 
@@ -435,7 +435,7 @@ impl MediaStream {
                 // Keep this session's event alive across the wait, even on detach.
                 let frame = self.transport.frame_event();
                 let now = now_100ns();
-                let due = self.due(&inner, now);
+                let due = self.due(&mut inner, now);
                 if due <= now {
                     if let Err(error) = self.deliver(&mut inner) {
                         // Asynchronous failure: reported as a stream error.
@@ -554,7 +554,7 @@ impl IMFMediaStream_Impl for MediaStream_Impl {
             // Answer at once when due and nothing older waits; failures then
             // return their HRESULT here and are never also queued as MEError.
             let now = now_100ns();
-            if inner.pending.len() == 1 && self.due(&inner, now) <= now {
+            if inner.pending.len() == 1 && self.due(&mut inner, now) <= now {
                 return self.deliver(&mut inner);
             }
             self.ensure_worker(&mut inner);
