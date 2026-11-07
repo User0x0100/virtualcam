@@ -507,11 +507,12 @@ fn create_fresh_event(name: &[u16], attributes: &windows::Win32::Security::SECUR
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use virtualcam_protocol::{FrameRate, PixelFormat};
     use windows::Win32::Media::MediaFoundation::{IMFMediaEventGenerator, IMFMediaStream2, MFCreateAttributes, MFCreateEventQueue, MFCreateStreamDescriptor};
     use windows::Win32::System::Threading::{EVENT_ALL_ACCESS, EVENT_MODIFY_STATE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject};
     use windows_core::{ComObject, Interface};
+
+    use super::*;
 
     #[test]
     fn queued_requests_wait_for_frame_events_and_detach_wakes_them() {
@@ -582,7 +583,6 @@ mod tests {
             buffer.Unlock().expect("unlock");
             interface.RequestSample(None).expect("pending request before detach");
         }
-        drop(writer);
         let detached = std::time::Instant::now();
         slot.detach();
         let _ = crate::tests::next_sample(&events);
