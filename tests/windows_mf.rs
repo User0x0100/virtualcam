@@ -57,6 +57,47 @@ fn is_camera(device: &str, name: &str) -> bool {
 }
 
 #[test]
+#[ignore = "requires the installed MF source and a real Frame Server clock"]
+fn frame_server_idle_delivery_follows_native_rate() {
+    // SAFETY: Initializes COM/MF for this system-device test.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        MFStartup(MF_VERSION, MFSTARTUP_FULL).expect("MFStartup");
+    }
+    let manager = ManagedCameraManager::for_app(AppId::new("dev.virtualcam.mf-test").expect("app id"));
+    let name = format!("VCRs MF Idle Rate {}", std::process::id());
+    let format = VideoFormat::new(PixelFormat::Nv12, 640, 360, FrameRate::fps(30));
+    let info = manager.register(MediaFoundationRegistration::new(&name, format)).expect("register");
+    struct Cleanup(ManagedCameraManager, virtualcam::ManagedCameraId);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.0.unregister(self.1);
+        }
+    }
+    let _cleanup = Cleanup(manager, info.id);
+    let (_, device) = video_devices().into_iter().find(|(device, _)| is_camera(device, &name)).expect("system device");
+    // SAFETY: System-enumerated source; only reads its black frames, no producer.
+    unsafe {
+        let source = device.ActivateObject::<windows::Win32::Media::MediaFoundation::IMFMediaSource>().expect("activate");
+        let reader = MFCreateSourceReaderFromMediaSource(&source, None).expect("reader");
+        let read = || {
+            let (mut sample, mut flags) = (None::<IMFSample>, 0);
+            reader.ReadSample(0xFFFF_FFFC, 0, None, Some(&mut flags), None, Some(&mut sample)).expect("read");
+            sample.is_some()
+        };
+        while !read() {}
+        let started = Instant::now();
+        let mut frames = 0;
+        while started.elapsed() < Duration::from_secs(2) {
+            frames += u32::from(read());
+        }
+        let fps = f64::from(frames) / started.elapsed().as_secs_f64();
+        let _ = source.Shutdown();
+        assert!((27.0..=33.0).contains(&fps), "idle 30 FPS camera delivered {fps:.2} FPS; coarse wait timeouts round to ~21 FPS in Session 0");
+    }
+}
+
+#[test]
 #[ignore = "requires the Media Foundation source installed machine-wide (elevated, once)"]
 fn frame_server_camera_delivers_producer_frames() {
     // SAFETY: Test thread setup.

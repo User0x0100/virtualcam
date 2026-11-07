@@ -33,10 +33,10 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
-use windows::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
+use windows::Win32::System::Threading::{CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, INFINITE, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects};
 use windows_core::{ComObject, GUID, IUnknown, IUnknownImpl, Interface, Ref, implement};
 
-use crate::rendezvous::TransportSlot;
+use crate::rendezvous::{Handle, TransportSlot};
 use crate::{ModuleRef, guard};
 
 /// Frames requested from a provided allocator.
@@ -414,12 +414,26 @@ impl MediaStream {
     /// until the stream shuts down.
     fn pace(&self) {
         let mut inner = self.inner();
+        let fail = |inner: &mut StreamInner, error: windows_core::Error| {
+            inner.worker = false;
+            // SAFETY: Valid queue, or shutdown reports its own error.
+            let _ = unsafe { self.queue.QueueEventParamVar(MEError.0 as u32, &GUID::zeroed(), error.code(), &PROPVARIANT::default()) };
+        };
+        // Millisecond wait timeouts round to the service's coarse clock tick.
+        // SAFETY: Anonymous high-resolution timer, owned by this worker.
+        let timer = match unsafe { CreateWaitableTimerExW(None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0) } {
+            Ok(timer) => Handle(timer),
+            Err(error) => {
+                fail(&mut inner, error);
+                return;
+            }
+        };
         loop {
             if inner.shutdown {
                 inner.worker = false;
                 return;
             }
-            let (frame, timeout) = if inner.state == MF_STREAM_STATE_RUNNING && !inner.pending.is_empty() {
+            let (frame, timed) = if inner.state == MF_STREAM_STATE_RUNNING && !inner.pending.is_empty() {
                 // Keep this session's event alive across the wait, even on detach.
                 let frame = self.transport.frame_event();
                 let now = now_100ns();
@@ -432,21 +446,26 @@ impl MediaStream {
                     }
                     continue;
                 }
-                (frame, due.saturating_sub(now).div_ceil(10_000).min(u64::from(INFINITE - 1)) as u32)
+                let relative = -((due - now).min(i64::MAX as u64) as i64);
+                // SAFETY: Live timer and a relative deadline in 100 ns units.
+                if let Err(error) = unsafe { SetWaitableTimer(timer.0, &relative, 0, None, None, false) } {
+                    fail(&mut inner, error);
+                    return;
+                }
+                (frame, true)
             } else {
-                (None, INFINITE)
+                (None, false)
             };
             let wake = self.transport.wake.0;
-            let handles = [wake, frame.as_ref().map_or(wake, |event| event.0)];
+            let handles = [wake, timer.0, frame.as_ref().map_or(timer.0, |event| event.0)];
+            let count = 1 + usize::from(timed) + usize::from(frame.is_some());
             drop(inner);
             // SAFETY: Distinct live handles; `frame` retains a detached session's event.
-            let waited = unsafe { WaitForMultipleObjects(&handles[..if frame.is_some() { 2 } else { 1 }], false, timeout) };
+            let waited = unsafe { WaitForMultipleObjects(&handles[..count], false, INFINITE) };
             let error = (waited == WAIT_FAILED).then(windows_core::Error::from_thread);
             inner = self.inner();
             if let Some(error) = error {
-                inner.worker = false;
-                // SAFETY: Valid queue, or shutdown reports its own error.
-                let _ = unsafe { self.queue.QueueEventParamVar(MEError.0 as u32, &GUID::zeroed(), error.code(), &PROPVARIANT::default()) };
+                fail(&mut inner, error);
                 return;
             }
         }
