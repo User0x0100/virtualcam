@@ -164,6 +164,7 @@ MF source 在 producer 不存在时也必须能被 Frame Server 枚举 media typ
 - 原因：只有 native NV12 时 DirectShow app（OBS「视频采集设备」）选 YUY2 会走 Frame Server DShow bridge 自带的转换，宽度不是 32 像素倍数时（如 1080）行跨度对齐到 1088 却按紧密交付，画面斜向错位；source 自己提供 YUY2 后 bridge 直通。
 - 交付必须节流（2026-11-07）：Frame Server/consumer 拿到样本就立即再 `RequestSample`，逐个立即应答会空转到约 1900 FPS。现共用 `Delivery`：有更新的 generation + sequence 且满足 0.75 native interval 最短间隔时交付；无 producer 帧时按 native 帧间隔交黑帧；producer 停滞时 1 s 后重交最新帧；其余请求排队，worker 等待 source 创建的跨进程帧事件、slot/state 唤醒或交付期限，禁止 1 ms ring 轮询。attach/detach 必须唤醒，等待期间保留旧事件 handle 的 Arc。`requests_are_answered_at_the_frame_rate`、`delivery_follows_the_producer_rate`、`queued_requests_wait_for_frame_events_and_detach_wakes_them` 守护。
 - 稳定读到但无法转换而填黑的帧也必须记录 generation + sequence，避免同一帧反复被判定为新帧；Contended 仍填黑且不记为成功处理。`unconvertible_frames_are_paced` 守护。
+- MF worker 的交付期限必须用 high-resolution waitable timer，不能用 `WaitForMultipleObjects` 毫秒 timeout：真实 Session 0 30 FPS 空闲黑帧曾降至 21.56 FPS。`frame_server_idle_delivery_follows_native_rate` 真机回归守护；事件/轮询性能对照见 `docs/performance/2026-11-07-mf-events.md`，原生 NV12 的客户端 CPU 上涨尚未定位。
 - RGB 行序（2026-11-07 实测）：MF RGB 以正 `MF_MT_DEFAULT_STRIDE`（自上而下）声明时，FFmpeg 经 DShow bridge 方向正确，但 OBS「视频采集设备」上下颠倒；改为负 stride（自下而上）后 FFmpeg 经 bridge 读取即进程崩溃（0xC0000005，无 producer 亦然），已撤回。保持正 stride；需要 RGB 的 DShow 应用应使用 managed DShow camera（LiveSwapFace 的 MF 后端只提供 YUV）。
 - source 交付的样本缓冲必须紧密（行跨度 = `MF_MT_DEFAULT_STRIDE`）：bridge 读原始内存、忽略 2D buffer 自身 pitch；分配器给出带填充的 buffer 时本次运行改用线性 buffer。
 - 禁止 producer 改变 runtime mode、dynamic capability mutation、implicit resize/fps convert。

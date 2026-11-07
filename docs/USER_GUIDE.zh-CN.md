@@ -401,6 +401,7 @@ let one = manager.get(id)?;
 - 原生 NV12/I420 的摄像头还提供 YUY2。应用选定的格式经管道告知生产者，生产者用 `VirtualCamera::requested_format()` 读取（随存活检查约每 100 ms 更新），可关闭后以 `ManagedCameraManager::open(id, requested)` 重开并自己产出该格式，source 此后只复制；重开之前 source 能转换就自行转换（NV12/I420 → YUY2），不能转换则输出黑帧。
 - 摄像头是 System lifetime：重启后仍然存在，直到 `unregister`。
 - MF 握手已升级到 wire version 2（Welcome 424 字节）：生产端库与 source DLL 需一起升级。持久化摄像头配置仍为 version 1，无需重建已有注册。两个 managed 后端的 `requested_format()` 都只在所选格式与当前写入格式不同时返回 `Some`。
+- MF 交付期限使用高精度 waitable timer，避免 Session 0 的普通毫秒超时把空闲 30 FPS 拉低到约 21 FPS。[本机 Frame Server CPU 与延迟记录](performance/2026-11-07-mf-events.md)列出了实际帧率和各负载差异，事件驱动并非所有负载都更省 CPU。
 
 ## 9. OBS Virtual Camera 与 Unity Capture
 
