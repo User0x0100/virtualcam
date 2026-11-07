@@ -18,7 +18,16 @@
 //!   <- Welcome { status, ring name } <-----
 //!   OpenFileMapping(ring), attach writer
 //!   (pipe stays open: its closure is the liveness signal for both sides)
+//!   <- Request { format }            <-----  whenever the consumers' selected
+//!                                            mode differs from the producer's
 //! ```
+//!
+//! The producer may write the native mode or any mode the source offers as
+//! a conversion of it (`crate::convert::is_offered`); the source converts
+//! when the selected mode differs and it can. A [`Request`] asks the
+//! producer to reopen in the selected mode so it can produce that layout
+//! itself (for example on the GPU) and the source only copies. Producers
+//! that never read the pipe simply keep the native mode.
 
 use crate::format::{FormatError, VideoFormat, WireVideoFormat};
 use crate::id::CameraId;
@@ -78,7 +87,8 @@ pub const WELCOME_MAGIC: u32 = u32::from_le_bytes(*b"VCMW");
 pub struct Hello {
     /// Camera the producer intends to feed.
     pub camera_id: CameraId,
-    /// Format the producer will write; must equal the native mode.
+    /// Format the producer will write: the native mode or one of the
+    /// conversions the source offers.
     pub format: VideoFormat,
 }
 
@@ -122,7 +132,7 @@ pub enum WelcomeStatus {
     Version = 1,
     /// The Hello named a different camera.
     CameraMismatch = 2,
-    /// The producer's format differs from the native mode.
+    /// The producer's format is not one the source offers.
     FormatMismatch = 3,
     /// Producer identity does not match the camera owner.
     Unauthorized = 4,
@@ -219,6 +229,41 @@ impl Welcome {
     }
 }
 
+/// `Request::magic`: `"VCMR"`.
+pub const REQUEST_MAGIC: u32 = u32::from_le_bytes(*b"VCMR");
+
+/// Source -> producer notice, sent after [`Welcome`] while attached: the
+/// mode consumers selected, when it differs from the producer's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Request {
+    /// The selected mode.
+    pub format: VideoFormat,
+}
+
+impl Request {
+    /// Exact encoded size.
+    pub const SIZE: usize = 48;
+
+    /// Encodes the message.
+    pub fn encode(&self) -> Result<[u8; Self::SIZE], MessageError> {
+        let mut out = [0_u8; Self::SIZE];
+        out[0..4].copy_from_slice(&REQUEST_MAGIC.to_le_bytes());
+        out[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        out[8..12].copy_from_slice(&(Self::SIZE as u32).to_le_bytes());
+        out[16..48].copy_from_slice(&self.format.to_wire().map_err(MessageError::Format)?.to_bytes());
+        Ok(out)
+    }
+
+    /// Decodes and validates the message.
+    pub fn decode(bytes: &[u8]) -> Result<Self, MessageError> {
+        if bytes.len() != Self::SIZE || u32_at(bytes, 0) != REQUEST_MAGIC || u32_at(bytes, 4) != PROTOCOL_VERSION || u32_at(bytes, 8) != Self::SIZE as u32 || u32_at(bytes, 12) != 0 {
+            return Err(MessageError::Malformed);
+        }
+        let format = WireVideoFormat::from_bytes(&bytes[16..48]).and_then(WireVideoFormat::decode).map_err(MessageError::Format)?;
+        Ok(Self { format })
+    }
+}
+
 fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
 }
@@ -275,6 +320,26 @@ mod tests {
             *byte = b'A';
         }
         assert_eq!(Welcome::decode(&unterminated), Err(MessageError::Malformed));
+    }
+
+    #[test]
+    fn request_round_trips_and_rejects_tampering() {
+        let request = Request {
+            format: VideoFormat::new(PixelFormat::Yuy2, 1080, 1920, FrameRate::fps(60)),
+        };
+        let bytes = request.encode().expect("encode");
+        assert_eq!(Request::decode(&bytes), Ok(request));
+        assert_eq!(Request::decode(&bytes[..47]), Err(MessageError::Malformed));
+        for offset in [0, 4, 8, 12] {
+            let mut corrupt = bytes;
+            corrupt[offset] ^= 1;
+            assert_eq!(Request::decode(&corrupt), Err(MessageError::Malformed), "offset {offset}");
+        }
+        let hello = Hello {
+            camera_id: CameraId::from_u128(1),
+            format: request.format,
+        };
+        assert_eq!(Request::decode(&hello.encode().expect("hello")[..48]), Err(MessageError::Malformed), "other magic");
     }
 
     #[test]

@@ -85,6 +85,9 @@ pub(crate) fn mode_media_type(format: &ValidatedFormat) -> windows_core::Result<
         media_type.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
         media_type.SetUINT32(&MF_MT_FIXED_SIZE_SAMPLES, 1)?;
         media_type.SetUINT32(&MF_MT_SAMPLE_SIZE, format.frame_size() as u32)?;
+        // Top-down for every mode, RGB included: a negative (bottom-up) RGB
+        // stride makes Frame Server's DirectShow bridge crash FFmpeg's
+        // DirectShow input (measured 2026-11-07).
         media_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, format.layout().planes()[0].pitch as u32)?;
         let color = video.color;
         if video.pixel_format.is_yuv() && color.matrix.code() != 0 {
@@ -146,7 +149,7 @@ impl MediaSource {
         set_stream_attributes(&stream_attributes)?;
         set_stream_attributes(&descriptor.cast()?)?;
 
-        let transport = Arc::new(TransportSlot::default());
+        let transport = Arc::new(TransportSlot::new());
         let stream = ComObject::new(MediaStream::new(stream_queue, descriptor, stream_attributes, offers, Arc::clone(&transport)));
         let rendezvous = Rendezvous::spawn(&config, transport);
         let source = ComObject::new(Self {

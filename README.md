@@ -22,7 +22,7 @@ The workspace builds two COM source DLLs and the library that manages them:
 | Seen by | DirectShow apps: FFmpeg `dshow`, OpenCV `CAP_DSHOW`, OBS, legacy conferencing apps | Frame Server apps: Windows Camera, browsers, Teams, WinRT `MediaCapture`, `IMFSourceReader` |
 | Install | none; each registration points at the DLL | once per machine, elevated: `install_media_foundation_source` |
 | Registration | `CurrentUser` (no elevation) or `AllUsers` (elevated) | per-user (`CurrentUser` access, `System` lifetime), no elevation |
-| Format | chosen by the producer for each session | one immutable native mode fixed at registration, plus source-side YUY2 for NV12/I420 |
+| Format | chosen by the producer for each session | one immutable native mode fixed at registration, plus YUY2 for NV12/I420 (the producer may follow the selected mode via `requested_format()`, else the source converts) |
 | Transport | producer-owned, session-local | source-owned, authenticated, cross-session |
 
 ```powershell

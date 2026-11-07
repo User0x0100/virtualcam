@@ -184,14 +184,20 @@ impl VirtualCamera {
         }
     }
 
-    /// The format a connected consumer graph negotiated with a managed
-    /// DirectShow camera, or `None` (no consumer connected, closed, or any
-    /// other backend).
+    /// The format consumers want when it differs from the one this session
+    /// writes, or `None` (none pending, closed, or an OBS/Unity camera).
     ///
-    /// A DirectShow graph's media type is fixed once connected; frames in any
-    /// other pixel format reach it as black. A producer that can convert
-    /// should reopen in the requested pixel format. Reading this is a few
+    /// Managed DirectShow: the format a connected consumer graph negotiated.
+    /// A graph's media type is fixed once connected; frames in any other
+    /// pixel format reach it as black, so a producer that can convert should
+    /// reopen in the requested pixel format. Reading this is a few
     /// shared-memory loads, cheap enough to check before every frame.
+    ///
+    /// Managed Media Foundation: the mode Frame Server's consumers selected
+    /// (the native mode or a conversion the source offers), reported by the
+    /// source and polled with the session's liveness check. Until the
+    /// producer reopens in it with [`crate::ManagedCameraManager::open`], the
+    /// source converts the written mode when it can and shows black otherwise.
     pub fn requested_format(&self) -> Option<VideoFormat> {
         if self.closed {
             return None;

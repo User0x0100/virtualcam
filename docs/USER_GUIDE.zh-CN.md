@@ -393,9 +393,10 @@ let one = manager.get(id)?;
 
 ### 8.2 Media Foundation
 
-- 应用请求帧时由 source 同步交付（request-driven）：有新帧就拷贝最新帧，没有生产者时返回黑帧，从不阻塞应用。
+- 应用请求帧时由 source 按节奏交付：生产者有新帧就立即交付；没有生产者帧时按原生帧率交黑帧；生产者停滞时每秒重交一次最新帧。应用连续请求也不会超过这个节奏。
 - 时间戳使用系统 QPC 时钟（`MFGetSystemTime`），时长等于原生帧间隔。
 - 生产者断开（管道关闭）时立即回到黑帧；正常停止不会发送流结束事件，应用可以继续使用摄像头。
+- 原生 NV12/I420 的摄像头还提供 YUY2。应用选定的格式经管道告知生产者，生产者用 `VirtualCamera::requested_format()` 读取（随存活检查约每 100 ms 更新），可关闭后以 `ManagedCameraManager::open(id, requested)` 重开并自己产出该格式，source 此后只复制；重开之前 source 能转换就自行转换（NV12/I420 → YUY2），不能转换则输出黑帧。
 - 摄像头是 System lifetime：重启后仍然存在，直到 `unregister`。
 
 ## 9. OBS Virtual Camera 与 Unity Capture

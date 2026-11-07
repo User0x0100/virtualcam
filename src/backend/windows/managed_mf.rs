@@ -5,13 +5,15 @@
 //! pipe (absent until a client opens the camera), authenticates by its
 //! token, and maps the source-created ring for writing. Until then frames
 //! are dropped with [`WriteStatus::ConsumerInactive`]. The open pipe is the
-//! liveness link in both directions.
+//! liveness link in both directions, and carries the source's `Request`s:
+//! the mode consumers selected, exposed through `requested_format` so the
+//! application can reopen in that mode (any mode the source offers).
 
 use std::time::{Duration, Instant};
 
-use virtualcam_protocol::mf::{Hello, Welcome, WelcomeStatus, pipe_name};
+use virtualcam_protocol::mf::{Hello, Request, Welcome, WelcomeStatus, pipe_name};
 use virtualcam_protocol::ring::RingWriter;
-use virtualcam_protocol::{CameraId, ValidatedFormat};
+use virtualcam_protocol::{CameraId, ValidatedFormat, VideoFormat};
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
@@ -38,6 +40,8 @@ struct Session {
     _section: OwnedHandle,
     pipe: OwnedHandle,
     next_liveness_check: Instant,
+    /// The mode the source last asked for.
+    requested: Option<VideoFormat>,
 }
 
 pub(crate) struct ManagedMfBackend {
@@ -180,10 +184,12 @@ impl ManagedMfBackend {
             _section: section,
             pipe,
             next_liveness_check: Instant::now() + LIVENESS_PERIOD,
+            requested: None,
         }))
     }
 
-    /// Drops the session when the source closed the pipe.
+    /// Drops the session when the source closed the pipe, and reads the
+    /// source's pending requests.
     fn check_liveness(&mut self) {
         let Some(session) = self.session.as_mut() else { return };
         let now = Instant::now();
@@ -191,11 +197,35 @@ impl ManagedMfBackend {
             return;
         }
         session.next_liveness_check = now + LIVENESS_PERIOD;
-        let mut available = 0_u32;
-        // SAFETY: Live pipe handle; non-blocking query.
-        if unsafe { PeekNamedPipe(session.pipe.raw(), core::ptr::null_mut(), 0, core::ptr::null_mut(), &mut available, core::ptr::null_mut()) } == 0 {
-            self.session = None;
+        loop {
+            let mut available = 0_u32;
+            // SAFETY: Live pipe handle; non-blocking query.
+            if unsafe { PeekNamedPipe(session.pipe.raw(), core::ptr::null_mut(), 0, core::ptr::null_mut(), &mut available, core::ptr::null_mut()) } == 0 {
+                self.session = None;
+                return;
+            }
+            if available == 0 {
+                return;
+            }
+            let pipe = session.pipe.raw();
+            let mut message = [0_u8; Request::SIZE];
+            // SAFETY: `message` outlives the drained overlapped read.
+            let read = overlapped_io(pipe, |ov| unsafe { ReadFile(pipe, message.as_mut_ptr(), message.len() as u32, core::ptr::null_mut(), ov) });
+            match read.map(|read| Request::decode(&message[..read as usize])) {
+                Some(Ok(request)) => session.requested = Some(request.format),
+                // A malformed or oversized message: the source is not one we
+                // understand; drop the session (it retries later).
+                _ => {
+                    self.session = None;
+                    return;
+                }
+            }
         }
+    }
+
+    /// The mode the source asked for, when it differs from the one written.
+    pub(crate) fn requested_format(&self) -> Option<VideoFormat> {
+        self.session.as_ref().and_then(|session| session.requested).filter(|requested| *requested != self.format.format())
     }
 
     pub(crate) fn is_ready(&mut self) -> Result<bool> {

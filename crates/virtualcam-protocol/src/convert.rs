@@ -13,7 +13,7 @@
 //! the nearest neighbor row, clamped at the edges. Matrix and range carry
 //! over unchanged.
 
-use crate::format::{FrameLayout, PixelFormat, Plane};
+use crate::format::{FrameLayout, PixelFormat, Plane, VideoFormat};
 use crate::planes::CopyError;
 
 /// Pixel formats a source can offer besides `native`, in preference order.
@@ -22,6 +22,18 @@ pub const fn conversions_from(native: PixelFormat) -> &'static [PixelFormat] {
         PixelFormat::Nv12 | PixelFormat::I420 => &[PixelFormat::Yuy2],
         _ => &[],
     }
+}
+
+/// Whether a Media Foundation camera with native mode `native` offers
+/// `format`: the native mode itself, or one of its conversions with the same
+/// size, rate and colorimetry.
+pub fn is_offered(native: &VideoFormat, format: &VideoFormat) -> bool {
+    *format == *native
+        || (conversions_from(native.pixel_format).contains(&format.pixel_format)
+            && VideoFormat {
+                pixel_format: native.pixel_format,
+                ..*format
+            } == *native)
 }
 
 /// Whether [`convert_frame`] supports `src` -> `dst`.
@@ -188,6 +200,32 @@ mod tests {
         for native in [PixelFormat::Yuy2, PixelFormat::Uyvy, PixelFormat::P010, PixelFormat::Bgra32, PixelFormat::Rgb24] {
             assert!(conversions_from(native).is_empty(), "{native:?}");
         }
+    }
+
+    #[test]
+    fn offered_modes_are_the_native_one_and_its_conversions() {
+        use crate::format::FrameRate;
+        let native = VideoFormat::new(PixelFormat::Nv12, 1080, 1920, FrameRate::fps(30));
+        assert!(is_offered(&native, &native));
+        assert!(is_offered(&native, &VideoFormat { pixel_format: PixelFormat::Yuy2, ..native }));
+        assert!(!is_offered(
+            &native,
+            &VideoFormat {
+                pixel_format: PixelFormat::Bgra32,
+                ..native
+            }
+        ));
+        assert!(!is_offered(&native, &VideoFormat::new(PixelFormat::Yuy2, 1080, 1080, FrameRate::fps(30))));
+        assert!(!is_offered(
+            &native,
+            &VideoFormat {
+                pixel_format: PixelFormat::Yuy2,
+                frame_rate: FrameRate::fps(60),
+                ..native
+            }
+        ));
+        let yuy2 = VideoFormat { pixel_format: PixelFormat::Yuy2, ..native };
+        assert!(!is_offered(&yuy2, &native), "no conversion back to 4:2:0");
     }
 
     #[test]

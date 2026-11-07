@@ -1,26 +1,57 @@
-//! The single video stream: synchronous, request-driven sample production.
+//! The single video stream: request-driven, paced sample production.
+//!
+//! Frame Server (and every consumer behind it) asks for the next sample as
+//! soon as the previous one arrives, so answering each `RequestSample` at
+//! once would deliver as fast as the consumer can spin (thousands of frames
+//! per second) and burn its CPU. A request is therefore answered only when it
+//! is due:
+//!
+//! - a producer frame newer than the last delivered one is available
+//!   (frame-driven, no added latency);
+//! - no producer frame exists (no producer, or none written yet): black at the
+//!   native frame interval;
+//! - a producer is attached but stalled: the newest frame again after
+//!   [`KEEPALIVE`], so consumers do not time out.
+//!
+//! A request that is not due is queued and answered by the stream's pacing
+//! worker, which polls the ring every [`POLL`] while requests wait.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
-use virtualcam_protocol::convert::convert_frame;
+use virtualcam_protocol::convert::{can_convert, convert_frame};
 use virtualcam_protocol::planes::{CopyError, copy_frame, fill_black};
 use virtualcam_protocol::ring::ReadOutcome;
 use virtualcam_protocol::{FrameLayout, ValidatedFormat};
 use windows::Win32::Foundation::{E_POINTER, E_UNEXPECTED, S_OK};
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMF2DBuffer2, IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaBuffer, IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource, IMFMediaStream_Impl, IMFMediaStream2,
-    IMFMediaStream2_Impl, IMFMediaType, IMFSample, IMFStreamDescriptor, IMFVideoSampleAllocator, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MEMediaSample, MEStreamStarted, MEStreamStopped, MF_E_INVALIDMEDIATYPE, MF_E_INVALIDREQUEST,
-    MF_E_MEDIA_SOURCE_WRONGSTATE, MF_E_SHUTDOWN, MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_PAUSED, MF_STREAM_STATE_RUNNING, MF_STREAM_STATE_STOPPED, MF2DBuffer_LockFlags_Write, MFCreateMemoryBuffer, MFCreateSample,
-    MFGetSystemTime, MFSampleExtension_Token,
+    IMFMediaStream2_Impl, IMFMediaType, IMFSample, IMFStreamDescriptor, IMFVideoSampleAllocator, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MEError, MEMediaSample, MEStreamStarted, MEStreamStopped, MF_E_INVALIDMEDIATYPE,
+    MF_E_INVALIDREQUEST, MF_E_MEDIA_SOURCE_WRONGSTATE, MF_E_SHUTDOWN, MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_PAUSED, MF_STREAM_STATE_RUNNING, MF_STREAM_STATE_STOPPED, MF2DBuffer_LockFlags_Write, MFCreateMemoryBuffer,
+    MFCreateSample, MFGetSystemTime, MFSampleExtension_Token,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-use windows_core::{GUID, IUnknown, Interface, Ref, implement};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+use windows_core::{ComObject, GUID, IUnknown, IUnknownImpl, Interface, Ref, implement};
 
 use crate::rendezvous::TransportSlot;
 use crate::{ModuleRef, guard};
 
 /// Frames requested from a provided allocator.
 const ALLOCATOR_FRAMES: u32 = 10;
+/// How often the pacing worker checks the ring for a new producer frame
+/// while requests wait.
+const POLL: Duration = Duration::from_millis(1);
+/// Longest wait for a new frame from an attached producer before the newest
+/// one is delivered again.
+const KEEPALIVE: Duration = Duration::from_secs(1);
+
+/// When the oldest pending request may be answered.
+enum Due {
+    Now,
+    At(Instant),
+}
 
 pub(crate) struct StreamInner {
     state: MF_STREAM_STATE,
@@ -32,6 +63,14 @@ pub(crate) struct StreamInner {
     /// Index into `MediaStream::offers` of the type selected at the last
     /// start.
     output: usize,
+    /// Tokens of requests not answered yet, oldest first.
+    pending: VecDeque<Option<IUnknown>>,
+    /// `(ring generation, sequence)` of the last delivered producer frame.
+    delivered_frame: Option<(u64, u64)>,
+    /// When the last sample was delivered.
+    delivered_at: Option<Instant>,
+    /// The pacing worker thread is running.
+    worker: bool,
 }
 
 #[implement(IMFMediaStream2)]
@@ -47,6 +86,8 @@ pub(crate) struct MediaStream {
     offers: Vec<(ValidatedFormat, IMFMediaType)>,
     transport: Arc<TransportSlot>,
     inner: Mutex<StreamInner>,
+    /// Wakes the pacing worker on new requests, state changes and shutdown.
+    wake: Condvar,
     _module: ModuleRef,
 }
 
@@ -79,7 +120,12 @@ impl MediaStream {
                 allocator: None,
                 allocator_ready: false,
                 output: 0,
+                pending: VecDeque::new(),
+                delivered_frame: None,
+                delivered_at: None,
+                worker: false,
             }),
+            wake: Condvar::new(),
             _module: ModuleRef::new(),
         }
     }
@@ -147,6 +193,8 @@ impl MediaStream {
             inner.allocator_ready = false;
             inner.output = output;
         }
+        // Ask the producer for this mode so the source only copies.
+        self.transport.select(self.offers[output].0.format());
         if let Some(allocator) = inner.allocator.clone()
             && !inner.allocator_ready
         {
@@ -168,6 +216,9 @@ impl MediaStream {
         let mut inner = self.live()?;
         let was_running = inner.state != MF_STREAM_STATE_STOPPED;
         inner.state = MF_STREAM_STATE_STOPPED;
+        // Requests of a stopped stream are never answered.
+        inner.pending.clear();
+        self.wake.notify_all();
         if inner.allocator_ready
             && let Some(allocator) = &inner.allocator
         {
@@ -198,6 +249,9 @@ impl MediaStream {
         }
         inner.allocator_ready = false;
         inner.source = None;
+        inner.pending.clear();
+        // The pacing worker exits and drops its reference to this stream.
+        self.wake.notify_all();
         // SAFETY: Valid queue; later queue calls report MF_E_SHUTDOWN.
         let _ = unsafe { self.queue.Shutdown() };
     }
@@ -253,7 +307,9 @@ impl MediaStream {
     /// Copies (or converts) the newest producer frame, or black, into
     /// `buffer` as `output`, honoring its pitch, which may differ from the
     /// tight layout and may be negative for bottom-up RGB.
-    fn fill(&self, buffer: &IMFMediaBuffer, output: &ValidatedFormat) -> windows_core::Result<()> {
+    /// Returns the `(ring generation, sequence)` of the delivered producer
+    /// frame, if any.
+    fn fill(&self, buffer: &IMFMediaBuffer, output: &ValidatedFormat) -> windows_core::Result<Option<(u64, u64)>> {
         if let Ok(buffer2) = buffer.cast::<IMF2DBuffer2>() {
             let (mut scanline0, mut pitch, mut start, mut length) = (core::ptr::null_mut(), 0_i32, core::ptr::null_mut(), 0_u32);
             // SAFETY: Valid buffer; all outputs writable.
@@ -293,9 +349,8 @@ impl MediaStream {
         result
     }
 
-    fn write_region(&self, output: &ValidatedFormat, start: *mut u8, length: usize, scanline0: *mut u8, pitch: i32) -> windows_core::Result<()> {
+    fn write_region(&self, output: &ValidatedFormat, start: *mut u8, length: usize, scanline0: *mut u8, pitch: i32) -> windows_core::Result<Option<(u64, u64)>> {
         let format = output.format();
-        let native = self.native.format().pixel_format;
         let invalid = || windows_core::Error::from(E_UNEXPECTED);
         if start.is_null() || scanline0.is_null() || pitch == 0 {
             return Err(E_POINTER.into());
@@ -318,23 +373,133 @@ impl MediaStream {
         // buffer region `start..start + length`, validated above.
         let destination = unsafe { core::slice::from_raw_parts_mut(lowest, layout.size()) };
         let mut copied = true;
-        let outcome = self.transport.read_latest(|src| {
-            copied = if native == format.pixel_format {
-                // SAFETY: `src` spans the ring's validated tight native frame.
-                unsafe { copy_frame(src, self.native.layout(), destination, &layout, flip) }
-            } else if flip {
-                // Conversions produce top-down YUV only.
+        let outcome = self.transport.read_latest(|src, producing| {
+            let producing_pixel = producing.format().pixel_format;
+            copied = if producing_pixel == format.pixel_format {
+                // SAFETY: `src` spans the ring's validated tight frame.
+                unsafe { copy_frame(src, producing.layout(), destination, &layout, flip) }
+            } else if flip || !can_convert(producing_pixel, format.pixel_format) {
+                // Not convertible (or bottom-up): black until the producer
+                // follows the request for the selected mode.
                 Err(CopyError)
             } else {
-                // SAFETY: `src` spans the ring's validated tight native frame.
-                unsafe { convert_frame(src, native, self.native.layout(), destination, format.pixel_format, &layout) }
+                // SAFETY: `src` spans the ring's validated tight frame.
+                unsafe { convert_frame(src, producing_pixel, producing.layout(), destination, format.pixel_format, &layout) }
             }
             .is_ok();
         });
-        if !copied || matches!(outcome, None | Some(ReadOutcome::Empty)) {
-            fill_black(destination, &layout, format.pixel_format, format.color.is_full_range(format.pixel_format)).map_err(|_| invalid())?;
+        match outcome {
+            Some((generation, ReadOutcome::Frame { sequence, .. })) if copied => Ok(Some((generation, sequence))),
+            _ => {
+                fill_black(destination, &layout, format.pixel_format, format.color.is_full_range(format.pixel_format)).map_err(|_| invalid())?;
+                Ok(None)
+            }
         }
-        Ok(())
+    }
+
+    /// When the oldest pending request may be answered (see the module docs).
+    fn due(&self, inner: &StreamInner, now: Instant) -> Due {
+        let Some(last) = inner.delivered_at else { return Due::Now };
+        let at = match self.transport.latest_frame() {
+            Some(frame @ (_, sequence)) if sequence != 0 => {
+                if inner.delivered_frame != Some(frame) {
+                    return Due::Now;
+                }
+                last + KEEPALIVE
+            }
+            _ => last + Duration::from_nanos(self.native.interval_100ns().saturating_mul(100)),
+        };
+        if now >= at { Due::Now } else { Due::At(at) }
+    }
+
+    /// Answers the oldest pending request with a filled sample.
+    fn deliver(&self, inner: &mut StreamInner) -> windows_core::Result<()> {
+        let Some(token) = inner.pending.pop_front() else { return Ok(()) };
+        let output = self.offers[inner.output].0;
+        let sample = Self::allocate(inner, &output)?;
+        // SAFETY: Valid sample with at least one buffer.
+        let buffer = unsafe { sample.GetBufferByIndex(0) }?;
+        if let Some(frame) = self.fill(&buffer, &output)? {
+            inner.delivered_frame = Some(frame);
+        }
+        inner.delivered_at = Some(Instant::now());
+        // SAFETY: Valid sample.
+        unsafe {
+            sample.SetSampleTime(MFGetSystemTime())?;
+            sample.SetSampleDuration(self.native.interval_100ns() as i64)?;
+            if let Some(token) = &token {
+                sample.SetUnknown(&MFSampleExtension_Token, token)?;
+            }
+            self.queue.QueueEventParamUnk(MEMediaSample.0 as u32, &GUID::zeroed(), S_OK, &sample)
+        }
+    }
+
+    /// Body of the pacing worker: answers pending requests as they fall due
+    /// until the stream shuts down.
+    fn pace(&self) {
+        let mut inner = self.inner();
+        loop {
+            if inner.shutdown {
+                inner.worker = false;
+                return;
+            }
+            if inner.state != MF_STREAM_STATE_RUNNING || inner.pending.is_empty() {
+                inner = self.wake.wait(inner).unwrap_or_else(std::sync::PoisonError::into_inner);
+                continue;
+            }
+            let now = Instant::now();
+            match self.due(&inner, now) {
+                Due::Now => {
+                    if let Err(error) = self.deliver(&mut inner) {
+                        // Asynchronous failure: reported as a stream error.
+                        // SAFETY: Valid queue.
+                        let _ = unsafe { self.queue.QueueEventParamVar(MEError.0 as u32, &GUID::zeroed(), error.code(), &PROPVARIANT::default()) };
+                    }
+                }
+                Due::At(at) => {
+                    // Release the lock while waiting; new requests only queue.
+                    drop(inner);
+                    std::thread::sleep(at.saturating_duration_since(now).min(POLL));
+                    inner = self.inner();
+                }
+            }
+        }
+    }
+}
+
+/// The stream object moved to its pacing worker.
+struct Worker(ComObject<MediaStream>);
+
+// SAFETY: Every field of `MediaStream` is a free-threaded Media Foundation
+// object or lock-protected state; Frame Server already calls the stream from
+// arbitrary MTA threads.
+unsafe impl Send for Worker {}
+
+impl Worker {
+    fn run(self) {
+        // SAFETY: Joins the process MTA for the MF calls of this thread.
+        let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+        let _ = guard(|| {
+            self.0.pace();
+            Ok(())
+        });
+        drop(self);
+        if initialized {
+            // SAFETY: Balances the successful CoInitializeEx.
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+impl MediaStream_Impl {
+    /// Starts the pacing worker once; it lives until the stream shuts down.
+    fn ensure_worker(&self, inner: &mut StreamInner) {
+        if inner.worker {
+            return;
+        }
+        let worker = Worker(self.to_object());
+        let started = std::thread::Builder::new().name("virtualcam-mf-pacing".into()).spawn(move || worker.run());
+        inner.worker = started.is_ok();
     }
 }
 
@@ -382,22 +547,15 @@ impl IMFMediaStream_Impl for MediaStream_Impl {
             if inner.state != MF_STREAM_STATE_RUNNING {
                 return Err(MF_E_MEDIA_SOURCE_WRONGSTATE.into());
             }
-            // Failures return their HRESULT here and are never also queued
-            // as MEError.
-            let output = self.offers[inner.output].0;
-            let sample = MediaStream::allocate(&mut inner, &output)?;
-            // SAFETY: Valid sample with at least one buffer.
-            let buffer = unsafe { sample.GetBufferByIndex(0) }?;
-            self.fill(&buffer, &output)?;
-            // SAFETY: Valid sample.
-            unsafe {
-                sample.SetSampleTime(MFGetSystemTime())?;
-                sample.SetSampleDuration(self.native.interval_100ns() as i64)?;
-                if let Some(token) = token.as_ref() {
-                    sample.SetUnknown(&MFSampleExtension_Token, token)?;
-                }
-                self.queue.QueueEventParamUnk(MEMediaSample.0 as u32, &GUID::zeroed(), S_OK, &sample)
+            inner.pending.push_back(token.as_ref().cloned());
+            // Answer at once when due and nothing older waits; failures then
+            // return their HRESULT here and are never also queued as MEError.
+            if inner.pending.len() == 1 && matches!(self.due(&inner, Instant::now()), Due::Now) {
+                return self.deliver(&mut inner);
             }
+            self.ensure_worker(&mut inner);
+            self.wake.notify_all();
+            Ok(())
         })
     }
 }

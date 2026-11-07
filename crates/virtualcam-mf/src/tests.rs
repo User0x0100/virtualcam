@@ -75,6 +75,19 @@ fn events(generator: &IMFMediaEventGenerator) -> Vec<(u32, Option<IUnknown>)> {
     out
 }
 
+/// Waits (up to a second) for the next delivered sample; requests that are
+/// not due yet are answered by the pacing worker.
+fn next_sample(generator: &IMFMediaEventGenerator) -> IMFSample {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if let Some(sample) = events(generator).into_iter().find(|(kind, _)| *kind as i32 == MEMediaSample.0).and_then(|(_, unk)| unk) {
+            return sample.cast().expect("IMFSample");
+        }
+        assert!(std::time::Instant::now() < deadline, "no sample delivered");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 fn kinds(events: &[(u32, Option<IUnknown>)]) -> Vec<i32> {
     events.iter().map(|(kind, _)| *kind as i32).collect()
 }
@@ -281,14 +294,7 @@ fn delivered_buffers_are_tight_for_unaligned_widths() {
             let _ = events(&stream_events);
             for _ in 0..2 {
                 stream.RequestSample(None).expect("request");
-                let delivered = events(&stream_events);
-                let sample: IMFSample = delivered
-                    .into_iter()
-                    .find(|(kind, _)| *kind as i32 == MEMediaSample.0)
-                    .and_then(|(_, unk)| unk)
-                    .expect("sample")
-                    .cast()
-                    .expect("IMFSample");
+                let sample = next_sample(&stream_events);
                 let pitch = raw_pitch(&sample);
                 assert!(pitch == 0 || pitch == 1080, "allocator={with_allocator}: delivered pitch {pitch}, expected a tight 1080");
                 // The raw (not converted) memory holds limited-range black.
@@ -358,13 +364,7 @@ fn consumers_select_a_converted_mode() {
                 let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
                 let _ = events(&stream_events);
                 stream.RequestSample(None).expect("request");
-                let sample: IMFSample = events(&stream_events)
-                    .into_iter()
-                    .find(|(kind, _)| *kind as i32 == MEMediaSample.0)
-                    .and_then(|(_, unk)| unk)
-                    .expect("sample")
-                    .cast()
-                    .expect("IMFSample");
+                let sample = next_sample(&stream_events);
                 let pitch = raw_pitch(&sample);
                 assert!(pitch == 0 || pitch == pitch_bytes, "allocator={with_allocator} pick={pick}: pitch {pitch}");
                 let buffer = sample.GetBufferByIndex(0).expect("buffer");
@@ -379,5 +379,46 @@ fn consumers_select_a_converted_mode() {
             }
             source.Shutdown().expect("shutdown");
         }
+    }
+}
+
+/// Consumers ask for the next sample as soon as one arrives; without pacing
+/// that spins at thousands of frames per second. Without a producer, black
+/// samples are delivered at the native frame interval, the first at once.
+#[test]
+fn requests_are_answered_at_the_frame_rate() {
+    init();
+    let source = source(&configured(&VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(50)))).expect("source");
+    // SAFETY: Valid source for the rest of the test.
+    unsafe {
+        let pd = source.CreatePresentationDescriptor().expect("pd");
+        let generator: IMFMediaEventGenerator = source.cast().expect("generator");
+        source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
+        let stream: IMFMediaStream2 = events(&generator)
+            .into_iter()
+            .find(|(kind, _)| *kind as i32 == MENewStream.0)
+            .and_then(|(_, unk)| unk)
+            .expect("stream")
+            .cast()
+            .expect("IMFMediaStream2");
+        let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
+        let _ = events(&stream_events);
+        let started = std::time::Instant::now();
+        stream.RequestSample(None).expect("request");
+        assert_eq!(kinds(&events(&stream_events)), vec![MEMediaSample.0], "the first request is answered at once");
+        // A consumer that asks again right away gets one sample per 20 ms.
+        for _ in 0..10 {
+            stream.RequestSample(None).expect("request");
+            let _ = next_sample(&stream_events);
+        }
+        let elapsed = started.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(195), "11 samples at 50 FPS took {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_millis(400), "pacing keeps up: {elapsed:?}");
+        // Stopping drops waiting requests; nothing arrives afterwards.
+        stream.RequestSample(None).expect("request");
+        source.Stop().expect("stop");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(!kinds(&events(&stream_events)).contains(&MEMediaSample.0), "no sample after stop");
+        source.Shutdown().expect("shutdown");
     }
 }

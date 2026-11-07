@@ -289,8 +289,10 @@ impl ManagedCameraManager {
     /// DirectShow accepts any valid managed format per session; a consumer
     /// graph that is already connected keeps its negotiated format (and shows
     /// black for a different one) until it reconnects. Media Foundation
-    /// requires `format` to equal the native mode exactly, otherwise
-    /// [`Error::FormatMismatch`].
+    /// accepts the native mode or a mode the source offers as a conversion of
+    /// it (NV12/I420 cameras also offer YUY2), otherwise
+    /// [`Error::FormatMismatch`]; [`VirtualCamera::requested_format`] reports
+    /// the mode consumers selected so the producer can follow it.
     pub fn open(&self, id: ManagedCameraId, format: VideoFormat) -> Result<VirtualCamera> {
         imp::open(self, id, Some(format))
     }
@@ -612,10 +614,11 @@ mod imp {
             }
             ManagedBackend::MediaFoundation => {
                 let native = record.format.ok_or(Error::RegistrationDegraded { detail: "native format is missing" })?;
-                if format.is_some_and(|format| format != native) {
+                let format = format.unwrap_or(native);
+                if !virtualcam_protocol::convert::is_offered(&native, &format) {
                     return Err(Error::FormatMismatch);
                 }
-                mf::open(&record, native.validate()?)
+                mf::open(&record, format.validate()?)
             }
         }
     }

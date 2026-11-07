@@ -111,6 +111,7 @@ impl Backend {
     pub(crate) fn requested_format(&self) -> Option<virtualcam_protocol::VideoFormat> {
         match self {
             Self::ManagedDirectShow(backend) => backend.requested_format(),
+            Self::ManagedMediaFoundation(backend) => backend.requested_format(),
             _ => None,
         }
     }

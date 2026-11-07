@@ -10,15 +10,19 @@
 //! 4. a fresh ring under a source-generated 128-bit nonce, with an explicit
 //!    DACL (owner: map read/write only), never reusing a pre-existing object;
 //! 5. `Welcome`, then a pending 1-byte read whose completion (pipe closed)
-//!    detaches the producer: the stream returns to black immediately.
+//!    detaches the producer: the stream returns to black immediately. While
+//!    parked, the worker sends a `Request` whenever the consumers' selected
+//!    mode differs from the producer's (the stream signals each selection).
 //!
 //! Source activation and `Start` never wait for any of this.
 
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use virtualcam_protocol::mf::{Hello, Welcome, WelcomeStatus, pipe_name, ring_name};
+use virtualcam_protocol::convert::is_offered;
+use virtualcam_protocol::mf::{Hello, Request, Welcome, WelcomeStatus, pipe_name, ring_name};
 use virtualcam_protocol::ring::{DEFAULT_SLOT_COUNT, ReadOutcome, RingLayout, RingReader, RingWriter};
+use virtualcam_protocol::{ValidatedFormat, VideoFormat};
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_HANDLE, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WIN32_ERROR};
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile};
@@ -75,20 +79,61 @@ struct Attached {
     // Field order is drop order: the reader's view outlives the reader.
     reader: RingReader,
     _mapping: RingMapping,
+    /// The mode the producer writes.
+    format: ValidatedFormat,
 }
 
-/// The currently attached producer ring, shared by worker and stream.
-#[derive(Default)]
-pub(crate) struct TransportSlot(Mutex<Option<Attached>>);
+/// The currently attached producer ring and the consumers' selected mode,
+/// shared by worker and stream.
+pub(crate) struct TransportSlot {
+    attached: Mutex<Option<Attached>>,
+    selected: Mutex<Option<VideoFormat>>,
+    /// Auto-reset event set on every selection; wakes the parked worker.
+    selected_event: Option<Handle>,
+}
 
 impl TransportSlot {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Attached>> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    pub(crate) fn new() -> Self {
+        // SAFETY: Anonymous auto-reset event; without it the worker simply
+        // never sends requests.
+        let selected_event = unsafe { CreateEventW(None, false, false, None) }.ok().map(Handle);
+        Self {
+            attached: Mutex::new(None),
+            selected: Mutex::new(None),
+            selected_event,
+        }
     }
 
-    /// Runs a seqlock'd read of the newest frame, if a producer is attached.
-    pub(crate) fn read_latest(&self, copy: impl FnMut(*const u8)) -> Option<ReadOutcome> {
-        self.lock().as_ref().map(|attached| attached.reader.read_latest(copy))
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Attached>> {
+        self.attached.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Runs a seqlock'd read of the newest frame, if a producer is attached;
+    /// `copy` also receives the mode the producer writes.
+    /// The result also carries the ring generation.
+    pub(crate) fn read_latest(&self, mut copy: impl FnMut(*const u8, &ValidatedFormat)) -> Option<(u64, ReadOutcome)> {
+        self.lock().as_ref().map(|attached| (attached.reader.generation(), attached.reader.read_latest(|src| copy(src, &attached.format))))
+    }
+
+    /// The attached producer's newest frame as `(ring generation, sequence)`
+    /// (sequence 0 before its first frame), or `None` without a producer.
+    /// Every producer session gets a fresh ring whose sequences restart at 1,
+    /// so a frame is identified by both.
+    pub(crate) fn latest_frame(&self) -> Option<(u64, u64)> {
+        self.lock().as_ref().map(|attached| (attached.reader.generation(), attached.reader.latest_sequence()))
+    }
+
+    /// Records the mode consumers selected and wakes the worker.
+    pub(crate) fn select(&self, format: VideoFormat) {
+        *self.selected.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format);
+        if let Some(event) = &self.selected_event {
+            // SAFETY: Live event.
+            let _ = unsafe { SetEvent(event.0) };
+        }
+    }
+
+    fn selected(&self) -> Option<VideoFormat> {
+        *self.selected.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn attach(&self, attached: Attached) {
@@ -252,12 +297,13 @@ fn serve(config: &SourceConfig, rendezvous: &RendezvousConfig, me: &Sid, slot: &
         return;
     };
     let Ok(hello) = Hello::decode(&buffer[..read as usize]) else { return };
+    let offered = is_offered(&config.format.format(), &hello.format).then(|| hello.format.validate().ok()).flatten();
     // The bounded message was read, so impersonation reflects this client.
     let status = match pipe_client_user(pipe) {
         Some(user) if user.equals(&rendezvous.expected_owner) => {
             if hello.camera_id != config.camera_id {
                 WelcomeStatus::CameraMismatch
-            } else if hello.format != config.format.format() {
+            } else if offered.is_none() {
                 WelcomeStatus::FormatMismatch
             } else {
                 WelcomeStatus::Ok
@@ -270,7 +316,8 @@ fn serve(config: &SourceConfig, rendezvous: &RendezvousConfig, me: &Sid, slot: &
         return;
     }
 
-    let Some((attached, welcome)) = create_ring(config, me, &rendezvous.expected_owner, pipe) else {
+    let Some(format) = offered else { return };
+    let Some((attached, welcome)) = create_ring(&format, me, &rendezvous.expected_owner, pipe) else {
         write_welcome(pipe, event, cancel, &Welcome::failure(WelcomeStatus::Internal));
         return;
     };
@@ -278,20 +325,80 @@ fn serve(config: &SourceConfig, rendezvous: &RendezvousConfig, me: &Sid, slot: &
     if !write_welcome(pipe, event, cancel, &welcome) {
         return;
     }
-    // Park until the producer closes its end (or we are cancelled).
+    park(slot, pipe, event, cancel, hello.format);
+}
+
+/// Waits until the producer closes its end (or we are cancelled), sending a
+/// `Request` whenever the selected mode differs from the producer's.
+fn park(slot: &TransportSlot, pipe: HANDLE, event: &Handle, cancel: &Handle, producing: VideoFormat) {
+    // SAFETY: Anonymous manual-reset event for overlapped writes.
+    let Ok(write_event) = (unsafe { CreateEventW(None, true, false, None) }) else { return };
+    let write_event = Handle(write_event);
+    // The mode the producer writes or was last asked for.
+    let mut asked = producing;
+    let request = |asked: &mut VideoFormat| -> bool {
+        let Some(selected) = slot.selected().filter(|selected| selected != asked) else { return true };
+        let Ok(bytes) = (Request { format: selected }).encode() else { return true };
+        // SAFETY: `bytes` outlives the drained overlapped write.
+        let sent = matches!(overlapped(pipe, &write_event, cancel, HANDSHAKE_TIMEOUT_MS, |ov| unsafe { WriteFile(pipe, Some(&bytes), None, Some(ov)) }), Io::Done(n) if n as usize == bytes.len());
+        if sent {
+            *asked = selected;
+        }
+        sent
+    };
+    if !request(&mut asked) {
+        return;
+    }
     let mut byte = [0_u8; 1];
     loop {
-        // SAFETY: `byte` outlives the drained overlapped read.
-        match overlapped(pipe, event, cancel, INFINITE, |ov| unsafe { ReadFile(pipe, Some(&mut byte), None, Some(ov)) }) {
-            Io::Done(_) => continue,
-            Io::Cancelled | Io::Failed => return,
+        let mut ov = OVERLAPPED { hEvent: event.0, ..Default::default() };
+        // SAFETY: `byte` and `ov` outlive the read, which is drained below
+        // on every path that leaves this iteration while it is pending.
+        match unsafe { ReadFile(pipe, Some(&mut byte), None, Some(&mut ov)) } {
+            Ok(()) => continue,
+            Err(error) if error.code() != ERROR_IO_PENDING.to_hresult() => return,
+            Err(_) => {}
+        }
+        let drain = |ov: &OVERLAPPED| {
+            // SAFETY: `ov` is the pending read on `pipe`.
+            unsafe {
+                let _ = CancelIoEx(pipe, Some(ov));
+                let mut ignored = 0;
+                let _ = GetOverlappedResult(pipe, ov, &mut ignored, true);
+            }
+        };
+        loop {
+            let selected = slot.selected_event.as_ref().map_or(cancel.0, |selected| selected.0);
+            let handles = [cancel.0, event.0, selected];
+            // SAFETY: Three live handles.
+            let waited = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+            match waited.0.wrapping_sub(WAIT_OBJECT_0.0) {
+                1 => {
+                    let mut bytes = 0;
+                    // SAFETY: The read completed.
+                    if unsafe { GetOverlappedResult(pipe, &ov, &mut bytes, false) }.is_err() {
+                        return;
+                    }
+                    break;
+                }
+                2 if !cancelled(cancel) => {
+                    if !request(&mut asked) {
+                        drain(&ov);
+                        return;
+                    }
+                }
+                _ => {
+                    drain(&ov);
+                    return;
+                }
+            }
         }
     }
 }
 
 /// Creates a fresh ring the authenticated owner may map read/write.
-fn create_ring(config: &SourceConfig, me: &Sid, owner: &Sid, pipe: HANDLE) -> Option<(Attached, Welcome)> {
-    let layout = RingLayout::for_format(&config.format, DEFAULT_SLOT_COUNT).ok()?;
+fn create_ring(format: &ValidatedFormat, me: &Sid, owner: &Sid, pipe: HANDLE) -> Option<(Attached, Welcome)> {
+    let layout = RingLayout::for_format(format, DEFAULT_SLOT_COUNT).ok()?;
     let descriptor = SecurityDescriptor::from_sddl(&mapping_sddl(me, owner)?)?;
     let attributes = descriptor.attributes();
     let mut client_pid = 0;
@@ -343,7 +450,7 @@ fn create_ring(config: &SourceConfig, me: &Sid, owner: &Sid, pipe: HANDLE) -> Op
             };
             let generation = u64::try_from(nonce >> 64).ok()?.max(1);
             // SAFETY: Fresh exclusive view; the producer attaches as writer later.
-            unsafe { RingWriter::initialize(mapping.ptr, mapping.len, &config.format, layout.slot_count, generation, client_pid) }.ok()?;
+            unsafe { RingWriter::initialize(mapping.ptr, mapping.len, format, layout.slot_count, generation, client_pid) }.ok()?;
             // SAFETY: The view lives as long as the reader (stored together).
             let reader = unsafe { RingReader::open(mapping.ptr, mapping.len) }.ok()?;
             let welcome = Welcome {
@@ -353,7 +460,14 @@ fn create_ring(config: &SourceConfig, me: &Sid, owner: &Sid, pipe: HANDLE) -> Op
                 generation,
                 ring_name: name,
             };
-            return Some((Attached { reader, _mapping: mapping }, welcome));
+            return Some((
+                Attached {
+                    reader,
+                    _mapping: mapping,
+                    format: *format,
+                },
+                welcome,
+            ));
         }
     }
     None
