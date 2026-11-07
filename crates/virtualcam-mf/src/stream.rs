@@ -65,7 +65,7 @@ pub(crate) struct StreamInner {
     output: usize,
     /// Tokens of requests not answered yet, oldest first.
     pending: VecDeque<Option<IUnknown>>,
-    /// `(ring generation, sequence)` of the last delivered producer frame.
+    /// `(ring generation, sequence)` of the last processed producer frame.
     delivered_frame: Option<(u64, u64)>,
     /// When the last sample was delivered.
     delivered_at: Option<Instant>,
@@ -207,6 +207,7 @@ impl MediaStream {
             }
         }
         inner.state = MF_STREAM_STATE_RUNNING;
+        self.wake.notify_all();
         // SAFETY: Valid queue; the variant outlives the call.
         unsafe { self.queue.QueueEventParamVar(MEStreamStarted.0 as u32, &GUID::zeroed(), S_OK, &variant_i64(time)) }
     }
@@ -307,8 +308,8 @@ impl MediaStream {
     /// Copies (or converts) the newest producer frame, or black, into
     /// `buffer` as `output`, honoring its pitch, which may differ from the
     /// tight layout and may be negative for bottom-up RGB.
-    /// Returns the `(ring generation, sequence)` of the delivered producer
-    /// frame, if any.
+    /// Returns the `(ring generation, sequence)` of the processed producer
+    /// frame, even when an incompatible mode is delivered as black.
     fn fill(&self, buffer: &IMFMediaBuffer, output: &ValidatedFormat) -> windows_core::Result<Option<(u64, u64)>> {
         if let Ok(buffer2) = buffer.cast::<IMF2DBuffer2>() {
             let (mut scanline0, mut pitch, mut start, mut length) = (core::ptr::null_mut(), 0_i32, core::ptr::null_mut(), 0_u32);
@@ -388,13 +389,14 @@ impl MediaStream {
             }
             .is_ok();
         });
-        match outcome {
-            Some((generation, ReadOutcome::Frame { sequence, .. })) if copied => Ok(Some((generation, sequence))),
-            _ => {
-                fill_black(destination, &layout, format.pixel_format, format.color.is_full_range(format.pixel_format)).map_err(|_| invalid())?;
-                Ok(None)
-            }
+        let frame = match outcome {
+            Some((generation, ReadOutcome::Frame { sequence, .. })) => Some((generation, sequence)),
+            _ => None,
+        };
+        if !copied || frame.is_none() {
+            fill_black(destination, &layout, format.pixel_format, format.color.is_full_range(format.pixel_format)).map_err(|_| invalid())?;
         }
+        Ok(frame)
     }
 
     /// When the oldest pending request may be answered (see the module docs).
@@ -566,6 +568,10 @@ impl IMFMediaStream2_Impl for MediaStream_Impl {
         match value {
             MF_STREAM_STATE_STOPPED | MF_STREAM_STATE_PAUSED => {
                 inner.state = value;
+                if value == MF_STREAM_STATE_STOPPED {
+                    inner.pending.clear();
+                }
+                self.wake.notify_all();
                 Ok(())
             }
             // Running is entered only through the source's Start, which

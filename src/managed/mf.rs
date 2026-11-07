@@ -466,6 +466,29 @@ mod tests {
     }
 
     #[test]
+    fn unconvertible_frames_are_paced() {
+        let _scope = MfScope::enter().expect("MF");
+        let native = VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(30));
+        let producing = VideoFormat { pixel_format: PixelFormat::Yuy2, ..native };
+        let (id, rendezvous, source, reader) = in_process_camera(native, PixelFormat::Nv12);
+        let mut camera = VirtualCamera::open_managed_mf(id, producing.validate().expect("format"), &rendezvous).expect("open");
+        assert_eq!(write_until_attached(&mut camera, &vec![100; 64 * 48 * 2]), Ok(WriteStatus::Written));
+        let started = Instant::now();
+        let mut samples = 0;
+        while started.elapsed() < Duration::from_millis(250) {
+            let bytes = read(&reader);
+            let y = 64 * 48;
+            assert_eq!(bytes.len(), y * 3 / 2);
+            assert!(bytes[..y].iter().all(|byte| *byte == 16) && bytes[y..].iter().all(|byte| *byte == 128), "YUY2 cannot become NV12: black");
+            samples += 1;
+        }
+        drop((camera, reader));
+        // SAFETY: Valid source; the reader may already have shut it down.
+        let _ = unsafe { source.Shutdown() };
+        assert!(samples <= 12, "{samples} black samples from one producer frame in {:?}", started.elapsed());
+    }
+
+    #[test]
     fn producer_authenticates_and_feeds_an_in_process_frame_server_source() {
         let _scope = MfScope::enter().expect("MF");
         let mut factory = core::ptr::null_mut();

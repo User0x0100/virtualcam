@@ -422,3 +422,71 @@ fn requests_are_answered_at_the_frame_rate() {
         source.Shutdown().expect("shutdown");
     }
 }
+
+#[test]
+fn restart_wakes_a_paused_pending_request() {
+    init();
+    let source = source(&configured(&VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(2)))).expect("source");
+    // SAFETY: Valid source, stream and event queues throughout the test.
+    unsafe {
+        let pd = source.CreatePresentationDescriptor().expect("pd");
+        let generator: IMFMediaEventGenerator = source.cast().expect("generator");
+        source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
+        let stream: IMFMediaStream2 = events(&generator)
+            .into_iter()
+            .find(|(kind, _)| *kind as i32 == MENewStream.0)
+            .and_then(|(_, unknown)| unknown)
+            .expect("stream")
+            .cast()
+            .expect("IMFMediaStream2");
+        let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
+        let _ = events(&stream_events);
+        stream.RequestSample(None).expect("first request");
+        let _ = next_sample(&stream_events);
+        let token: IUnknown = source.GetSourceAttributes().expect("attributes").cast().expect("token");
+        stream.RequestSample(&token).expect("pending request");
+        stream.SetStreamState(windows::Win32::Media::MediaFoundation::MF_STREAM_STATE_PAUSED).expect("pause");
+        // Let the worker enter its condition-variable wait before restarting.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!kinds(&events(&stream_events)).contains(&MEMediaSample.0), "no sample while paused");
+        source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("restart");
+        let sample = next_sample(&stream_events);
+        let echoed: IUnknown = sample.GetUnknown(&MFSampleExtension_Token).expect("token");
+        source.Shutdown().expect("shutdown");
+        assert_eq!(echoed.as_raw(), token.as_raw(), "the pending request resumes without another RequestSample");
+    }
+}
+
+#[test]
+fn stream_stop_drops_old_request_tokens() {
+    init();
+    let source = source(&configured(&VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(2)))).expect("source");
+    // SAFETY: Valid source, stream and event queues throughout the test.
+    unsafe {
+        let pd = source.CreatePresentationDescriptor().expect("pd");
+        let generator: IMFMediaEventGenerator = source.cast().expect("generator");
+        source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
+        let stream: IMFMediaStream2 = events(&generator)
+            .into_iter()
+            .find(|(kind, _)| *kind as i32 == MENewStream.0)
+            .and_then(|(_, unknown)| unknown)
+            .expect("stream")
+            .cast()
+            .expect("IMFMediaStream2");
+        let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
+        let _ = events(&stream_events);
+        stream.RequestSample(None).expect("first request");
+        let _ = next_sample(&stream_events);
+        let old: IUnknown = source.GetSourceAttributes().expect("source attributes").cast().expect("old token");
+        let new: IUnknown = source.GetStreamAttributes(0).expect("stream attributes").cast().expect("new token");
+        stream.RequestSample(&old).expect("pending request");
+        stream.SetStreamState(windows::Win32::Media::MediaFoundation::MF_STREAM_STATE_STOPPED).expect("stop");
+        assert_eq!(stream.RequestSample(None).map_err(|error| error.code()), Err(MF_E_MEDIA_SOURCE_WRONGSTATE));
+        source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("restart");
+        stream.RequestSample(&new).expect("new request");
+        let sample = next_sample(&stream_events);
+        let echoed: IUnknown = sample.GetUnknown(&MFSampleExtension_Token).expect("token");
+        source.Shutdown().expect("shutdown");
+        assert_eq!(echoed.as_raw(), new.as_raw(), "the stopped request must not be delivered after restart");
+    }
+}
