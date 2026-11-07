@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use virtualcam_protocol::delivery::FrameId;
 use virtualcam_protocol::dshow::{CONTROL_STATE_ACTIVE, DshowControl, DshowNames};
 use virtualcam_protocol::planes::copy_frame;
 use virtualcam_protocol::ring::{RING_STATE_STOPPED, ReadOutcome, RingReader};
@@ -32,7 +33,7 @@ struct Session {
     // Field order is drop order: the reader's view outlives the reader.
     reader: RingReader,
     _view: ReadView,
-    producer: Option<Handle>,
+    producer: Option<Arc<Handle>>,
     /// `None` for producers that predate frame events: timer pacing.
     frame_event: Option<Arc<Handle>>,
     next_liveness_check: u64,
@@ -43,6 +44,12 @@ impl Session {
     fn serves(&self, want: &VideoFormat) -> bool {
         self.alive && self.format.pixel_format == want.pixel_format && self.format.width == want.width && self.format.height == want.height
     }
+}
+
+pub(crate) struct LiveSignal {
+    pub(crate) event: Arc<Handle>,
+    pub(crate) frame: FrameId,
+    pub(crate) producer: Option<Arc<Handle>>,
 }
 
 /// Lazily attached view of one camera's producer sessions.
@@ -77,16 +84,26 @@ impl Transport {
 
     /// The frame event and latest sequence of a live session that carries
     /// `want`'s pixel format and size, if it has a frame event.
-    pub(crate) fn live_signal(&mut self, want: &VideoFormat) -> Option<(Arc<Handle>, u64)> {
+    pub(crate) fn live_signal(&mut self, want: &VideoFormat) -> Option<LiveSignal> {
         self.refresh(now_100ns());
         let session = self.session.as_ref().filter(|s| s.serves(want) && s.reader.state() != RING_STATE_STOPPED)?;
-        Some((Arc::clone(session.frame_event.as_ref()?), session.reader.latest_sequence()))
+        Some(LiveSignal {
+            event: Arc::clone(session.frame_event.as_ref()?),
+            frame: (session.reader.generation(), session.reader.latest_sequence()),
+            producer: session.producer.clone(),
+        })
+    }
+
+    pub(crate) fn producer_stopped(&mut self, generation: u64) {
+        if let Some(session) = self.session.as_mut().filter(|session| session.generation == generation) {
+            session.alive = false;
+        }
     }
 
     /// Copies the newest producer frame into `dst` when a live session
     /// carries `want`'s pixel format and size, returning its sequence.
     /// `None` means the caller should deliver black instead.
-    pub(crate) fn fill(&mut self, dst: &mut [u8], dst_layout: &FrameLayout, want: &VideoFormat, flip: bool) -> Option<u64> {
+    pub(crate) fn fill(&mut self, dst: &mut [u8], dst_layout: &FrameLayout, want: &VideoFormat, flip: bool) -> Option<FrameId> {
         self.refresh(now_100ns());
         let session = self.session.as_ref().filter(|s| s.serves(want))?;
         let mut copied = true;
@@ -95,9 +112,7 @@ impl Transport {
             copied = unsafe { copy_frame(src, &session.source_layout, dst, dst_layout, flip) }.is_ok();
         });
         match outcome {
-            ReadOutcome::Frame { sequence, .. } if copied => Some(sequence),
-            // A torn read still beats black; it is superseded next frame.
-            ReadOutcome::Contended if copied => Some(session.reader.latest_sequence()),
+            ReadOutcome::Frame { sequence, .. } if copied => Some((session.reader.generation(), sequence)),
             _ => None,
         }
     }
@@ -159,7 +174,7 @@ impl Transport {
             source_layout: *validated.layout(),
             reader,
             _view: view,
-            producer,
+            producer: producer.map(Arc::new),
             frame_event,
             next_liveness_check: now + LIVENESS_PERIOD_100NS,
             alive,

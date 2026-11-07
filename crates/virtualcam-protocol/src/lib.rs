@@ -14,15 +14,17 @@
 //! - [`mf`]: Media Foundation vendor attributes and rendezvous handshake
 //!   (source-owned format, cross-session transport).
 //! - [`planes`]: pitch-aware plane copy and black fill used by both sources.
+//! - [`delivery`]: shared frame identity, delivery timing and format-request checks.
 //! - [`convert`]: the NV12/I420 to YUY2 conversion a Media Foundation source
 //!   offers besides its native mode.
 //!
-//! Only the frame ring is common to both backends. Control planes,
+//! The frame ring and delivery decisions are common to both backends. Control planes,
 //! ownership, naming, and readiness stay backend-specific by design.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod convert;
+pub mod delivery;
 pub mod dshow;
 pub mod format;
 pub mod id;

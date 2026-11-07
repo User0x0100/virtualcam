@@ -11,6 +11,7 @@
 //! seqlock'd transport v2 ring from `virtualcam-protocol`.
 
 mod managed_dshow;
+mod managed_frame;
 mod managed_mf;
 mod obs;
 mod protocol;

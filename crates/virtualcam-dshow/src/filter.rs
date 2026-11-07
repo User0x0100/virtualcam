@@ -203,6 +203,9 @@ impl SourceFilter {
             }
         }
         state.filter_state = State_Paused;
+        if let Some(worker) = &state.worker {
+            worker.wake();
+        }
         S_OK
     }
 }

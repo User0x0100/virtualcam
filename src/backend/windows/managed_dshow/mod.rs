@@ -192,25 +192,12 @@ impl ManagedDshowBackend {
         if record.state != REQUEST_STATE_CONNECTED {
             return None;
         }
-        record.format.decode().ok().filter(|format| format.validate().is_ok())
+        virtualcam_protocol::delivery::requested_format(self.record.format.decode().ok()?, record.format.decode().ok().filter(|format| format.validate().is_ok()))
     }
 
     pub(super) fn write_frame(&mut self, frame: FrameSource<'_>) -> Result<WriteStatus> {
         let Session { writer, frame_event, .. } = self.ring.as_mut().ok_or(Error::AlreadyClosed)?;
-        if frame.byte_len() != writer.frame_size() {
-            return Err(Error::FrameSizeMismatch {
-                expected: writer.frame_size(),
-                actual: frame.byte_len(),
-            });
-        }
-        let payload = writer.begin_frame();
-        if let Err(error) = frame.copy_to(payload) {
-            writer.abort_frame();
-            return Err(error);
-        }
-        writer.commit_frame(self.clock.now_100ns()?);
-        // SAFETY: Live event handle owned by this session.
-        unsafe { SetEvent(frame_event.raw()) };
+        super::managed_frame::write_frame(writer, frame_event, frame, self.clock.now_100ns()?)?;
         if !self.first_frame_published {
             self.first_frame_published = true;
             self.record_history();
@@ -333,9 +320,13 @@ mod tests {
         // SAFETY: The view stays mapped for the reader's lifetime.
         let reader = unsafe { RingReader::open(ring_view.as_ptr(), ring_view.accessible_len()) }.expect("ring");
         assert_eq!(reader.generation(), record.generation);
+        // SAFETY: Session owns this live named event; the test only waits.
+        let frame_event = unsafe { OwnedHandle::from_result(windows_sys::Win32::System::Threading::OpenEventW(0x0010_0000, 0, names.frame_event(record.generation).as_ptr()), "OpenEventW(test)") }.expect("frame event");
 
         let frame: Vec<u8> = (0..16).collect();
         assert_eq!(producer.write_frame(FrameSource::Host(&frame)), Ok(WriteStatus::Written));
+        // SAFETY: Live event, signaled only after the committed payload is visible.
+        assert_eq!(unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(frame_event.raw(), 0) }, windows_sys::Win32::Foundation::WAIT_OBJECT_0);
         assert_eq!(reader.state(), RING_STATE_ACTIVE);
         let mut out = [0_u8; 16];
         let outcome = reader.read_latest(|src| {
@@ -345,6 +336,12 @@ mod tests {
         assert!(matches!(outcome, ReadOutcome::Frame { sequence: 1, .. }));
         assert_eq!(out.as_slice(), frame.as_slice());
         assert!(matches!(producer.write_frame(FrameSource::Host(&frame[..8])), Err(Error::FrameSizeMismatch { .. })));
+        assert_eq!(
+            unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(frame_event.raw(), 0) },
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT,
+            "rejected frame must not notify"
+        );
+        assert_eq!(reader.latest_sequence(), 1, "rejected frame must not publish");
 
         producer.close().expect("close");
         producer.close().expect("idempotent");
