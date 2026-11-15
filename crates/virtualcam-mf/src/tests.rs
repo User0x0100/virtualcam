@@ -2,14 +2,15 @@
 
 use core::ffi::c_void;
 
-use virtualcam_protocol::mf::{ATTR_CAMERA_ID, ATTR_NATIVE_FORMAT, ATTR_PROTOCOL_VERSION, PROTOCOL_VERSION, SOURCE_CLSID};
+use virtualcam_protocol::mf::{ATTR_CAMERA_ID, ATTR_DEFAULT_FORMAT, ATTR_PIXEL_FORMATS, ATTR_PROTOCOL_VERSION, PROTOCOL_VERSION, SOURCE_CLSID};
+use virtualcam_protocol::planes::fill_black;
 use virtualcam_protocol::{FrameRate, PixelFormat, VideoFormat};
 use windows::Win32::Foundation::{ERROR_SET_NOT_FOUND, S_OK};
 use windows::Win32::Media::KernelStreaming::{IKsControl, KSIDENTIFIER};
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFAttributes, IMFGetService, IMFMediaEventGenerator, IMFMediaSource, IMFMediaSourceEx, IMFMediaStream2, IMFSample, MEMediaSample, MENewStream, MESourceStarted, MESourceStopped, MEStreamStarted, MEStreamStopped,
-    MEUpdatedStream, MF_E_INVALID_STATE_TRANSITION, MF_E_INVALIDREQUEST, MF_E_MEDIA_SOURCE_WRONGSTATE, MF_E_SHUTDOWN, MF_E_UNSUPPORTED_SERVICE, MF_E_UNSUPPORTED_TIME_FORMAT, MF_EVENT_FLAG_NO_WAIT, MF_MT_FRAME_SIZE, MF_MT_SUBTYPE,
-    MF_STREAM_STATE_RUNNING, MF_VERSION, MFMEDIASOURCE_IS_LIVE, MFSTARTUP_LITE, MFSampleExtension_Token, MFStartup,
+    MEUpdatedStream, MF_E_INVALID_STATE_TRANSITION, MF_E_INVALIDREQUEST, MF_E_MEDIA_SOURCE_WRONGSTATE, MF_E_SHUTDOWN, MF_E_UNSUPPORTED_SERVICE, MF_E_UNSUPPORTED_TIME_FORMAT, MF_EVENT_FLAG_NO_WAIT, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_SIZE, MF_MT_SUBTYPE, MF_STREAM_STATE_RUNNING, MF_VERSION, MFMEDIASOURCE_IS_LIVE, MFSTARTUP_LITE, MFSampleExtension_Token, MFStartup,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, IClassFactory};
 use windows_core::{GUID, HSTRING, IUnknown, Interface};
@@ -40,15 +41,24 @@ fn activate() -> IMFActivate {
     unsafe { factory.CreateInstance(None) }.expect("activate")
 }
 
-fn configured(format: &VideoFormat) -> IMFActivate {
+/// An activation object configured with `default` and the declared pixel
+/// formats, exactly as the manager writes them.
+fn configured(default: &VideoFormat, formats: &[PixelFormat]) -> IMFActivate {
     let activate = activate();
+    let declared: Vec<u8> = formats.iter().filter_map(|format| format.wire_code()).flat_map(u32::to_le_bytes).collect();
     // SAFETY: Plain attribute writes.
     unsafe {
         activate.SetUINT32(&key(ATTR_PROTOCOL_VERSION), PROTOCOL_VERSION).expect("version");
         activate.SetString(&key(ATTR_CAMERA_ID), &HSTRING::from("{11111111-2222-4333-8444-555555555555}")).expect("id");
-        activate.SetBlob(&key(ATTR_NATIVE_FORMAT), &format.to_wire().expect("wire").to_bytes()).expect("format");
+        activate.SetBlob(&key(ATTR_DEFAULT_FORMAT), &default.to_wire().expect("wire").to_bytes()).expect("default");
+        activate.SetBlob(&key(ATTR_PIXEL_FORMATS), &declared).expect("formats");
     }
     activate
+}
+
+/// A camera declaring exactly one mode.
+fn single(format: &VideoFormat) -> IMFActivate {
+    configured(format, &[format.pixel_format])
 }
 
 fn source(activate: &IMFActivate) -> windows_core::Result<IMFMediaSourceEx> {
@@ -92,39 +102,70 @@ fn kinds(events: &[(u32, Option<IUnknown>)]) -> Vec<i32> {
     events.iter().map(|(kind, _)| *kind as i32).collect()
 }
 
+/// The `IMFMediaStream2` announced by a `MENewStream` event.
+fn announced_stream(events: &[(u32, Option<IUnknown>)]) -> IMFMediaStream2 {
+    events
+        .iter()
+        .find(|(kind, _)| *kind as i32 == MENewStream.0)
+        .and_then(|(_, unknown)| unknown.clone())
+        .expect("stream")
+        .cast()
+        .expect("IMFMediaStream2")
+}
+
+fn bytes_of(sample: &IMFSample) -> Vec<u8> {
+    // SAFETY: The sample owns its buffer and the lock is balanced.
+    unsafe {
+        let buffer = sample.ConvertToContiguousBuffer().expect("buffer");
+        let (mut data, mut length) = (core::ptr::null_mut(), 0_u32);
+        buffer.Lock(&mut data, None, Some(&mut length)).expect("lock");
+        let bytes = core::slice::from_raw_parts(data, length as usize).to_vec();
+        buffer.Unlock().expect("unlock");
+        bytes
+    }
+}
+
 #[test]
 fn activation_fails_closed_on_missing_or_malformed_attributes() {
     init();
     let format = VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(30));
     assert_eq!(source(&activate()).map(|_| ()).map_err(|e| e.code()), Err(MF_E_INVALIDREQUEST), "no attributes");
 
-    let bad_version = configured(&format);
+    let bad_version = single(&format);
     // SAFETY: Attribute write.
     unsafe { bad_version.SetUINT32(&key(ATTR_PROTOCOL_VERSION), 99) }.expect("set");
     assert!(source(&bad_version).is_err());
 
-    let oversized = configured(&format);
+    let oversized = single(&format);
     // SAFETY: Attribute write.
     unsafe { oversized.SetString(&key(ATTR_CAMERA_ID), &HSTRING::from("x".repeat(10_000))) }.expect("set");
     assert!(source(&oversized).is_err());
 
-    let bad_format = configured(&format);
+    let bad_default = single(&format);
     // SAFETY: Attribute write with a blob one byte too long.
-    unsafe { bad_format.SetBlob(&key(ATTR_NATIVE_FORMAT), &[0_u8; 33]) }.expect("set");
-    assert!(source(&bad_format).is_err());
+    unsafe { bad_default.SetBlob(&key(ATTR_DEFAULT_FORMAT), &[0_u8; 33]) }.expect("set");
+    assert!(source(&bad_default).is_err());
 
-    let odd = configured(&format);
+    let odd = single(&format);
     let wire = VideoFormat::new(PixelFormat::Nv12, 63, 48, FrameRate::fps(30)).to_wire().expect("wire");
     // SAFETY: Attribute write.
-    unsafe { odd.SetBlob(&key(ATTR_NATIVE_FORMAT), &wire.to_bytes()) }.expect("set");
-    assert!(source(&odd).is_err(), "odd NV12 width is not a valid native mode");
+    unsafe { odd.SetBlob(&key(ATTR_DEFAULT_FORMAT), &wire.to_bytes()) }.expect("set");
+    assert!(source(&odd).is_err(), "odd NV12 width is not a valid mode");
+
+    // A default mode missing from the declared list, and an empty list.
+    let undeclared = configured(&format, &[PixelFormat::Yuy2]);
+    assert!(source(&undeclared).is_err(), "the default mode must be declared");
+    let empty = single(&format);
+    // SAFETY: Attribute write with a zero-length blob.
+    unsafe { empty.SetBlob(&key(ATTR_PIXEL_FORMATS), &[]) }.expect("set");
+    assert!(source(&empty).is_err(), "a camera must declare a mode");
 }
 
 #[test]
 fn source_follows_the_frame_server_contract() {
     init();
     let format = VideoFormat::new(PixelFormat::Yuy2, 64, 48, FrameRate::fps(30));
-    let activate = configured(&format);
+    let activate = single(&format);
     let source = source(&activate).expect("source");
     // Repeated activation returns the same source object.
     let again: IUnknown = unsafe { activate.ActivateObject() }.expect("again");
@@ -147,7 +188,7 @@ fn source_follows_the_frame_server_contract() {
         pd.GetStreamDescriptorByIndex(0, &mut selected, &mut sd).expect("sd");
         assert!(selected.as_bool());
         let handler = sd.expect("sd").GetMediaTypeHandler().expect("handler");
-        assert_eq!(handler.GetMediaTypeCount().expect("count"), 1, "exactly the native mode");
+        assert_eq!(handler.GetMediaTypeCount().expect("count"), 1, "exactly the declared mode");
         let mt = handler.GetCurrentMediaType().expect("current");
         assert_eq!(mt.GetGUID(&MF_MT_SUBTYPE).expect("subtype"), GUID::from_u128(PixelFormat::Yuy2.mf_subtype().expect("subtype")));
         assert_eq!(mt.GetUINT64(&MF_MT_FRAME_SIZE).expect("size"), 64 << 32 | 48);
@@ -161,13 +202,7 @@ fn source_follows_the_frame_server_contract() {
         source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
         let started = events(&generator);
         assert!(kinds(&started).contains(&MENewStream.0) && kinds(&started).contains(&MESourceStarted.0), "{:?}", kinds(&started));
-        let stream: IMFMediaStream2 = started
-            .iter()
-            .find(|(kind, _)| *kind as i32 == MENewStream.0)
-            .and_then(|(_, unk)| unk.clone())
-            .expect("stream")
-            .cast()
-            .expect("IMFMediaStream2");
+        let stream = announced_stream(&started);
         let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
         assert_eq!(kinds(&events(&stream_events)), vec![MEStreamStarted.0]);
         assert_eq!(stream.GetStreamState().expect("state"), MF_STREAM_STATE_RUNNING);
@@ -183,11 +218,7 @@ fn source_follows_the_frame_server_contract() {
         assert_eq!(echoed.as_raw(), token.as_raw());
         assert!(sample.GetSampleTime().expect("time") > 0);
         assert_eq!(sample.GetSampleDuration().expect("duration"), 333_333);
-        let buffer = sample.ConvertToContiguousBuffer().expect("buffer");
-        let (mut data, mut length) = (core::ptr::null_mut(), 0_u32);
-        buffer.Lock(&mut data, None, Some(&mut length)).expect("lock");
-        let bytes = core::slice::from_raw_parts(data, length as usize).to_vec();
-        buffer.Unlock().expect("unlock");
+        let bytes = bytes_of(&sample);
         assert_eq!(bytes.len(), 64 * 48 * 2);
         assert!(bytes.chunks_exact(2).all(|pair| pair == [16, 128]), "limited-range YUY2 black");
 
@@ -260,68 +291,22 @@ fn raw_pitch(sample: &IMFSample) -> i32 {
     }
 }
 
-/// Frame Server and the DirectShow bridge read a sample as a tight frame of
-/// `MF_MT_DEFAULT_STRIDE`; a 2D buffer whose rows are padded for alignment
-/// (NV12 1080 wide -> 1088) is sheared on that path. Every delivered buffer
-/// must therefore be tight, with or without a pipeline allocator.
-#[test]
-fn delivered_buffers_are_tight_for_unaligned_widths() {
-    use windows::Win32::Media::MediaFoundation::{IMFSampleAllocatorControl, IMFVideoSampleAllocator, MFCreateVideoSampleAllocatorEx};
-    init();
-    let format = VideoFormat::new(PixelFormat::Nv12, 1080, 8, FrameRate::fps(30));
-    for with_allocator in [false, true] {
-        let activate = configured(&format);
-        let source = source(&activate).expect("source");
-        // SAFETY: Valid source for the rest of the iteration.
-        unsafe {
-            if with_allocator {
-                let mut raw: *mut c_void = core::ptr::null_mut();
-                MFCreateVideoSampleAllocatorEx(&IMFVideoSampleAllocator::IID, &mut raw).expect("allocator");
-                let allocator = IMFVideoSampleAllocator::from_raw(raw);
-                source.cast::<IMFSampleAllocatorControl>().expect("allocator control").SetDefaultAllocator(0, &allocator).expect("set allocator");
-            }
-            let pd = source.CreatePresentationDescriptor().expect("pd");
-            let generator: IMFMediaEventGenerator = source.cast().expect("generator");
-            source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
-            let stream: IMFMediaStream2 = events(&generator)
-                .into_iter()
-                .find(|(kind, _)| *kind as i32 == MENewStream.0)
-                .and_then(|(_, unk)| unk)
-                .expect("stream")
-                .cast()
-                .expect("IMFMediaStream2");
-            let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
-            let _ = events(&stream_events);
-            for _ in 0..2 {
-                stream.RequestSample(None).expect("request");
-                let sample = next_sample(&stream_events);
-                let pitch = raw_pitch(&sample);
-                assert!(pitch == 0 || pitch == 1080, "allocator={with_allocator}: delivered pitch {pitch}, expected a tight 1080");
-                // The raw (not converted) memory holds limited-range black.
-                let buffer = sample.GetBufferByIndex(0).expect("buffer");
-                let (mut data, mut length) = (core::ptr::null_mut(), 0_u32);
-                buffer.Lock(&mut data, None, Some(&mut length)).expect("lock");
-                let bytes = core::slice::from_raw_parts(data, length as usize).to_vec();
-                buffer.Unlock().expect("unlock");
-                assert_eq!(bytes.len(), 1080 * 8 * 3 / 2);
-                assert!(bytes[..1080 * 8].iter().all(|&y| y == 16) && bytes[1080 * 8..].iter().all(|&c| c == 128), "allocator={with_allocator}: black frame");
-            }
-            source.Shutdown().expect("shutdown");
-        }
-    }
-}
+const FIVE: [PixelFormat; 5] = [PixelFormat::Nv12, PixelFormat::I420, PixelFormat::Yuy2, PixelFormat::Uyvy, PixelFormat::P010];
+/// The same five modes in the stream descriptor's bridge-safe order.
+const ORDERED: [PixelFormat; 5] = [PixelFormat::Yuy2, PixelFormat::Uyvy, PixelFormat::Nv12, PixelFormat::I420, PixelFormat::P010];
 
-/// An NV12 camera also offers YUY2, converted by the source itself, so the
-/// DirectShow bridge never converts; the selected type takes effect at start
-/// and can change across restarts.
+/// Every declared mode is listed with its own media type, in bridge-safe
+/// order (packed 4:2:2 first), the declared default is current, and a
+/// consumer can select each of them in turn.
 #[test]
-fn consumers_select_a_converted_mode() {
+fn source_lists_every_declared_mode() {
     use windows::Win32::Media::MediaFoundation::{IMFSampleAllocatorControl, IMFVideoSampleAllocator, MFCreateVideoSampleAllocatorEx};
     init();
-    let format = VideoFormat::new(PixelFormat::Nv12, 1080, 8, FrameRate::fps(30));
+    let (width, height) = (1080_u32, 8_u32);
+    let default = VideoFormat::new(PixelFormat::Nv12, width, height, FrameRate::fps(30));
     let subtype = |format: PixelFormat| GUID::from_u128(format.mf_subtype().expect("subtype"));
     for with_allocator in [false, true] {
-        let source = source(&configured(&format)).expect("source");
+        let source = source(&configured(&default, &FIVE)).expect("source");
         // SAFETY: Valid source for the rest of the iteration.
         unsafe {
             if with_allocator {
@@ -334,31 +319,31 @@ fn consumers_select_a_converted_mode() {
             let mut sd = None;
             pd.GetStreamDescriptorByIndex(0, &mut selected, &mut sd).expect("sd");
             let handler = sd.expect("sd").GetMediaTypeHandler().expect("handler");
-            let offered: Vec<GUID> = (0..handler.GetMediaTypeCount().expect("count"))
-                .map(|i| handler.GetMediaTypeByIndex(i).expect("type").GetGUID(&MF_MT_SUBTYPE).expect("subtype"))
+            let offers: Vec<GUID> = (0..handler.GetMediaTypeCount().expect("count"))
+                .map(|index| handler.GetMediaTypeByIndex(index).expect("type").GetGUID(&MF_MT_SUBTYPE).expect("subtype"))
                 .collect();
+            assert_eq!(offers, ORDERED.map(subtype), "packed 4:2:2 before planar 4:2:0 keeps the DirectShow bridge from converting");
             assert_eq!(
-                offered,
-                [subtype(PixelFormat::Yuy2), subtype(PixelFormat::Nv12)],
-                "conversions first (the DirectShow bridge takes the first type it can convert from), native last"
+                handler.GetCurrentMediaType().expect("current").GetGUID(&MF_MT_SUBTYPE).expect("subtype"),
+                subtype(PixelFormat::Nv12),
+                "the declared default is current"
             );
-            assert_eq!(handler.GetCurrentMediaType().expect("current").GetGUID(&MF_MT_SUBTYPE).expect("subtype"), subtype(PixelFormat::Nv12));
-            let yuy2 = handler.GetMediaTypeByIndex(0).expect("yuy2");
-            assert_eq!(yuy2.GetUINT64(&MF_MT_FRAME_SIZE).expect("size"), 1080 << 32 | 8);
-            assert_eq!(yuy2.GetUINT32(&windows::Win32::Media::MediaFoundation::MF_MT_DEFAULT_STRIDE).expect("stride"), 2160);
 
             let generator: IMFMediaEventGenerator = source.cast().expect("generator");
             let mut stream: Option<IMFMediaStream2> = None;
-            for (pick, pitch_bytes, bytes, black) in [(0, 2160, 1080 * 8 * 2, [16_u8, 128]), (1, 1080, 1080 * 8 * 3 / 2, [16, 16])] {
-                handler.SetCurrentMediaType(&handler.GetMediaTypeByIndex(pick).expect("type")).expect("select");
+            // Every declared mode, then back to a 4:2:2 one: selection may
+            // change across restarts without recreating the source.
+            for index in [0_usize, 1, 2, 3, 4, 0] {
+                let mode = ORDERED[index];
+                let format = VideoFormat { pixel_format: mode, ..default };
+                let validated = format.validate().expect("valid");
+                let media_type = handler.GetMediaTypeByIndex(index as u32).expect("type");
+                assert_eq!(media_type.GetUINT64(&MF_MT_FRAME_SIZE).expect("size"), u64::from(width) << 32 | u64::from(height));
+                handler.SetCurrentMediaType(&media_type).expect("select");
                 source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
                 let started = events(&generator);
                 if stream.is_none() {
-                    stream = started
-                        .iter()
-                        .find(|(kind, _)| *kind as i32 == MENewStream.0)
-                        .and_then(|(_, unk)| unk.clone())
-                        .map(|unk| unk.cast().expect("IMFMediaStream2"));
+                    stream = Some(announced_stream(&started));
                 }
                 let stream = stream.as_ref().expect("stream");
                 let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
@@ -366,14 +351,12 @@ fn consumers_select_a_converted_mode() {
                 stream.RequestSample(None).expect("request");
                 let sample = next_sample(&stream_events);
                 let pitch = raw_pitch(&sample);
-                assert!(pitch == 0 || pitch == pitch_bytes, "allocator={with_allocator} pick={pick}: pitch {pitch}");
-                let buffer = sample.GetBufferByIndex(0).expect("buffer");
-                let (mut data, mut length) = (core::ptr::null_mut(), 0_u32);
-                buffer.Lock(&mut data, None, Some(&mut length)).expect("lock");
-                let frame = core::slice::from_raw_parts(data, length as usize).to_vec();
-                buffer.Unlock().expect("unlock");
-                assert_eq!(frame.len(), bytes, "allocator={with_allocator} pick={pick}");
-                assert_eq!(&frame[..2], &black, "allocator={with_allocator} pick={pick}: black");
+                assert!(pitch == 0 || pitch == validated.layout().planes()[0].pitch as i32, "allocator={with_allocator} {mode:?}: pitch {pitch}");
+                let bytes = bytes_of(&sample);
+                assert_eq!(bytes.len(), validated.frame_size(), "allocator={with_allocator} {mode:?}");
+                let mut black = vec![0_u8; validated.frame_size()];
+                fill_black(&mut black, validated.layout(), mode, format.color.is_full_range(mode)).expect("black");
+                assert_eq!(bytes, black, "allocator={with_allocator} {mode:?}: black while no producer runs");
                 source.Stop().expect("stop");
                 let _ = events(&generator);
             }
@@ -382,25 +365,67 @@ fn consumers_select_a_converted_mode() {
     }
 }
 
+/// Frame Server and the DirectShow bridge read a sample as a tight frame of
+/// `MF_MT_DEFAULT_STRIDE`; a 2D buffer whose rows are padded for alignment
+/// (NV12 1080 wide -> 1088) is sheared on that path. Every delivered buffer
+/// must therefore be tight, with or without a pipeline allocator.
+#[test]
+fn delivered_buffers_are_tight_for_unaligned_widths() {
+    use windows::Win32::Media::MediaFoundation::{IMFSampleAllocatorControl, IMFVideoSampleAllocator, MFCreateVideoSampleAllocatorEx};
+    init();
+    for pixel_format in [PixelFormat::Nv12, PixelFormat::Yuy2, PixelFormat::I420] {
+        let format = VideoFormat::new(pixel_format, 1080, 8, FrameRate::fps(30));
+        let validated = format.validate().expect("valid");
+        let tight = validated.layout().planes()[0].pitch;
+        for with_allocator in [false, true] {
+            let source = source(&single(&format)).expect("source");
+            // SAFETY: Valid source for the rest of the iteration.
+            unsafe {
+                if with_allocator {
+                    let mut raw: *mut c_void = core::ptr::null_mut();
+                    MFCreateVideoSampleAllocatorEx(&IMFVideoSampleAllocator::IID, &mut raw).expect("allocator");
+                    source
+                        .cast::<IMFSampleAllocatorControl>()
+                        .expect("allocator control")
+                        .SetDefaultAllocator(0, &IMFVideoSampleAllocator::from_raw(raw))
+                        .expect("set allocator");
+                }
+                let pd = source.CreatePresentationDescriptor().expect("pd");
+                let generator: IMFMediaEventGenerator = source.cast().expect("generator");
+                source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
+                let stream = announced_stream(&events(&generator));
+                let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
+                let _ = events(&stream_events);
+                for _ in 0..2 {
+                    stream.RequestSample(None).expect("request");
+                    let sample = next_sample(&stream_events);
+                    let pitch = raw_pitch(&sample);
+                    assert!(pitch == 0 || pitch as usize == tight, "{pixel_format:?} allocator={with_allocator}: delivered pitch {pitch}, expected a tight {tight}");
+                    let bytes = bytes_of(&sample);
+                    assert_eq!(bytes.len(), validated.frame_size(), "{pixel_format:?} allocator={with_allocator}");
+                    let mut black = vec![0_u8; validated.frame_size()];
+                    fill_black(&mut black, validated.layout(), pixel_format, format.color.is_full_range(pixel_format)).expect("black");
+                    assert_eq!(bytes, black, "{pixel_format:?} allocator={with_allocator}: black frame");
+                }
+                source.Shutdown().expect("shutdown");
+            }
+        }
+    }
+}
+
 /// Consumers ask for the next sample as soon as one arrives; without pacing
 /// that spins at thousands of frames per second. Without a producer, black
-/// samples are delivered at the native frame interval, the first at once.
+/// samples are delivered at the frame interval, the first at once.
 #[test]
 fn requests_are_answered_at_the_frame_rate() {
     init();
-    let source = source(&configured(&VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(50)))).expect("source");
+    let source = source(&single(&VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(50)))).expect("source");
     // SAFETY: Valid source for the rest of the test.
     unsafe {
         let pd = source.CreatePresentationDescriptor().expect("pd");
         let generator: IMFMediaEventGenerator = source.cast().expect("generator");
         source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
-        let stream: IMFMediaStream2 = events(&generator)
-            .into_iter()
-            .find(|(kind, _)| *kind as i32 == MENewStream.0)
-            .and_then(|(_, unk)| unk)
-            .expect("stream")
-            .cast()
-            .expect("IMFMediaStream2");
+        let stream = announced_stream(&events(&generator));
         let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
         let _ = events(&stream_events);
         let started = std::time::Instant::now();
@@ -426,19 +451,13 @@ fn requests_are_answered_at_the_frame_rate() {
 #[test]
 fn restart_wakes_a_paused_pending_request() {
     init();
-    let source = source(&configured(&VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(2)))).expect("source");
+    let source = source(&single(&VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(2)))).expect("source");
     // SAFETY: Valid source, stream and event queues throughout the test.
     unsafe {
         let pd = source.CreatePresentationDescriptor().expect("pd");
         let generator: IMFMediaEventGenerator = source.cast().expect("generator");
         source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
-        let stream: IMFMediaStream2 = events(&generator)
-            .into_iter()
-            .find(|(kind, _)| *kind as i32 == MENewStream.0)
-            .and_then(|(_, unknown)| unknown)
-            .expect("stream")
-            .cast()
-            .expect("IMFMediaStream2");
+        let stream = announced_stream(&events(&generator));
         let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
         let _ = events(&stream_events);
         stream.RequestSample(None).expect("first request");
@@ -460,19 +479,13 @@ fn restart_wakes_a_paused_pending_request() {
 #[test]
 fn stream_stop_drops_old_request_tokens() {
     init();
-    let source = source(&configured(&VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(2)))).expect("source");
+    let source = source(&single(&VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(2)))).expect("source");
     // SAFETY: Valid source, stream and event queues throughout the test.
     unsafe {
         let pd = source.CreatePresentationDescriptor().expect("pd");
         let generator: IMFMediaEventGenerator = source.cast().expect("generator");
         source.Start(&pd, core::ptr::null(), &variant_i64(0)).expect("start");
-        let stream: IMFMediaStream2 = events(&generator)
-            .into_iter()
-            .find(|(kind, _)| *kind as i32 == MENewStream.0)
-            .and_then(|(_, unknown)| unknown)
-            .expect("stream")
-            .cast()
-            .expect("IMFMediaStream2");
+        let stream = announced_stream(&events(&generator));
         let stream_events: IMFMediaEventGenerator = stream.cast().expect("generator");
         let _ = events(&stream_events);
         stream.RequestSample(None).expect("first request");
@@ -488,5 +501,29 @@ fn stream_stop_drops_old_request_tokens() {
         let echoed: IUnknown = sample.GetUnknown(&MFSampleExtension_Token).expect("token");
         source.Shutdown().expect("shutdown");
         assert_eq!(echoed.as_raw(), new.as_raw(), "the stopped request must not be delivered after restart");
+    }
+}
+
+/// The default media type carries the tight first-plane pitch as its stride,
+/// which is what Frame Server and the DirectShow bridge read.
+#[test]
+fn declared_modes_publish_their_tight_stride() {
+    init();
+    let default = VideoFormat::new(PixelFormat::P010, 1080, 8, FrameRate::fps(30));
+    let source = source(&configured(&default, &FIVE)).expect("source");
+    // SAFETY: Valid source for the rest of the test.
+    unsafe {
+        let pd = source.CreatePresentationDescriptor().expect("pd");
+        let mut selected = windows_core::BOOL::default();
+        let mut sd = None;
+        pd.GetStreamDescriptorByIndex(0, &mut selected, &mut sd).expect("sd");
+        let handler = sd.expect("sd").GetMediaTypeHandler().expect("handler");
+        for index in 0..handler.GetMediaTypeCount().expect("count") {
+            let media_type = handler.GetMediaTypeByIndex(index).expect("type");
+            let subtype = PixelFormat::from_mf_subtype(media_type.GetGUID(&MF_MT_SUBTYPE).expect("subtype").to_u128()).expect("declared mode");
+            let layout = subtype.layout(1080, 8).expect("layout");
+            assert_eq!(media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE).expect("stride") as usize, layout.planes()[0].pitch, "{subtype:?}");
+        }
+        source.Shutdown().expect("shutdown");
     }
 }

@@ -2,8 +2,8 @@
 //!
 //! Sources copy each tightly packed ring frame straight into the consumer's
 //! buffer, honoring its pitch row by row. When both layouts are tight the
-//! copy collapses into one `memcpy`. Nothing is staged; pixel conversions live
-//! in [`crate::convert`].
+//! copy collapses into one `memcpy`. Nothing is staged and nothing is
+//! converted: formats must match exactly.
 
 use crate::format::{FrameLayout, PixelFormat};
 

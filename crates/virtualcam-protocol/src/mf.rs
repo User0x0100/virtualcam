@@ -1,9 +1,12 @@
 //! Media Foundation configuration attributes and producer rendezvous protocol.
 //!
 //! The MF source runs inside Frame Server (Local Service, session 0) and owns
-//! the camera's media capability. The manager passes configuration to the
-//! fixed-CLSID source through vendor attributes on `IMFVirtualCamera`; all of
-//! them are untrusted configuration, never authorization.
+//! the camera's media capability: the *declared format set* fixed at
+//! registration — a default format plus every pixel format consumers may
+//! select, all sharing its size, frame rate and colorimetry. The manager
+//! passes that set to the fixed-CLSID source through vendor attributes on
+//! `IMFVirtualCamera`; all of them are untrusted configuration, never
+//! authorization.
 //!
 //! Producer attach:
 //!
@@ -23,12 +26,11 @@
 //!                                            mode differs from the producer's
 //! ```
 //!
-//! The producer may write the native mode or any mode the source offers as
-//! a conversion of it (`crate::convert::is_offered`); the source converts
-//! when the selected mode differs and it can. A [`Request`] asks the
-//! producer to reopen in the selected mode so it can produce that layout
-//! itself (for example on the GPU) and the source only copies. Producers
-//! that never read the pipe simply keep the native mode.
+//! The producer must write one of the declared formats exactly; the source
+//! copies it when it equals the mode consumers selected and delivers black
+//! otherwise — there is no conversion. A [`Request`] asks the producer to
+//! reopen in the selected mode so frames flow again. Producers that never
+//! read the pipe simply keep showing black while another mode is selected.
 
 use crate::format::{FormatError, VideoFormat, WireVideoFormat};
 use crate::id::CameraId;
@@ -45,11 +47,17 @@ pub const ATTR_RENDEZVOUS_ID: CameraId = CameraId::from_u128(0x76D66E69_4E68_456
 pub const ATTR_EXPECTED_OWNER_SID: CameraId = CameraId::from_u128(0x56CCA6A6_EAAA_4B9E_BE29_CBE2745B10D2);
 /// UINT32: [`PROTOCOL_VERSION`].
 pub const ATTR_PROTOCOL_VERSION: CameraId = CameraId::from_u128(0x0EB9BE63_C946_43DE_A8D8_6A541245BA50);
-/// Blob: the immutable native mode as a 32-byte [`WireVideoFormat`].
-pub const ATTR_NATIVE_FORMAT: CameraId = CameraId::from_u128(0xD51FA021_9DC8_4234_8D4B_F94FF8DEA092);
+/// Blob: the default format as a 32-byte [`WireVideoFormat`]. It carries the
+/// size, frame rate and colorimetry shared by every declared format and is
+/// the mode consumers get when they select none.
+pub const ATTR_DEFAULT_FORMAT: CameraId = CameraId::from_u128(0xD51FA021_9DC8_4234_8D4B_F94FF8DEA092);
+/// Blob: every declared pixel format as little-endian u32 wire codes, in
+/// declaration order (`crate::registry::decode_pixel_formats`). The default
+/// format's own pixel format is always one of them.
+pub const ATTR_PIXEL_FORMATS: CameraId = CameraId::from_u128(0x4C1E7C3A_9D26_4B7F_8E51_2A6D9F0B7C34);
 
 /// Version of the persisted attribute set; independent of the rendezvous wire version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Rendezvous wire version. Version 2 requires the source-created frame event.
 pub const RENDEZVOUS_VERSION: u32 = 2;
 /// Upper bound of string attributes the source accepts (UTF-16 units).
@@ -95,8 +103,7 @@ pub const WELCOME_MAGIC: u32 = u32::from_le_bytes(*b"VCMW");
 pub struct Hello {
     /// Camera the producer intends to feed.
     pub camera_id: CameraId,
-    /// Format the producer will write: the native mode or one of the
-    /// conversions the source offers.
+    /// Format the producer will write: one of the declared formats.
     pub format: VideoFormat,
 }
 
@@ -140,7 +147,7 @@ pub enum WelcomeStatus {
     Version = 1,
     /// The Hello named a different camera.
     CameraMismatch = 2,
-    /// The producer's format is not one the source offers.
+    /// The producer's format is not one the source declares.
     FormatMismatch = 3,
     /// Producer identity does not match the camera owner.
     Unauthorized = 4,

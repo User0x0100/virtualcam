@@ -1,7 +1,9 @@
 //! Real Frame Server benchmark. Run elevated to read the service's process CPU time.
-//! `mf_delivery_bench <nv12|convert|yuy2|idle> [seconds=15] [width=1080] [height=1920] [fps=30]`
+//! `mf_delivery_bench <nv12|yuy2|idle> [seconds=15] [width=1080] [height=1920] [fps=30]`
 //! Latency is the producer's pre-write pixel timestamp to readable client sample,
 //! including host copy, Frame Server and Source Reader; warm-up is excluded.
+//! The producer writes exactly the mode the client selects — the source never
+//! converts.
 
 #[cfg(windows)]
 mod windows_bench {
@@ -104,17 +106,14 @@ mod windows_bench {
     }
 
     #[test]
-    fn pixel_timestamp_survives_nv12_to_yuy2_conversion() {
-        let native = PixelFormat::Nv12.layout(640, 16).expect("layout");
-        let output = PixelFormat::Yuy2.layout(640, 16).expect("layout");
-        for value in [0, 0xA5A5_1234, u32::MAX] {
-            let mut frame = vec![128; native.size()];
-            stamp(&mut frame, 640, 1, value);
-            assert_eq!(decode_stamp(&frame, 640, 1), Some(value));
-            let mut converted = vec![0; output.size()];
-            // SAFETY: Tight frame sized to the native layout.
-            unsafe { virtualcam_protocol::convert::convert_frame(frame.as_ptr(), PixelFormat::Nv12, &native, &mut converted, PixelFormat::Yuy2, &output) }.expect("convert");
-            assert_eq!(decode_stamp(&converted, 640, 2), Some(value));
+    fn pixel_timestamp_round_trips_in_every_produced_layout() {
+        for (format, step) in [(PixelFormat::Nv12, 1_usize), (PixelFormat::Yuy2, 2)] {
+            let layout = format.layout(640, 16).expect("layout");
+            for value in [0, 0xA5A5_1234, u32::MAX] {
+                let mut frame = vec![128; layout.size()];
+                stamp(&mut frame, 640, step, value);
+                assert_eq!(decode_stamp(&frame, 640, step), Some(value), "{format:?}");
+            }
         }
         assert_eq!(decode_stamp(&[], 640, 1), None);
     }
@@ -173,8 +172,8 @@ mod windows_bench {
     pub fn run() -> Result<()> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mode = args.first().map_or("nv12", String::as_str);
-        if !["nv12", "convert", "yuy2", "idle"].contains(&mode) {
-            return Err("mode must be nv12, convert, yuy2 or idle".into());
+        if !["nv12", "yuy2", "idle"].contains(&mode) {
+            return Err("mode must be nv12, yuy2 or idle".into());
         }
         let number = |index: usize, default: u32| -> Result<u32> { Ok(args.get(index).map(|value| value.parse()).transpose()?.unwrap_or(default)) };
         let (seconds, width, height, fps) = (number(1, 15)?, number(2, 1080)?, number(3, 1920)?, number(4, 30)?);
@@ -189,14 +188,12 @@ mod windows_bench {
         let _mf = Mf;
         let native = VideoFormat::new(PixelFormat::Nv12, width, height, FrameRate::fps(fps));
         native.validate().map_err(virtualcam::Error::from)?;
-        let selected = if mode == "convert" || mode == "yuy2" { PixelFormat::Yuy2 } else { PixelFormat::Nv12 };
-        let producing = VideoFormat {
-            pixel_format: if mode == "yuy2" { PixelFormat::Yuy2 } else { PixelFormat::Nv12 },
-            ..native
-        };
+        // The producer writes exactly the mode the client selects.
+        let selected = if mode == "yuy2" { PixelFormat::Yuy2 } else { PixelFormat::Nv12 };
+        let producing = VideoFormat { pixel_format: selected, ..native };
         let manager = ManagedCameraManager::for_app(AppId::new("dev.virtualcam.mf-bench")?);
         let name = format!("VCRs MF Bench {}", std::process::id());
-        let info = manager.register(MediaFoundationRegistration::new(&name, native))?;
+        let info = manager.register(MediaFoundationRegistration::new(&name, native, [PixelFormat::Yuy2, PixelFormat::Nv12]))?;
         let _camera = Camera(manager.clone(), info.id);
         let base = Instant::now();
         let mut producer = Producer {

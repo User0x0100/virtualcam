@@ -14,7 +14,10 @@ pub(crate) struct CameraRecord {
     pub(crate) backend: ManagedBackend,
     pub(crate) name: String,
     pub(crate) app_id: Option<AppId>,
+    /// DirectShow idle default format, or the Media Foundation default format.
     pub(crate) format: Option<VideoFormat>,
+    /// Offered pixel formats in declaration order: DirectShow's advertised
+    /// set, or the Media Foundation declared format set.
     pub(crate) pixel_formats: Vec<PixelFormat>,
     pub(crate) frame_rates: Vec<FrameRate>,
     pub(crate) source_path: Option<String>,

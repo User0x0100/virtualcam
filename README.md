@@ -5,13 +5,13 @@
 | Backend | Input formats | Layout |
 | --- | --- | --- |
 | Managed DirectShow camera | NV12, I420, YUY2, UYVY, P010, BGRA32, RGB24 | tightly packed (see `PixelFormat::layout`) |
-| Managed Media Foundation camera | same set; one immutable native mode per camera (NV12/I420 cameras also offer YUY2, converted by the source) | tightly packed |
+| Managed Media Foundation camera | a declared set of NV12, I420, YUY2, UYVY and P010 with one default format (RGB is DirectShow-only) | tightly packed |
 | OBS Virtual Camera | NV12 | tightly packed Y plane, then interleaved UV |
 | Unity Capture | RGBA8, RGBA FP16 gamma, or RGBA FP16 linear | tight or explicitly padded rows |
 
 中文使用说明书 / Chinese user guide: [docs/USER_GUIDE.zh-CN.md](docs/USER_GUIDE.zh-CN.md).
 
-Producers never scale or convert pixels. Sources copy each tightly packed frame straight into the consumer's buffer, honoring its pitch row by row (one `memcpy` when the layouts match); colorimetry is signaled as metadata only. The one exception: a Media Foundation camera whose native mode is NV12 or I420 also offers YUY2 and converts it in the source, because Frame Server's own DirectShow-bridge conversion shears frames whose width is not a multiple of 32 pixels.
+No layer of this crate converts pixels — not the producers, not the sources. The consumer picks the format, the producer writes exactly that format, and the source copies each tightly packed frame straight into the consumer's buffer, honoring its pitch row by row (one `memcpy` when the layouts match); colorimetry is signaled as metadata only. A managed consumer that negotiated a mode the producer is not writing yet sees black until the producer reopens in it (see `VirtualCamera::requested_format`).
 
 ## Managed cameras
 
@@ -22,7 +22,7 @@ The workspace builds two COM source DLLs and the library that manages them:
 | Seen by | DirectShow apps: FFmpeg `dshow`, OpenCV `CAP_DSHOW`, OBS, traditional conferencing apps | Frame Server apps: Windows Camera, browsers, Teams, WinRT `MediaCapture`, `IMFSourceReader` |
 | Install | none; each registration points at the DLL | once per machine, elevated: `install_media_foundation_source` |
 | Registration | `CurrentUser` (no elevation) or `AllUsers` (elevated) | per-user (`CurrentUser` access, `System` lifetime), no elevation |
-| Format | chosen by the producer for each session | one immutable native mode fixed at registration, plus YUY2 for NV12/I420 (the producer may follow the selected mode via `requested_format()`, else the source converts) |
+| Format | chosen by the producer for each session | one immutable declared set fixed at registration: a default format plus every YUV pixel format consumers may select, all sharing its size, rate and colorimetry (the producer follows the selection via `requested_format()`, otherwise consumers see black) |
 | Transport | producer-owned, session-local | source-owned, authenticated, cross-session |
 
 ```powershell
@@ -61,7 +61,7 @@ manager.unregister(info.id)?;
 # }
 ```
 
-Media Foundation cameras fix their format at registration because Frame Server enumerates media types before any producer exists:
+Media Foundation cameras declare their format set at registration because Frame Server enumerates media types before any producer exists. The default format fixes the size, frame rate and colorimetry shared by every declared format. It is initially selected by this source, **not guaranteed to be the format Windows Frame Server or a consumer ultimately chooses**: the Frame Server path may prefer the first advertised media type (packed YUY2/UYVY are intentionally listed before NV12/I420/P010 for DirectShow-bridge correctness). Producers must honor `requested_format()` even immediately after startup:
 
 ```rust,no_run
 use virtualcam::{FrameRate, ManagedCameraManager, MediaFoundationRegistration, PixelFormat, VideoFormat, WriteStatus};
@@ -70,9 +70,15 @@ use virtualcam::{FrameRate, ManagedCameraManager, MediaFoundationRegistration, P
 // Once per machine, elevated, from a folder Local Service can read:
 // ManagedCameraManager::install_media_foundation_source(r"C:\Program Files\Studio\virtualcam_mf.dll")?;
 let manager = ManagedCameraManager::new();
-let native = VideoFormat::new(PixelFormat::Nv12, 1920, 1080, FrameRate::fps(30));
-let info = manager.register(MediaFoundationRegistration::new("Studio MF Cam", native))?;
-let mut camera = manager.open_registered(info.id)?; // `open` also accepts offered YUY2
+let default = VideoFormat::new(PixelFormat::Nv12, 1920, 1080, FrameRate::fps(30));
+let info = manager.register(MediaFoundationRegistration::new(
+    "Studio MF Cam",
+    default,
+    [PixelFormat::Nv12, PixelFormat::I420, PixelFormat::Yuy2, PixelFormat::Uyvy, PixelFormat::P010],
+))?;
+
+// Any declared format, not just the default one.
+let mut camera = manager.open(info.id, VideoFormat { pixel_format: PixelFormat::Yuy2, ..default })?;
 let frame = vec![0_u8; camera.frame_size()];
 // ConsumerInactive until an application starts the camera; then Written.
 let _status: WriteStatus = camera.write_host(&frame)?;
@@ -91,6 +97,8 @@ let _status: WriteStatus = camera.write_host(&frame)?;
 | `Bgra32` | `B G R A`, top-down | `RGB32` (bottom-up DIB, flipped by the source) | `RGB32` |
 | `Rgb24` | `B G R`, top-down, no row padding | `RGB24` (DWORD-aligned DIB rows) | `RGB24` |
 
+A DirectShow camera accepts the whole list. A Media Foundation camera may declare only the YUV rows (`Nv12`, `I420`, `Yuy2`, `Uyvy`, `P010`): it fixes one colorimetry for every mode and never converts, so it does not advertise RGB.
+
 `ColorSpace` (matrix, range, primaries, transfer) defaults per format and height (`BT601` SD, `BT709` HD, `BT2020` for P010, `SRGB` for RGB) and has presets including `BT709_FULL`, `BT2100_PQ`, and `BT2100_HLG`. It is published as `VIDEOINFOHEADER2` DXVA extended-format bits (DirectShow) and `MF_MT_*` attributes (Media Foundation), and selects the black level (limited Y=16 / full Y=0) of idle frames. Dimensions up to 16384, rates from one frame per minute to 1000 fps.
 
 ### Runtime behavior
@@ -102,6 +110,7 @@ let _status: WriteStatus = camera.write_host(&frame)?;
 - **One producer per camera** (`Error::DeviceInUse` otherwise). A crashed producer is detected (process handle + creation time / pipe closure) and consumers fall back to black.
 - **Transport v2**: every session writes a fresh ring whose slots are guarded by a sequence lock, so consumers never accept a torn frame and the writer never waits. DirectShow delivery is paced by a high-resolution timer without catch-up bursts.
 - **Media Foundation producers** attach lazily: `write_host` returns `ConsumerInactive` (and `is_ready` is `false`) until a client starts the camera. The source authenticates the producer's Windows token against the camera owner on a DACL-protected pipe and hands it a ring created with an owner-only DACL; another user cannot inject frames.
+- **Media Foundation format sets**: the source lists every declared mode, the consumer selects one, and the source asks the producer for it through the pipe. Frames written in another mode are delivered as black — never reinterpreted or converted — until the producer reopens in the requested mode; switching needs no re-registration and no source restart, and the pending selection survives a producer reconnect. Packed 4:2:2 modes are listed before planar 4:2:0 ones, so Frame Server's DirectShow bridge passes every declared type through instead of converting with its own padded-row filter (which sheared 1080-wide YUY2 frames).
 - **Managed delivery** shares one timing policy: new frames are identified by generation and sequence, rate-limited by a virtual schedule (GCRA): a new frame seen no earlier than a quarter interval before its grid slot goes out at once and an earlier one is skipped rather than delayed, so jitter adds no latency and the grid locks onto the producer's phase, while the long-term rate never exceeds the negotiated one and the cadence does not drift; without producer frames, black follows the grid at the negotiated rate; a stalled producer's last frame repeats once per second. Both producers commit then signal an auto-reset frame event. Media Foundation waits for this event, state changes or the delivery deadline, with no ring polling; incompatible frames replaced with black are paced too. Stream pause preserves pending requests for the next Start; stream stop cancels them. `requested_format()` returns a selected mode only when it differs from the mode being written.
 - MF delivery deadlines use a high-resolution waitable timer to maintain the negotiated cadence, including when the producer is idle.
 - Every exported function and COM method is panic-guarded; `DllMain` does nothing.
@@ -111,6 +120,7 @@ let _status: WriteStatus = camera.write_host(&frame)?;
 - x64 only. There is no x86 DirectShow DLL yet (32-bit DirectShow apps do not see managed cameras) and no ARM64 build.
 - FFmpeg's `dshow` demuxer does not implement P010; other DirectShow consumers may.
 - `uninstall_media_foundation_source` cannot enumerate other Windows users' cameras; it refuses unless told they were cleaned.
+- Upgrading from a build whose Media Foundation cameras had one native mode requires reinstalling the machine-wide `virtualcam_mf.dll` (elevated) and registering those cameras again: the vendor attribute set is versioned (`PROTOCOL_VERSION`), and a camera registered under the old one reports `RegistrationHealth::Degraded` until it is re-registered.
 - The Frame Server path is covered by an opt-in test that needs the source installed (elevated); it is verified for a single user, not yet across multiple Windows users. Frame Server shows the camera under its name plus a localized " (Windows Virtual Camera)" suffix.
 
 ## Independent backend controls
@@ -375,10 +385,10 @@ Managed cameras have two more opt-in suites. The DirectShow suite registers per-
 cargo test --release --test windows_dshow -- --ignored --test-threads=1
 ```
 
-The Media Foundation contract (activation, attributes, events, `RequestSample`, shutdown) and an in-process end-to-end run through `IMFSourceReader` with the real producer and authenticated rendezvous are part of the default suite. The Frame Server test needs the source installed (see `tests/windows_mf.rs`):
+The Media Foundation contract (activation, attributes, events, `RequestSample`, shutdown), the declared-format enumeration, and in-process end-to-end runs through `IMFSourceReader` with a real producer following mode switches over the authenticated rendezvous are part of the default suite. The Frame Server tests need the source installed (see `tests/windows_mf.rs`):
 
 ```powershell
 cargo test --test windows_mf -- --ignored
 ```
 
-`cargo run --example managed_camera -- register|list|stream|unregister|install-mf|uninstall-mf ...` exercises the manager from the command line.
+`cargo run --example managed_camera -- register|list|stream|unregister|install-mf|uninstall-mf ...` exercises the manager from the command line; `stream` follows every mode a consumer selects, and `register --backend mf --formats nv12,i420,yuy2,uyvy,p010` declares a full format set.

@@ -9,7 +9,7 @@
 | 位置 | 职责 |
 | --- | --- |
 | `src/` | 公开 API、注册管理、OBS/Unity producer、Managed producer、CUDA D2H |
-| `crates/virtualcam-protocol/` | 自有帧格式、ring、同步、DShow/MF IPC 结构与转换 |
+| `crates/virtualcam-protocol/` | 自有帧格式、ring、同步、DShow/MF IPC 结构 |
 | `crates/virtualcam-dshow/` | Rust DirectShow COM source filter（`virtualcam_dshow.dll`） |
 | `crates/virtualcam-mf/` | Rust Media Foundation / Frame Server source（`virtualcam_mf.dll`） |
 | `examples/managed_camera.rs` | 注册、列出、推流、注销及 MF source 安装 |
@@ -22,7 +22,7 @@
 - OBS Virtual Camera：第三方 NV12 三槽共享队列；库只提供 producer，不安装摄像头。
 - Unity Capture：第三方 SharedImageMemory，RGBA8/FP16；库只提供 producer。
 - Managed DirectShow：每次 producer session 决定 video format；注册可为 CurrentUser 或 AllUsers。
-- Managed Media Foundation：每台摄像头一个注册时确定的 immutable native mode；CurrentUser access、System lifetime，Frame Server 可跨 session 加载 source。
+- Managed Media Foundation：每台摄像头一个注册时确定的 immutable 格式集合（一个默认格式 + 若干可选像素格式，共用默认格式的尺寸/帧率/色彩空间），且只允许 NV12/I420/YUY2/UYVY/P010 五种 YUV 格式（RGB 仅 DirectShow）；CurrentUser access、System lifetime，Frame Server 可跨 session 加载 source。
 
 OBS/Unity 协议兼容是现有功能要求；不得因简化仓库而修改其对象名、结构布局、状态值、发布顺序或握手。外部协议参见 `UPSTREAM.md`。
 
@@ -32,7 +32,7 @@ OBS/Unity 协议兼容是现有功能要求；不得因简化仓库而修改其�
 
 - Managed `PixelFormat`：NV12、I420、YUY2、UYVY、P010、BGRA32、RGB24；`VideoFormat` 携带尺寸、分数帧率和 `ColorSpace`。生产端必须写紧密排列的对应格式，不能隐式缩放、重采样或转换。
 - DShow source 复制帧，并在需要时按 DIB 行序/行对齐处理 RGB；`VIDEOINFOHEADER2` 宣告色彩信息。consumer 连接后维持协商格式，实际 producer 格式不符时输出黑帧。
-- MF source 可额外宣告 NV12/I420 → YUY2（同尺寸、帧率、色彩空间），必要时在 source 内执行转换；其他格式无法转换时输出黑帧。转换格式在媒体类型列表中位于 native 之前，以避免 Frame Server 的 DirectShow bridge 自行转换导致非 32 像素倍数宽度的行错位。若 consumer 选中其他 offered mode，可经 `requested_format()` 通知 producer 自己生成该格式。
+- MF source 只宣告注册时声明的格式集合，并为每个格式各建一个 media type；不做任何派生或转换。生产会话格式由 `media_foundation_session_format` 判定：像素格式必须在集合内、尺寸/帧率与默认格式一致、`ColorSpace` 必须与注册值完全相同，否则 `Error::FormatMismatch`；不允许静默替换请求的色彩参数。消费端选定的 mode 经 `requested_format()` 通知 producer 自己生成该格式；producer 尚未切换时输出黑帧。媒体类型列表按 4:2:2（YUY2/UYVY）在前、4:2:0（NV12/I420/P010）在后的稳定顺序列出（组内保持声明顺序），避免 Frame Server 的 DirectShow bridge 自行做 4:2:0 → 4:2:2 转换导致非 32 像素倍数宽度的行错位。
 - 色彩属性是 metadata，不做自动色彩校正。必须按实际 `ColorSpace` 处理黑电平与格式布局。
 - Frame Server 的 DirectShow bridge 读取紧密样本内存；MF 输出使用紧密线性 buffer，不假定消费者理解 2D allocator 的 padded pitch。`SamplePool` 重用 tracked samples。拷贝到外部 buffer 时遵守实际 pitch、负 stride、长度和 unlock 约定。
 
@@ -57,12 +57,12 @@ VCR2 ring：4 KiB header page、4 KiB 对齐的 slots、64-byte slot header；�
 ## Managed Media Foundation
 
 - source 使用固定 `SOURCE_CLSID`；`IMFActivate`（FTM/`IAgileObject`）、`IMFMediaSourceEx`、`IMFMediaStream2`、`IMFGetService`、`IKsControl` 以及适用的 allocator control。`ThreadingModel=Both` 不是 agility 的替代品。同一 activation 对象缓存其 source instance。
-- 系统摄像头通过 `MFCreateVirtualCamera` 注册为 CurrentUser access、System lifetime。native mode 注册后不可修改，改动需 recreate；rename 也是 recreate transaction，symbolic link 可变化。永久注销必须调用 `Remove`，`Shutdown` 只释放对象资源。
+- 系统摄像头通过 `MFCreateVirtualCamera` 注册为 CurrentUser access、System lifetime。格式集合（默认格式 + 可选像素格式）注册后不可修改，改动需 recreate；rename 也是 recreate transaction，symbolic link 可变化。消费端在集合内部切换格式不需要 recreate。永久注销必须调用 `Remove`，`Shutdown` 只释放对象资源。
 - per-user manager metadata 在 HKCU `Software\VirtualCamRs\Cameras\{ID}`，MF source 运行于 Local Service / Session 0，不能读取自己的 HKCU 当作 owner 数据。runtime 参数来自 MF vendor attributes，并须校验大小、版本与格式；缺失时 fail closed，禁止从未验证的 symbolic link 猜 owner。
 - source 经 `\\.\pipe\VirtualCamRs-MF-{RID}` rendezvous：显式 DACL、first-pipe-instance、overlapped message mode、拒绝远端客户端；有界的握手读取后才 impersonate，并从 token SID 验证 owner，所有路径恢复身份。`EXPECTED_OWNER_SID` 只供校验，不能直接视为授权凭据。source 再创建随机命名、权限受控的 Global/同 session Local ring 与 frame event；发现已有任何类型同名内核对象都必须拒绝或换新 nonce。不得暴露跨用户帧注入。
 - worker 可取消、有握手时限；`Shutdown` 取消未完成 I/O、在状态锁外等待 worker，不能在 `DllMain` 停启。producer lazy attach，未有活跃消费端时 `write_host` 返回 `ConsumerInactive`；pipe 关闭后重新等待，source 则回黑帧。
 - `RequestSample` 在 RUNNING 下受帧事件和交付期限驱动；STOPPED / PAUSED 不立即输出。PAUSED 保留待处理请求，恢复时唤醒；STOPPED 清空旧请求，防止重启后交付旧 token。正常停止、生产者缺席、短暂通信故障不发送 EOS；源与流都维护正确 MF events/attributes。
-- sample time 使用 `MFGetSystemTime`；duration = native interval。若消费者提供 allocator，按 Initialize/Allocate/Uninitialize 合同处理，异常时可用标准 MF buffer fallback。Source/Stream 有 shutdown 时拆掉的引用环；禁止锁内 blocking `GetEvent`，避免反向锁顺序。
+- sample time 使用 `MFGetSystemTime`；duration = 默认格式的帧间隔（集合内所有格式共用）。若消费者提供 allocator，按 Initialize/Allocate/Uninitialize 合同处理，异常时可用标准 MF buffer fallback。Source/Stream 有 shutdown 时拆掉的引用环；禁止锁内 blocking `GetEvent`，避免反向锁顺序。
 - 卸载 machine-wide source 前必须移除当前用户的 MF cameras 并确认其他用户的注册也已清理；无法证明时 fail safe。不能假设可跨用户枚举所有注册。
 
 ## COM / FFI / 运行时性能

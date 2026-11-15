@@ -6,10 +6,12 @@
 //! per second) and burn its CPU. A request is therefore answered only when it
 //! is due:
 //!
-//! - a producer frame newer than the last delivered one is available,
-//!   subject to the shared GCRA rate limit (see `virtualcam_protocol::delivery`);
-//! - no producer frame exists (no producer, or none written yet): black at the
-//!   native frame interval;
+//! - a producer frame newer than the last delivered one is available in the
+//!   selected mode, subject to the shared GCRA rate limit (see
+//!   `virtualcam_protocol::delivery`);
+//! - no usable producer frame exists (no producer, none written yet, or one
+//!   written in a different mode than consumers selected): black at the
+//!   selected mode's frame interval;
 //! - a producer is attached but stalled: the newest frame again after
 //!   one second, so consumers do not time out.
 //!
@@ -19,9 +21,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use virtualcam_protocol::convert::{can_convert, convert_frame};
 use virtualcam_protocol::delivery::Delivery;
-use virtualcam_protocol::planes::{CopyError, copy_frame, fill_black};
+use virtualcam_protocol::planes::{copy_frame, fill_black};
 use virtualcam_protocol::ring::ReadOutcome;
 use virtualcam_protocol::{FrameLayout, ValidatedFormat};
 use windows::Win32::Foundation::{E_POINTER, E_UNEXPECTED, S_OK, WAIT_FAILED};
@@ -69,12 +70,10 @@ pub(crate) struct MediaStream {
     pub(crate) queue: IMFMediaEventQueue,
     pub(crate) descriptor: IMFStreamDescriptor,
     pub(crate) attributes: IMFAttributes,
-    /// The registered mode the producer writes into the ring.
-    native: ValidatedFormat,
-    /// Offered output modes with their media types: the native mode at index
-    /// 0, then the conversions the source performs itself (the stream
-    /// descriptor lists them in a different order, see `MediaSource::create`).
+    /// Every mode the camera declared, in stream-descriptor order.
     offers: Vec<(ValidatedFormat, IMFMediaType)>,
+    /// Frame interval shared by every offered mode.
+    interval_100ns: u64,
     transport: Arc<TransportSlot>,
     /// Reused linear samples when no pipeline allocator is usable.
     samples: SamplePool,
@@ -95,14 +94,16 @@ pub(crate) fn variant_i64(value: i64) -> PROPVARIANT {
 }
 
 impl MediaStream {
-    /// `offers` must be non-empty, the native mode first.
-    pub(crate) fn new(queue: IMFMediaEventQueue, descriptor: IMFStreamDescriptor, attributes: IMFAttributes, offers: Vec<(ValidatedFormat, IMFMediaType)>, transport: Arc<TransportSlot>) -> Self {
+    /// `offers` must be non-empty; `default` indexes the mode consumers get
+    /// when they select none.
+    pub(crate) fn new(queue: IMFMediaEventQueue, descriptor: IMFStreamDescriptor, attributes: IMFAttributes, offers: Vec<(ValidatedFormat, IMFMediaType)>, default: usize, transport: Arc<TransportSlot>) -> Self {
+        let interval_100ns = offers[default].0.interval_100ns();
         Self {
             queue,
             descriptor,
             attributes,
-            native: offers[0].0,
             offers,
+            interval_100ns,
             transport,
             samples: SamplePool::new(),
             inner: Mutex::new(StreamInner {
@@ -111,7 +112,7 @@ impl MediaStream {
                 source: None,
                 allocator: None,
                 allocator_ready: false,
-                output: 0,
+                output: default,
                 pending: VecDeque::new(),
                 delivery: Delivery::default(),
                 worker: false,
@@ -289,11 +290,12 @@ impl MediaStream {
         Ok(usize::try_from(pitch).is_ok_and(|pitch| pitch == output.layout().planes()[0].pitch))
     }
 
-    /// Copies (or converts) the newest producer frame, or black, into
-    /// `buffer` as `output`, honoring its pitch, which may differ from the
-    /// tight layout and may be negative for bottom-up RGB.
+    /// Copies the newest producer frame when it is in exactly the selected
+    /// mode, or writes black, into `buffer` as `output`, honoring its pitch,
+    /// which may differ from the tight layout and may be negative for
+    /// bottom-up RGB.
     /// Returns the `(ring generation, sequence)` of the processed producer
-    /// frame, even when an incompatible mode is delivered as black.
+    /// frame, even when a frame in another mode is delivered as black.
     fn fill(&self, buffer: &IMFMediaBuffer, output: &ValidatedFormat) -> windows_core::Result<Option<(u64, u64)>> {
         if let Ok(buffer2) = buffer.cast::<IMF2DBuffer2>() {
             let (mut scanline0, mut pitch, mut start, mut length) = (core::ptr::null_mut(), 0_i32, core::ptr::null_mut(), 0_u32);
@@ -359,19 +361,11 @@ impl MediaStream {
         let destination = unsafe { core::slice::from_raw_parts_mut(lowest, layout.size()) };
         let mut copied = true;
         let outcome = self.transport.read_latest(|src, producing| {
-            let producing_pixel = producing.format().pixel_format;
-            copied = if producing_pixel == format.pixel_format {
+            // Only a frame in the selected mode is delivered; one in another
+            // declared mode is never reinterpreted, resampled or converted.
+            copied = producing.format() == format
                 // SAFETY: `src` spans the ring's validated tight frame.
-                unsafe { copy_frame(src, producing.layout(), destination, &layout, flip) }
-            } else if flip || !can_convert(producing_pixel, format.pixel_format) {
-                // Not convertible (or bottom-up): black until the producer
-                // follows the request for the selected mode.
-                Err(CopyError)
-            } else {
-                // SAFETY: `src` spans the ring's validated tight frame.
-                unsafe { convert_frame(src, producing_pixel, producing.layout(), destination, format.pixel_format, &layout) }
-            }
-            .is_ok();
+                && unsafe { copy_frame(src, producing.layout(), destination, &layout, flip) }.is_ok();
         });
         let frame = match outcome {
             Some((generation, ReadOutcome::Frame { sequence, .. })) => Some((generation, sequence)),
@@ -385,7 +379,7 @@ impl MediaStream {
 
     /// When the oldest pending request may be answered (see the module docs).
     fn due(&self, inner: &mut StreamInner, now: u64) -> u64 {
-        inner.delivery.due(now, self.transport.latest_frame(), self.native.interval_100ns())
+        inner.delivery.due(now, self.transport.latest_frame(), self.interval_100ns)
     }
 
     /// Answers the oldest pending request with a filled sample.
@@ -396,11 +390,11 @@ impl MediaStream {
         // SAFETY: Valid sample with at least one buffer.
         let buffer = unsafe { sample.GetBufferByIndex(0) }?;
         let frame = self.fill(&buffer, &output)?;
-        inner.delivery.delivered(now_100ns(), frame, self.native.interval_100ns());
+        inner.delivery.delivered(now_100ns(), frame, self.interval_100ns);
         // SAFETY: Valid sample.
         unsafe {
             sample.SetSampleTime(MFGetSystemTime())?;
-            sample.SetSampleDuration(self.native.interval_100ns() as i64)?;
+            sample.SetSampleDuration(self.interval_100ns as i64)?;
             if let Some(token) = &token {
                 sample.SetUnknown(&MFSampleExtension_Token, token)?;
             }

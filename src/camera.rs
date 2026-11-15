@@ -139,6 +139,9 @@ impl VirtualCamera {
     }
 
     /// Returns the native format required by this backend.
+    ///
+    /// For managed cameras this is the pixel format of the current producer
+    /// session, i.e. the one this session was opened with.
     pub const fn native_format(&self) -> PixelFormat {
         self.native_format
     }
@@ -194,10 +197,10 @@ impl VirtualCamera {
     /// shared-memory loads, cheap enough to check before every frame.
     ///
     /// Managed Media Foundation: the mode Frame Server's consumers selected
-    /// (the native mode or a conversion the source offers), reported by the
-    /// source and polled with the session's liveness check. Until the
-    /// producer reopens in it with [`crate::ManagedCameraManager::open`], the
-    /// source converts the written mode when it can and shows black otherwise.
+    /// (one of the camera's declared formats), reported by the source and
+    /// polled with the session's liveness check. Until the producer reopens
+    /// in it with [`crate::ManagedCameraManager::open`], frames written in
+    /// another mode are delivered as black: the source never converts.
     pub fn requested_format(&self) -> Option<VideoFormat> {
         if self.closed {
             return None;
@@ -214,10 +217,12 @@ impl VirtualCamera {
 
     /// Publishes one host-memory frame.
     ///
-    /// `frame` must use [`Self::native_format`], include any configured Unity
-    /// row padding, and contain exactly [`Self::frame_size`] bytes. `Written`
-    /// means the full frame has
-    /// been copied and the backend's publication fields or event were updated.
+    /// `frame` must use the session's format ([`Self::native_format`]), include
+    /// any configured Unity row padding, and contain exactly
+    /// [`Self::frame_size`] bytes. No format is converted: a managed consumer
+    /// that negotiated another mode shows black until this producer reopens in
+    /// it. `Written` means the full frame has been copied and the backend's
+    /// publication fields or event were updated.
     pub fn write_host(&mut self, frame: &[u8]) -> Result<WriteStatus> {
         if self.closed {
             return Err(Error::AlreadyClosed);

@@ -19,7 +19,6 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use virtualcam_protocol::convert::is_offered;
 use virtualcam_protocol::mf::{Hello, Request, Welcome, WelcomeStatus, frame_event_name, pipe_name, ring_name};
 use virtualcam_protocol::ring::{DEFAULT_SLOT_COUNT, ReadOutcome, RingLayout, RingReader, RingWriter};
 use virtualcam_protocol::{ValidatedFormat, VideoFormat};
@@ -310,7 +309,9 @@ fn serve(config: &SourceConfig, rendezvous: &RendezvousConfig, me: &Sid, slot: &
         return;
     };
     let Ok(hello) = Hello::decode(&buffer[..read as usize]) else { return };
-    let offered = is_offered(&config.format.format(), &hello.format).then(|| hello.format.validate().ok()).flatten();
+    // The producer must write one of the declared modes exactly; the source
+    // never converts, so any other layout is refused up front.
+    let offered = config.offer_of(&hello.format);
     // The bounded message was read, so impersonation reflects this client.
     let status = match pipe_client_user(pipe) {
         Some(user) if user.equals(&rendezvous.expected_owner) => {
@@ -554,7 +555,7 @@ mod tests {
                 attributes.expect("attributes"),
             )
         };
-        let stream = ComObject::new(crate::stream::MediaStream::new(queue, descriptor, attributes, vec![(format, media_type)], Arc::clone(&slot)));
+        let stream = ComObject::new(crate::stream::MediaStream::new(queue, descriptor, attributes, vec![(format, media_type)], 0, Arc::clone(&slot)));
         let interface: IMFMediaStream2 = stream.to_interface();
         let events: IMFMediaEventGenerator = interface.cast().expect("generator");
         stream.start(0, 0).expect("start");

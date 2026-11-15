@@ -4,7 +4,7 @@
 //! - `managed_dshow`: this crate's managed DirectShow camera (producer-owned
 //!   runtime format, session-local transport v2).
 //! - `managed_mf`: this crate's managed Media Foundation camera (source-owned
-//!   native mode, authenticated cross-session transport).
+//!   declared format set, authenticated cross-session transport).
 //! - `unity_capture`: third-party Unity Capture shared image.
 //!
 //! OBS keeps the OBS-compatible three-slot queue; managed cameras use the

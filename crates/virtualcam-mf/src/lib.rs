@@ -3,11 +3,14 @@
 //! Frame Server (Local Service, session 0) activates the fixed
 //! [`SOURCE_CLSID`](virtualcam_protocol::mf::SOURCE_CLSID) once per virtual
 //! camera and copies that camera's vendor attributes into our
-//! `IMFActivate`. The source advertises the immutable native mode from
-//! those attributes plus the conversions it performs itself (NV12/I420 to
-//! YUY2, see `virtualcam_protocol::convert`), produces samples on `RequestSample`
-//! (black until a producer attaches), and lazily authenticates producers on a
-//! named pipe before handing them a freshly created, DACL-protected ring and frame event.
+//! `IMFActivate`. The source advertises the declared format set from those
+//! attributes — a default mode plus every pixel format consumers may select,
+//! all sharing its size, frame rate and colorimetry — produces samples on
+//! `RequestSample` (black until a matching producer frame exists), and lazily
+//! authenticates producers on a named pipe before handing them a freshly
+//! created, DACL-protected ring and frame event. No frame is ever converted:
+//! a producer frame in another mode is replaced with black until the producer
+//! follows the source's request and reopens in the selected mode.
 //!
 //! No work happens in `DllMain`; every export and COM method is
 //! panic-guarded; activate and source aggregate the free-threaded marshaler.

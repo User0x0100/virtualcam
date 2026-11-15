@@ -2,13 +2,19 @@
 //!
 //! ```text
 //! cargo run --example managed_camera -- register "Studio Cam" [--app com.example.studio] [--backend dshow|mf]
-//!                                         [--scope user|machine] [--format nv12] [--size 1280x720] [--fps 30]
+//!                                         [--scope user|machine] [--format nv12] [--formats nv12,yuy2]
+//!                                         [--size 1280x720] [--fps 30]
 //! cargo run --example managed_camera -- list [--app com.example.studio]
 //! cargo run --example managed_camera -- stream <ID> [--format yuy2] [--size 1280x720] [--fps 30] [--seconds 30]
 //! cargo run --example managed_camera -- unregister <ID> [--app com.example.studio]
 //! cargo run --example managed_camera -- install-mf <PATH>       # elevated, once per machine
 //! cargo run --example managed_camera -- uninstall-mf [--other-users-cleaned]  # elevated
 //! ```
+//!
+//! `--formats` is the Media Foundation declared format set (default: only
+//! `--format`); `--format` is its default format and the DirectShow idle
+//! format. When a consumer selects another declared format, `stream` follows
+//! it by reopening the producer in that format.
 //!
 //! DirectShow cameras need `virtualcam_dshow.dll`; pass `--dshow-source <path>`
 //! or place it next to the example executable. Media Foundation cameras need
@@ -25,6 +31,7 @@ struct Args {
     backend: String,
     scope: String,
     format: String,
+    formats: Option<String>,
     size: (u32, u32),
     fps: u32,
     seconds: f64,
@@ -39,6 +46,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         backend: "dshow".into(),
         scope: "user".into(),
         format: "nv12".into(),
+        formats: None,
         size: (1280, 720),
         fps: 30,
         seconds: 30.0,
@@ -53,6 +61,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--backend" => args.backend = value()?,
             "--scope" => args.scope = value()?,
             "--format" => args.format = value()?,
+            "--formats" => args.formats = Some(value()?),
             "--fps" => args.fps = value()?.parse()?,
             "--seconds" => args.seconds = value()?.parse()?,
             "--dshow-source" => args.dshow_source = Some(value()?),
@@ -103,7 +112,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     pixel_formats: PixelFormat::MANAGED.to_vec(),
                     frame_rates: [15, 24, 25, 30, 50, 60].map(FrameRate::fps).to_vec(),
                 })?,
-                "mf" => manager.register(MediaFoundationRegistration::new(name, format))?,
+                "mf" => {
+                    let formats = match &args.formats {
+                        Some(list) => list.split(',').map(|name| pixel_format(name.trim())).collect::<Result<Vec<_>, Box<dyn Error>>>()?,
+                        None => vec![format.pixel_format],
+                    };
+                    manager.register(MediaFoundationRegistration::new(name, format, formats))?
+                }
                 other => return Err(format!("unknown backend {other}").into()),
             };
             println!("{}", info.id);
@@ -122,12 +137,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("stream") => {
             let id: ManagedCameraId = args.positional.get(1).ok_or("stream needs an id")?.parse().map_err(|_| "invalid id")?;
             let info = manager.get(id)?;
-            let mut camera = if info.backend == ManagedBackend::MediaFoundation {
+            let camera = if info.backend == ManagedBackend::MediaFoundation {
                 manager.open_registered(id)?
             } else {
                 manager.open(id, format)?
             };
-            stream(&mut camera, args.seconds)?;
+            stream(&manager, id, camera, args.seconds)?;
         }
         Some("install-mf") => {
             let path = args.positional.get(1).ok_or("install-mf needs the virtualcam_mf.dll path")?;
@@ -140,14 +155,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn stream(camera: &mut VirtualCamera, seconds: f64) -> Result<(), Box<dyn Error>> {
-    let format = camera.video_format().ok_or("camera has no video format")?;
+/// Streams a moving test pattern, following every mode consumers select by
+/// reopening the producer in it.
+fn stream(manager: &ManagedCameraManager, id: ManagedCameraId, mut camera: VirtualCamera, seconds: f64) -> Result<(), Box<dyn Error>> {
+    let mut format = camera.video_format().ok_or("camera has no video format")?;
     let interval = Duration::from_nanos(format.frame_rate.interval_100ns().unwrap_or(333_333) * 100);
     let mut frame = vec![0_u8; camera.frame_size()];
     let started = Instant::now();
-    let (mut written, mut inactive) = (0_u64, 0_u64);
+    let (mut written, mut inactive, mut switches) = (0_u64, 0_u64, 0_u64);
     let mut index = 0_u64;
     while started.elapsed().as_secs_f64() < seconds {
+        if let Some(wanted) = camera.requested_format() {
+            // The consumer selected another mode: frames in the current one
+            // would be shown as black, so reopen in the requested mode.
+            camera = manager.open(id, wanted)?;
+            format = wanted;
+            frame.resize(camera.frame_size(), 0);
+            switches += 1;
+        }
         draw(&mut frame, &format, index);
         match camera.write_host(&frame)? {
             WriteStatus::Written => written += 1,
@@ -160,7 +185,7 @@ fn stream(camera: &mut VirtualCamera, seconds: f64) -> Result<(), Box<dyn Error>
         }
     }
     camera.close()?;
-    println!("{format}: {written} frames written, {inactive} while no consumer was attached");
+    println!("{format}: {written} frames written, {inactive} while no consumer was attached, {switches} mode switches");
     Ok(())
 }
 

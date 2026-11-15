@@ -3,15 +3,16 @@
 //! Every camera is created with `MFCreateVirtualCamera(SoftwareCameraSource,
 //! System lifetime, CurrentUser access, name, fixed source CLSID)` and
 //! configured through vendor attributes (camera id, rendezvous id, owner SID
-//! assertion, protocol version, native mode). The same tuple reopens the
-//! same system camera, which is how unregister and rename find it again.
-//! The manager never needs elevation for cameras; installing the shared
-//! source DLL machine-wide (once) does.
+//! assertion, protocol version, default format, declared pixel formats). The
+//! same tuple reopens the same system camera, which is how unregister and
+//! rename find it again. The manager never needs elevation for cameras;
+//! installing the shared source DLL machine-wide (once) does.
 
 use std::path::{Path, PathBuf};
 
-use virtualcam_protocol::mf::{ATTR_CAMERA_ID, ATTR_EXPECTED_OWNER_SID, ATTR_NATIVE_FORMAT, ATTR_PROTOCOL_VERSION, ATTR_RENDEZVOUS_ID, PROTOCOL_VERSION, SOURCE_CLSID};
-use virtualcam_protocol::{ValidatedFormat, VideoFormat};
+use virtualcam_protocol::mf::{ATTR_CAMERA_ID, ATTR_DEFAULT_FORMAT, ATTR_EXPECTED_OWNER_SID, ATTR_PIXEL_FORMATS, ATTR_PROTOCOL_VERSION, ATTR_RENDEZVOUS_ID, PROTOCOL_VERSION, SOURCE_CLSID};
+use virtualcam_protocol::registry::encode_pixel_formats;
+use virtualcam_protocol::{PixelFormat, ValidatedFormat, VideoFormat};
 use windows::Win32::Media::MediaFoundation::{
     IMFAttributes, IMFVirtualCamera, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_VERSION, MFCreateVirtualCamera, MFSTARTUP_LITE, MFShutdown, MFStartup, MFVirtualCameraAccess_CurrentUser,
     MFVirtualCameraLifetime_System, MFVirtualCameraType_SoftwareCameraSource,
@@ -99,9 +100,10 @@ impl Drop for MfScope {
 }
 
 /// Writes the vendor attributes the source reads at activation.
-pub(crate) fn configure_attributes(attributes: &IMFAttributes, id: ManagedCameraId, rendezvous_id: &str, owner_sid: &str, format: &VideoFormat) -> Result<()> {
+pub(crate) fn configure_attributes(attributes: &IMFAttributes, id: ManagedCameraId, rendezvous_id: &str, owner_sid: &str, default_format: &VideoFormat, pixel_formats: &[PixelFormat]) -> Result<()> {
     let key = |id: ManagedCameraId| GUID::from_u128(id.to_u128());
-    let wire = format.to_wire()?.to_bytes();
+    let wire = default_format.to_wire()?.to_bytes();
+    let formats = encode_pixel_formats(pixel_formats);
     // SAFETY: Plain attribute writes on a live store.
     let result: windows_core::Result<()> = unsafe {
         (|| {
@@ -109,7 +111,8 @@ pub(crate) fn configure_attributes(attributes: &IMFAttributes, id: ManagedCamera
             attributes.SetString(&key(ATTR_RENDEZVOUS_ID), &HSTRING::from(rendezvous_id))?;
             attributes.SetString(&key(ATTR_EXPECTED_OWNER_SID), &HSTRING::from(owner_sid))?;
             attributes.SetUINT32(&key(ATTR_PROTOCOL_VERSION), PROTOCOL_VERSION)?;
-            attributes.SetBlob(&key(ATTR_NATIVE_FORMAT), &wire)
+            attributes.SetBlob(&key(ATTR_DEFAULT_FORMAT), &wire)?;
+            attributes.SetBlob(&key(ATTR_PIXEL_FORMATS), &formats)
         })()
     };
     result.map_err(|error| hresult_error("IMFAttributes::Set*(vendor attributes)", &error))
@@ -145,7 +148,7 @@ fn symbolic_link(camera: &IMFVirtualCamera) -> Option<String> {
 
 /// Creates and starts a System-lifetime camera, returning its symbolic link.
 /// On failure after creation the camera is removed again.
-fn create_camera(name: &str, id: ManagedCameraId, rendezvous_id: &str, owner_sid: &str, format: &VideoFormat) -> Result<Option<String>> {
+fn create_camera(name: &str, id: ManagedCameraId, rendezvous_id: &str, owner_sid: &str, default_format: &VideoFormat, pixel_formats: &[PixelFormat]) -> Result<Option<String>> {
     let camera = virtual_camera(name)?;
     let result = (|| {
         configure_attributes(
@@ -153,7 +156,8 @@ fn create_camera(name: &str, id: ManagedCameraId, rendezvous_id: &str, owner_sid
             id,
             rendezvous_id,
             owner_sid,
-            format,
+            default_format,
+            pixel_formats,
         )?;
         // SAFETY: Live camera; synchronous start (no callback).
         unsafe { camera.Start(None) }.map_err(|error| hresult_error("IMFVirtualCamera::Start", &error))?;
@@ -191,19 +195,20 @@ pub(super) fn register(app_id: Option<AppId>, request: MediaFoundationRegistrati
     if installed_source().is_none() {
         return Err(Error::BackendUnavailable(CameraType::ManagedMediaFoundation));
     }
+    let pixel_formats = request.formats()?;
     let _scope = MfScope::enter()?;
     let id = super::imp::new_camera_id()?;
     let rendezvous_id = format!("{:032X}", u128::from_le_bytes(random_bytes()?));
     let owner = current_user_sid()?;
-    let symbolic_link = create_camera(&request.name, id, &rendezvous_id, &owner, &request.native_format)?;
+    let symbolic_link = create_camera(&request.name, id, &rendezvous_id, &owner, &request.default_format, &pixel_formats)?;
     let record = CameraRecord {
         id,
         hive: Hive::CurrentUser,
         backend: ManagedBackend::MediaFoundation,
         name: request.name,
         app_id,
-        format: Some(request.native_format),
-        pixel_formats: Vec::new(),
+        format: Some(request.default_format),
+        pixel_formats,
         frame_rates: Vec::new(),
         source_path: None,
         rendezvous_id: Some(rendezvous_id),
@@ -221,8 +226,9 @@ pub(super) fn unregister(record: &CameraRecord) -> Result<()> {
     remove_camera(&record.name)
 }
 
-/// Rename = recreate under the new name with the same id, rendezvous, and
-/// native mode, then remove the old device (rolled back if that fails).
+/// Rename = recreate under the new name with the same id, rendezvous, default
+/// format and declared format set, then remove the old device (rolled back if
+/// that fails).
 pub(super) fn rename(record: &CameraRecord, name: &str) -> Result<CameraRecord> {
     let _scope = MfScope::enter()?;
     let (format, rendezvous_id) = match (record.format, record.rendezvous_id.as_deref()) {
@@ -233,8 +239,13 @@ pub(super) fn rename(record: &CameraRecord, name: &str) -> Result<CameraRecord> 
             });
         }
     };
+    if record.pixel_formats.is_empty() {
+        return Err(Error::RegistrationDegraded {
+            detail: "Media Foundation record declares no pixel format",
+        });
+    }
     let owner = current_user_sid()?;
-    let symbolic_link = create_camera(name, record.id, rendezvous_id, &owner, &format)?;
+    let symbolic_link = create_camera(name, record.id, rendezvous_id, &owner, &format, &record.pixel_formats)?;
     if let Err(error) = remove_camera(&record.name) {
         let _ = remove_camera(name);
         return Err(error);
@@ -255,6 +266,9 @@ pub(super) fn health(record: &CameraRecord) -> core::result::Result<(), &'static
     if record.rendezvous_id.is_none() || record.format.is_none() {
         return Err("Media Foundation record is incomplete");
     }
+    if record.pixel_formats.is_empty() {
+        return Err("Media Foundation record declares no pixel format");
+    }
     Ok(())
 }
 
@@ -269,14 +283,19 @@ pub(super) fn open(record: &CameraRecord, format: ValidatedFormat) -> Result<Vir
 mod tests {
     use std::time::{Duration, Instant};
 
-    use virtualcam_protocol::{FrameRate, PixelFormat};
-    use windows::Win32::Media::MediaFoundation::{IMFActivate, IMFMediaSource, IMFSample, IMFSourceReader, MFCreateSourceReaderFromMediaSource};
+    use virtualcam_protocol::planes::fill_black;
+    use virtualcam_protocol::{ColorSpace, FrameRate, PixelFormat};
+    use windows::Win32::Media::MediaFoundation::{IMFActivate, IMFMediaSource, IMFMediaType, IMFSample, IMFSourceReader, MF_MT_SUBTYPE, MFCreateSourceReaderFromMediaSource};
     use windows::Win32::System::Com::IClassFactory;
 
     use super::*;
     use crate::WriteStatus;
 
     const FIRST_VIDEO_STREAM: u32 = 0xFFFF_FFFC;
+    /// Every format a camera may declare, in declaration order.
+    const FIVE: [PixelFormat; 5] = [PixelFormat::Nv12, PixelFormat::I420, PixelFormat::Yuy2, PixelFormat::Uyvy, PixelFormat::P010];
+    /// The same set in descriptor order: packed 4:2:2 before planar 4:2:0.
+    const ORDERED: [PixelFormat; 5] = [PixelFormat::Yuy2, PixelFormat::Uyvy, PixelFormat::Nv12, PixelFormat::I420, PixelFormat::P010];
 
     fn read(reader: &IMFSourceReader) -> Vec<u8> {
         let mut sample: Option<IMFSample> = None;
@@ -316,10 +335,59 @@ mod tests {
         }
     }
 
-    /// An in-process source for a fresh camera id and rendezvous, with a
-    /// reader whose current type is `selected`.
-    fn in_process_camera(native: VideoFormat, selected: PixelFormat) -> (ManagedCameraId, String, IMFMediaSource, IMFSourceReader) {
-        use windows::Win32::Media::MediaFoundation::MF_MT_SUBTYPE;
+    /// A deterministic frame of `pixel_format`; it never equals the black
+    /// fill, so a delivered frame is distinguishable from an idle one.
+    fn frame(pixel_format: PixelFormat, width: u32, height: u32) -> Vec<u8> {
+        let size = pixel_format.layout(width, height).expect("layout").size();
+        (0..size).map(|index| (index.wrapping_mul(37).wrapping_add(11) % 251) as u8).collect()
+    }
+
+    fn black(pixel_format: PixelFormat, width: u32, height: u32) -> Vec<u8> {
+        let layout = pixel_format.layout(width, height).expect("layout");
+        let mut bytes = vec![0_u8; layout.size()];
+        fill_black(&mut bytes, &layout, pixel_format, ColorSpace::default_for(pixel_format, height).is_full_range(pixel_format)).expect("black");
+        bytes
+    }
+
+    /// The media types the source offers, in enumeration order.
+    fn offered(reader: &IMFSourceReader) -> Vec<PixelFormat> {
+        (0..)
+            .map_while(|index| {
+                // SAFETY: Valid reader; a missing index ends the enumeration.
+                unsafe { reader.GetNativeMediaType(FIRST_VIDEO_STREAM, index) }.ok()
+            })
+            .map(|media_type| {
+                // SAFETY: Valid media type.
+                let subtype = unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }.expect("subtype");
+                PixelFormat::from_mf_subtype(subtype.to_u128()).expect("managed subtype")
+            })
+            .collect()
+    }
+
+    fn type_for(reader: &IMFSourceReader, pixel_format: PixelFormat) -> IMFMediaType {
+        let subtype = GUID::from_u128(pixel_format.mf_subtype().expect("subtype"));
+        (0..)
+            .map_while(|index| {
+                // SAFETY: Valid reader; a missing index ends the enumeration.
+                unsafe { reader.GetNativeMediaType(FIRST_VIDEO_STREAM, index) }.ok()
+            })
+            // SAFETY: Valid media type.
+            .find(|media_type| unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }.is_ok_and(|guid| guid == subtype))
+            .expect("declared type offered")
+    }
+
+    /// Selects `pixel_format` on a running reader, as a consumer switching
+    /// modes does: no source is recreated and no camera re-registered.
+    fn select(reader: &IMFSourceReader, pixel_format: PixelFormat) {
+        let media_type = type_for(reader, pixel_format);
+        // SAFETY: An offered media type on a live reader.
+        unsafe { reader.SetCurrentMediaType(FIRST_VIDEO_STREAM, None, &media_type) }.expect("select");
+    }
+
+    /// An in-process source for a fresh camera id and rendezvous, declaring
+    /// `formats` with `default` as the default mode, with a reader whose
+    /// current type is `selected`.
+    fn in_process_camera(default: &VideoFormat, formats: &[PixelFormat], selected: PixelFormat) -> (ManagedCameraId, String, IMFMediaSource, IMFSourceReader) {
         let mut factory = core::ptr::null_mut();
         let clsid = GUID::from_u128(SOURCE_CLSID.to_u128());
         // SAFETY: Valid pointers for the export of the linked source crate.
@@ -330,17 +398,12 @@ mod tests {
         let activate: IMFActivate = unsafe { factory.CreateInstance(None) }.expect("activate");
         let id = super::super::imp::new_camera_id().expect("id");
         let rendezvous = format!("{:032X}", u128::from_le_bytes(random_bytes().expect("random")));
-        configure_attributes(&activate.cast().expect("attributes"), id, &rendezvous, &current_user_sid().expect("sid"), &native).expect("configure");
+        configure_attributes(&activate.cast().expect("attributes"), id, &rendezvous, &current_user_sid().expect("sid"), default, formats).expect("configure");
         // SAFETY: Valid activate, source and reader for the rest of the call.
         unsafe {
             let source: IMFMediaSource = activate.ActivateObject().expect("source");
             let reader = MFCreateSourceReaderFromMediaSource(&source, None).expect("reader");
-            let subtype = GUID::from_u128(selected.mf_subtype().expect("subtype"));
-            let media_type = (0..)
-                .map_while(|index| reader.GetNativeMediaType(FIRST_VIDEO_STREAM, index).ok())
-                .find(|media_type| media_type.GetGUID(&MF_MT_SUBTYPE).is_ok_and(|guid| guid == subtype))
-                .expect("selected type offered");
-            reader.SetCurrentMediaType(FIRST_VIDEO_STREAM, None, &media_type).expect("select");
+            select(&reader, selected);
             (id, rendezvous, source, reader)
         }
     }
@@ -358,62 +421,59 @@ mod tests {
         false
     }
 
-    /// The source asks the producer for the consumers' selected mode; the
-    /// producer may write any offered mode. Meanwhile the source converts
-    /// when it can (NV12 -> YUY2) and shows black when it cannot.
+    /// The camera's declared mode for `pixel_format`: every mode shares the
+    /// default format's size, rate and colorimetry.
+    fn mode(default: &VideoFormat, pixel_format: PixelFormat) -> VideoFormat {
+        VideoFormat { pixel_format, ..*default }
+    }
+
+    /// The declared set is enumerated in bridge-safe order, a producer may
+    /// open any declared mode, and a frame in a mode consumers did not select
+    /// is delivered as black — never converted.
     #[test]
     fn producer_follows_the_mode_consumers_selected() {
         let _scope = MfScope::enter().expect("MF");
-        let native = VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(30));
-        let yuy2 = VideoFormat { pixel_format: PixelFormat::Yuy2, ..native };
-        let y = 64 * 48;
-        let nv12_frame: Vec<u8> = (0..y * 3 / 2).map(|i| (i * 13 + i / 64) as u8).collect();
-        let yuy2_frame: Vec<u8> = (0..y * 2).map(|i| (i * 7 + 3) as u8).collect();
-        let mut converted = vec![0_u8; y * 2];
-        let (nv12_layout, yuy2_layout) = (native.pixel_format.layout(64, 48).expect("layout"), yuy2.pixel_format.layout(64, 48).expect("layout"));
-        // SAFETY: `nv12_frame` spans the tight NV12 layout.
-        unsafe { virtualcam_protocol::convert::convert_frame(nv12_frame.as_ptr(), PixelFormat::Nv12, &nv12_layout, &mut converted, PixelFormat::Yuy2, &yuy2_layout) }.expect("convert");
+        let (width, height) = (64, 48);
+        let default = VideoFormat::new(PixelFormat::Nv12, width, height, FrameRate::fps(30));
+        let yuy2 = mode(&default, PixelFormat::Yuy2);
         let validated = |format: VideoFormat| format.validate().expect("valid");
 
-        // Consumers selected YUY2; a native producer is converted by the
-        // source and asked for YUY2.
-        let (id, rendezvous, source, reader) = in_process_camera(native, PixelFormat::Yuy2);
-        let mut camera = VirtualCamera::open_managed_mf(id, validated(native), &rendezvous).expect("open native");
+        // Consumers selected YUY2; a producer writing the default NV12 keeps
+        // running but is shown as black, and is asked for YUY2.
+        let (id, rendezvous, source, reader) = in_process_camera(&default, &FIVE, PixelFormat::Yuy2);
+        assert_eq!(offered(&reader), ORDERED, "every declared mode is offered, packed 4:2:2 first");
+        let nv12_frame = frame(PixelFormat::Nv12, width, height);
+        let mut camera = VirtualCamera::open_managed_mf(id, validated(default), &rendezvous).expect("open default mode");
         assert_eq!(write_until_attached(&mut camera, &nv12_frame), Ok(WriteStatus::Written));
-        assert!(read_until(&reader, |bytes| bytes == converted.as_slice()), "source converts NV12 to the selected YUY2");
+        assert!(read_until(&reader, |bytes| *bytes == black(PixelFormat::Yuy2, width, height)), "an NV12 frame is never converted into the selected YUY2");
         assert!(write_until_requested(&mut camera, &nv12_frame, Some(yuy2)), "producer asked for YUY2");
-        // Reopened in YUY2: the source copies the producer's frame as is.
+
+        // Reopened in YUY2: the source copies the producer's frame unchanged.
         camera.close().expect("close");
+        let yuy2_frame = frame(PixelFormat::Yuy2, width, height);
         let mut camera = VirtualCamera::open_managed_mf(id, validated(yuy2), &rendezvous).expect("open YUY2");
         assert_eq!(write_until_attached(&mut camera, &yuy2_frame), Ok(WriteStatus::Written));
-        assert!(read_until(&reader, |bytes| bytes == yuy2_frame.as_slice()), "producer's YUY2 delivered unchanged");
+        assert!(read_until(&reader, |bytes| *bytes == yuy2_frame), "the producer's YUY2 frame is delivered unchanged");
         assert!(write_until_requested(&mut camera, &yuy2_frame, None), "nothing more to follow");
         drop((camera, reader));
         // SAFETY: Valid source.
         let _ = unsafe { source.Shutdown() };
 
-        // Consumers selected NV12; a YUY2 producer cannot be converted back:
-        // black until it follows the request.
-        let (id, rendezvous, source, reader) = in_process_camera(native, PixelFormat::Nv12);
-        let mut camera = VirtualCamera::open_managed_mf(id, validated(yuy2), &rendezvous).expect("open YUY2");
-        assert_eq!(write_until_attached(&mut camera, &yuy2_frame), Ok(WriteStatus::Written));
-        let is_black = |bytes: &[u8]| bytes.len() == y * 3 / 2 && bytes[..y].iter().all(|v| *v == 16) && bytes[y..].iter().all(|v| *v == 128);
-        assert!(is_black(&read(&reader)), "YUY2 cannot become NV12: black");
-        assert!(write_until_requested(&mut camera, &yuy2_frame, Some(native)), "producer asked for NV12");
-        camera.close().expect("close");
-        let mut camera = VirtualCamera::open_managed_mf(id, validated(native), &rendezvous).expect("open native");
-        assert_eq!(write_until_attached(&mut camera, &nv12_frame), Ok(WriteStatus::Written));
-        assert!(read_until(&reader, |bytes| bytes == nv12_frame.as_slice()), "native frame delivered");
+        // A producer may open a mode that is not the default one even when
+        // consumers already selected it: no request is pending.
+        let (id, rendezvous, source, reader) = in_process_camera(&default, &FIVE, PixelFormat::P010);
+        let p010_frame = frame(PixelFormat::P010, width, height);
+        let mut camera = VirtualCamera::open_managed_mf(id, validated(mode(&default, PixelFormat::P010)), &rendezvous).expect("open P010");
+        assert_eq!(write_until_attached(&mut camera, &p010_frame), Ok(WriteStatus::Written));
+        assert!(read_until(&reader, |bytes| *bytes == p010_frame), "a non-default declared mode is delivered");
+        assert_eq!(camera.requested_format(), None, "the selected mode is already being written");
         drop((camera, reader));
         // SAFETY: Valid source.
         let _ = unsafe { source.Shutdown() };
 
-        // Modes the source does not offer are still refused.
-        let (id, rendezvous, source, reader) = in_process_camera(native, PixelFormat::Nv12);
-        let bgra = VideoFormat {
-            pixel_format: PixelFormat::Bgra32,
-            ..native
-        };
+        // Modes the camera does not declare are still refused.
+        let (id, rendezvous, source, reader) = in_process_camera(&default, &FIVE, PixelFormat::Nv12);
+        let bgra = mode(&default, PixelFormat::Bgra32);
         let refused = VirtualCamera::open_managed_mf(id, validated(bgra), &rendezvous).and_then(|mut camera| write_until_attached(&mut camera, &vec![0; validated(bgra).frame_size()]));
         assert_eq!(refused, Err(Error::FormatMismatch));
         drop(reader);
@@ -421,14 +481,67 @@ mod tests {
         let _ = unsafe { source.Shutdown() };
     }
 
-    /// Unregistering a record whose system camera is already gone succeeds,
-    /// so the record can be cleaned up instead of failing forever.
+    /// Consumers switch between declared modes repeatedly on one source; the
+    /// producer follows each selection by reopening, and every mode arrives
+    /// byte for byte.
     #[test]
-    #[ignore = "creates (never starts) a Windows virtual camera object"]
-    fn removing_a_missing_system_camera_counts_as_removed() {
+    fn consumers_switch_between_declared_modes() {
         let _scope = MfScope::enter().expect("MF");
-        let name = format!("VCRs Missing {}", std::process::id());
-        assert_eq!(remove_camera(&name), Ok(()));
+        let (width, height) = (64, 48);
+        let default = VideoFormat::new(PixelFormat::Nv12, width, height, FrameRate::fps(30));
+        let (id, rendezvous, source, reader) = in_process_camera(&default, &FIVE, PixelFormat::Nv12);
+
+        let mut camera = VirtualCamera::open_managed_mf(id, default.validate().expect("valid"), &rendezvous).expect("open default");
+        let mut producing = PixelFormat::Nv12;
+        let mut current = frame(producing, width, height);
+        assert_eq!(write_until_attached(&mut camera, &current), Ok(WriteStatus::Written));
+        assert!(read_until(&reader, |bytes| *bytes == current), "the default mode is delivered");
+
+        // A full round trip, ending back at the mode the producer started in.
+        for selected in [PixelFormat::Yuy2, PixelFormat::I420, PixelFormat::Uyvy, PixelFormat::P010, PixelFormat::Nv12] {
+            select(&reader, selected);
+            let wanted = mode(&default, selected);
+            // The producer keeps writing the old mode: the consumer sees black
+            // and the source asks for the new one.
+            if selected != producing {
+                assert!(read_until(&reader, |bytes| *bytes == black(selected, width, height)), "{selected:?}: no frame in another mode is delivered");
+                assert!(write_until_requested(&mut camera, &current, Some(wanted)), "{selected:?}: producer asked to switch");
+                camera.close().expect("close");
+                camera = VirtualCamera::open_managed_mf(id, wanted.validate().expect("valid"), &rendezvous).expect("reopen in the selected mode");
+                producing = selected;
+                current = frame(selected, width, height);
+            }
+            assert_eq!(write_until_attached(&mut camera, &current), Ok(WriteStatus::Written), "{selected:?}");
+            assert!(read_until(&reader, |bytes| *bytes == current), "{selected:?}: delivered unchanged");
+            assert_eq!(camera.requested_format(), None, "{selected:?}: nothing pending");
+        }
+        drop((camera, reader));
+        // SAFETY: Valid source.
+        let _ = unsafe { source.Shutdown() };
+    }
+
+    /// A frame written in another declared mode is paced as black, not
+    /// reinterpreted and not converted.
+    #[test]
+    fn mismatched_frames_are_black_and_paced() {
+        let _scope = MfScope::enter().expect("MF");
+        let (width, height) = (64, 48);
+        let default = VideoFormat::new(PixelFormat::Nv12, width, height, FrameRate::fps(30));
+        let (id, rendezvous, source, reader) = in_process_camera(&default, &FIVE, PixelFormat::Nv12);
+        let producing = mode(&default, PixelFormat::Yuy2);
+        let mut camera = VirtualCamera::open_managed_mf(id, producing.validate().expect("format"), &rendezvous).expect("open");
+        assert_eq!(write_until_attached(&mut camera, &frame(PixelFormat::Yuy2, width, height)), Ok(WriteStatus::Written));
+        let expected = black(PixelFormat::Nv12, width, height);
+        let started = Instant::now();
+        let mut samples = 0;
+        while started.elapsed() < Duration::from_millis(250) {
+            assert_eq!(read(&reader), expected, "a YUY2 frame is never delivered as NV12");
+            samples += 1;
+        }
+        drop((camera, reader));
+        // SAFETY: Valid source; the reader may already have shut it down.
+        let _ = unsafe { source.Shutdown() };
+        assert!(samples <= 12, "{samples} black samples from one producer frame in {:?}", started.elapsed());
     }
 
     /// A consumer that reads as fast as it can gets the producer's frames
@@ -437,7 +550,7 @@ mod tests {
     fn delivery_follows_the_producer_rate() {
         let _scope = MfScope::enter().expect("MF");
         let native = VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(30));
-        let (id, rendezvous, source, reader) = in_process_camera(native, PixelFormat::Nv12);
+        let (id, rendezvous, source, reader) = in_process_camera(&native, &[PixelFormat::Nv12], PixelFormat::Nv12);
         let frame = vec![100_u8; 64 * 48 * 3 / 2];
         let mut camera = VirtualCamera::open_managed_mf(id, native.validate().expect("valid"), &rendezvous).expect("open");
         assert_eq!(write_until_attached(&mut camera, &frame), Ok(WriteStatus::Written));
@@ -465,27 +578,14 @@ mod tests {
         let _ = unsafe { source.Shutdown() };
     }
 
+    /// Unregistering a record whose system camera is already gone succeeds,
+    /// so the record can be cleaned up instead of failing forever.
     #[test]
-    fn unconvertible_frames_are_paced() {
+    #[ignore = "creates (never starts) a Windows virtual camera object"]
+    fn removing_a_missing_system_camera_counts_as_removed() {
         let _scope = MfScope::enter().expect("MF");
-        let native = VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(30));
-        let producing = VideoFormat { pixel_format: PixelFormat::Yuy2, ..native };
-        let (id, rendezvous, source, reader) = in_process_camera(native, PixelFormat::Nv12);
-        let mut camera = VirtualCamera::open_managed_mf(id, producing.validate().expect("format"), &rendezvous).expect("open");
-        assert_eq!(write_until_attached(&mut camera, &vec![100; 64 * 48 * 2]), Ok(WriteStatus::Written));
-        let started = Instant::now();
-        let mut samples = 0;
-        while started.elapsed() < Duration::from_millis(250) {
-            let bytes = read(&reader);
-            let y = 64 * 48;
-            assert_eq!(bytes.len(), y * 3 / 2);
-            assert!(bytes[..y].iter().all(|byte| *byte == 16) && bytes[y..].iter().all(|byte| *byte == 128), "YUY2 cannot become NV12: black");
-            samples += 1;
-        }
-        drop((camera, reader));
-        // SAFETY: Valid source; the reader may already have shut it down.
-        let _ = unsafe { source.Shutdown() };
-        assert!(samples <= 12, "{samples} black samples from one producer frame in {:?}", started.elapsed());
+        let name = format!("VCRs Missing {}", std::process::id());
+        assert_eq!(remove_camera(&name), Ok(()));
     }
 
     #[test]
@@ -503,30 +603,32 @@ mod tests {
         let id = super::super::imp::new_camera_id().expect("id");
         let rendezvous = format!("{:032X}", u128::from_le_bytes(random_bytes().expect("random")));
         let format = VideoFormat::new(PixelFormat::Nv12, 64, 48, FrameRate::fps(30));
-        configure_attributes(&activate.cast().expect("attributes"), id, &rendezvous, &current_user_sid().expect("sid"), &format).expect("configure");
+        configure_attributes(&activate.cast().expect("attributes"), id, &rendezvous, &current_user_sid().expect("sid"), &format, &[PixelFormat::Nv12]).expect("configure");
         // SAFETY: Valid activate.
         let source: IMFMediaSource = unsafe { activate.ActivateObject() }.expect("source");
         // SAFETY: Valid source.
         let reader = unsafe { MFCreateSourceReaderFromMediaSource(&source, None) }.expect("reader");
-        let y = 64 * 48;
-        let is_black = |bytes: &[u8]| bytes.len() == y * 3 / 2 && bytes[..y].iter().all(|v| *v == 16) && bytes[y..].iter().all(|v| *v == 128);
+        let (width, height) = (64, 48);
+        let is_black = |bytes: &[u8]| *bytes == black(PixelFormat::Nv12, width, height);
         assert!(is_black(&read(&reader)), "no producer: black");
 
-        // Wrong native mode and wrong camera are rejected by the source.
+        // A different size, and a pixel format the camera does not declare,
+        // are both rejected by the source.
         let other = VideoFormat::new(PixelFormat::Nv12, 32, 48, FrameRate::fps(30)).validate().expect("valid");
         // (The rejection surfaces at `open` when the source is already up,
         // otherwise at the first write that reaches it.)
         let attempt = |id, format: ValidatedFormat| VirtualCamera::open_managed_mf(id, format, &rendezvous).and_then(|mut camera| write_until_attached(&mut camera, &vec![0; format.frame_size()]));
         assert_eq!(attempt(id, other), Err(Error::FormatMismatch));
+        assert_eq!(attempt(id, mode(&format, PixelFormat::Yuy2).validate().expect("valid")), Err(Error::FormatMismatch), "an undeclared mode is refused");
         let stranger = super::super::imp::new_camera_id().expect("id");
         assert!(matches!(attempt(stranger, format.validate().expect("valid")), Err(Error::Protocol { .. })));
 
         // The owner attaches and its frames reach the source reader.
-        let frame: Vec<u8> = (0..y * 3 / 2).map(|i| (i * 13 + i / 64) as u8).collect();
+        let produced = frame(PixelFormat::Nv12, width, height);
         let mut camera = VirtualCamera::open_managed_mf(id, format.validate().expect("valid"), &rendezvous).expect("open");
-        assert_eq!(write_until_attached(&mut camera, &frame), Ok(WriteStatus::Written));
+        assert_eq!(write_until_attached(&mut camera, &produced), Ok(WriteStatus::Written));
         assert_eq!(camera.is_ready(), Ok(true));
-        assert!(read_until(&reader, |bytes| bytes == frame.as_slice()), "producer frame delivered");
+        assert!(read_until(&reader, |bytes| *bytes == produced), "producer frame delivered");
 
         // Closing the producer closes the pipe: the source returns to black.
         camera.close().expect("close");
@@ -534,7 +636,7 @@ mod tests {
 
         // A new producer session can attach again.
         let mut camera = VirtualCamera::open_managed_mf(id, format.validate().expect("valid"), &rendezvous).expect("reopen");
-        assert_eq!(write_until_attached(&mut camera, &frame), Ok(WriteStatus::Written));
+        assert_eq!(write_until_attached(&mut camera, &produced), Ok(WriteStatus::Written));
         // Releasing the reader shuts the source down (reader default); an
         // explicit Shutdown afterwards reports MF_E_SHUTDOWN.
         drop(reader);
@@ -542,9 +644,102 @@ mod tests {
         let _ = unsafe { source.Shutdown() };
         // The source closed the pipe; the producer notices and goes inactive.
         let deadline = Instant::now() + Duration::from_secs(2);
-        while camera.write_host(&frame) == Ok(WriteStatus::Written) && Instant::now() < deadline {
+        while camera.write_host(&produced) == Ok(WriteStatus::Written) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(camera.write_host(&frame), Ok(WriteStatus::ConsumerInactive));
+        assert_eq!(camera.write_host(&produced), Ok(WriteStatus::ConsumerInactive));
+    }
+
+    /// A device-backed frame reaches consumers unchanged, in whatever mode the
+    /// session writes: `write_cuda` copies D2H straight into the ring slot and
+    /// never stages or converts.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA-capable device and Runtime"]
+    fn write_cuda_delivers_every_selected_mode_without_conversion() {
+        use core::ffi::c_void;
+
+        // CUDA Runtime entry points for the device side of the copy.
+        type Malloc = unsafe extern "system" fn(*mut *mut c_void, usize) -> i32;
+        type Free = unsafe extern "system" fn(*mut c_void) -> i32;
+        type Memcpy = unsafe extern "system" fn(*mut c_void, *const c_void, usize, i32) -> i32;
+        const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+        // SAFETY: Each type is the documented CUDA Runtime signature of its export.
+        let (cuda_malloc, cuda_free, cuda_memcpy) = unsafe { (crate::cuda::test_api::<Malloc>(c"cudaMalloc"), crate::cuda::test_api::<Free>(c"cudaFree"), crate::cuda::test_api::<Memcpy>(c"cudaMemcpy")) };
+        // A device buffer holding one frame, released on drop.
+        struct Device {
+            pointer: *mut c_void,
+            len: usize,
+            free: Free,
+        }
+        impl Device {
+            fn upload(host: &[u8], malloc: Malloc, memcpy: Memcpy, free: Free) -> Self {
+                let mut pointer = core::ptr::null_mut();
+                // SAFETY: Writable pointer storage receives an allocation of exactly `host.len()` bytes.
+                assert_eq!(unsafe { malloc(&mut pointer, host.len()) }, 0, "cudaMalloc");
+                assert!(!pointer.is_null());
+                // SAFETY: Both buffers hold `host.len()` bytes and kind 1 is H2D.
+                assert_eq!(unsafe { memcpy(pointer, host.as_ptr().cast(), host.len(), CUDA_MEMCPY_HOST_TO_DEVICE) }, 0, "cudaMemcpy");
+                Self { pointer, len: host.len(), free }
+            }
+        }
+        impl Drop for Device {
+            fn drop(&mut self) {
+                // SAFETY: The pointer came from a successful cudaMalloc and is freed once.
+                assert_eq!(unsafe { (self.free)(self.pointer) }, 0, "cudaFree");
+            }
+        }
+
+        let _scope = MfScope::enter().expect("MF");
+        let (width, height) = (64, 48);
+        let default = VideoFormat::new(PixelFormat::Nv12, width, height, FrameRate::fps(30));
+        let (id, rendezvous, source, reader) = in_process_camera(&default, &FIVE, PixelFormat::Nv12);
+        let mut camera = VirtualCamera::open_managed_mf(id, default.validate().expect("valid"), &rendezvous).expect("open default");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut producing = PixelFormat::Nv12;
+        loop {
+            let host = frame(producing, width, height);
+            let device = Device::upload(&host, cuda_malloc, cuda_memcpy, cuda_free);
+            // SAFETY: The device allocation spans exactly `device.len` readable
+            // bytes in the context current on this thread, and no stream is passed.
+            let status = unsafe { camera.write_cuda(device.pointer, device.len, None) }.expect("write_cuda");
+            if status == WriteStatus::Written {
+                assert!(read_until(&reader, |bytes| *bytes == host), "{producing:?}: the device frame arrives unchanged");
+                break;
+            }
+            assert!(Instant::now() < deadline, "producer never attached: {status:?}");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+
+        // The same D2H path in another selected mode: no conversion anywhere.
+        for selected in [PixelFormat::Yuy2, PixelFormat::P010] {
+            select(&reader, selected);
+            // The source reader applies a new type on its next read, which is
+            // what restarts the source and signals the selection.
+            let _ = read(&reader);
+            let wanted = mode(&default, selected);
+            assert!(write_until_requested(&mut camera, &frame(producing, width, height), Some(wanted)), "{selected:?}: producer asked to switch");
+            camera.close().expect("close");
+            camera = VirtualCamera::open_managed_mf(id, wanted.validate().expect("valid"), &rendezvous).expect("reopen");
+            producing = selected;
+            let host = frame(producing, width, height);
+            let device = Device::upload(&host, cuda_malloc, cuda_memcpy, cuda_free);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                // SAFETY: As above; re-uploaded for every attempt.
+                match unsafe { camera.write_cuda(device.pointer, device.len, None) }.expect("write_cuda") {
+                    WriteStatus::Written => break,
+                    status => {
+                        assert!(Instant::now() < deadline, "{selected:?}: producer never attached: {status:?}");
+                        std::thread::sleep(Duration::from_millis(30));
+                    }
+                }
+            }
+            assert!(read_until(&reader, |bytes| *bytes == host), "{selected:?}: the device frame arrives unchanged");
+        }
+        drop((camera, reader));
+        // SAFETY: Valid source.
+        let _ = unsafe { source.Shutdown() };
     }
 }

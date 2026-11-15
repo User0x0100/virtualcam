@@ -27,8 +27,11 @@ pub enum Error {
     InvalidAppId,
     /// The pixel format cannot be carried by the selected backend.
     UnsupportedFormat,
-    /// A Media Foundation producer format differs from the camera's immutable native mode.
+    /// A requested Media Foundation format is not one the camera declares.
     FormatMismatch,
+    /// A Media Foundation registration declares no pixel format, or its
+    /// default format's pixel format is not among them.
+    InvalidFormatSet,
     /// No managed camera with this id is visible to the manager (or to its application scope).
     CameraNotFound,
     /// Another managed camera of the same backend and scope already uses this name.
@@ -103,7 +106,8 @@ impl fmt::Display for Error {
             Self::InvalidCameraId => formatter.write_str("invalid managed camera CLSID"),
             Self::InvalidAppId => formatter.write_str("invalid managed camera application id"),
             Self::UnsupportedFormat => formatter.write_str("pixel format is not supported by this backend"),
-            Self::FormatMismatch => formatter.write_str("format differs from the camera's native mode"),
+            Self::FormatMismatch => formatter.write_str("pixel format is not offered by this camera"),
+            Self::InvalidFormatSet => formatter.write_str("camera declares no pixel format, or its default format is not among them"),
             Self::CameraNotFound => formatter.write_str("managed camera not found"),
             Self::NameConflict => formatter.write_str("another managed camera already uses this name"),
             Self::RegistrationDegraded { detail } => write!(formatter, "managed camera registration is degraded: {detail}"),

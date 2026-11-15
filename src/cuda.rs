@@ -155,6 +155,21 @@ mod cuda_runtime_api {
     }
 }
 
+/// Resolves one CUDA Runtime entry point for tests that must allocate device
+/// memory through the same module the D2H path uses.
+///
+/// # Safety
+///
+/// `F` must be the exact signature of the named export.
+#[cfg(all(test, windows))]
+pub(crate) unsafe fn test_api<F: Copy>(name: &core::ffi::CStr) -> F {
+    let module = cuda_runtime_api::module().expect("CUDA Runtime DLL");
+    let symbol = cuda_runtime_api::symbol(module, name).expect("CUDA Runtime export");
+    assert_eq!(size_of::<F>(), size_of_val(&symbol));
+    // SAFETY: The caller names the export's exact function-pointer type.
+    unsafe { core::mem::transmute_copy(&symbol) }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::cuda_runtime_api::cudaError_t;
@@ -166,11 +181,8 @@ mod tests {
     /// # Safety
     /// `F` must be the exact signature of the named export.
     unsafe fn api<F: Copy>(name: &core::ffi::CStr) -> F {
-        let module = super::cuda_runtime_api::module().expect("CUDA Runtime DLL");
-        let symbol = super::cuda_runtime_api::symbol(module, name).expect("CUDA Runtime export");
-        assert_eq!(size_of::<F>(), size_of_val(&symbol));
-        // SAFETY: The caller names the export's exact function-pointer type.
-        unsafe { core::mem::transmute_copy(&symbol) }
+        // SAFETY: Forwarded caller contract.
+        unsafe { test_api(name) }
     }
 
     #[test]

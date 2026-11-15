@@ -42,7 +42,7 @@
 
 设计原则：
 
-- 不缩放像素。你写入什么格式，消费端就收到什么格式；唯一例外是 Media Foundation 摄像头在原生 NV12/I420 之外还提供由 source 自行转换的 YUY2（避免 Windows DirectShow 桥接自带转换在宽度非 32 倍数时错位）。
+- 不缩放、不转换像素。消费端选择格式，生产端写入该格式，source 只做按行 pitch 的复制；生产端还没切到消费端所选格式时输出黑帧，而不是偷偷转换。
 - 共享内存 ring 带 per-slot 序列锁，消费端永远不会拿到"撕裂"的半帧；写入端从不等待消费端。
 - 没有生产者时摄像头输出黑帧，而不是报错或冻结。
 
@@ -53,7 +53,7 @@
 | 能看到它的应用 | FFmpeg `-f dshow`、OpenCV `CAP_DSHOW`、OBS、Zoom 等传统 DirectShow 应用 | Windows 相机、Chrome/Edge、Teams、WinRT `MediaCapture`、`IMFSourceReader` |
 | 安装 | 无需安装；注册时指向 DLL 路径 | 每台机器一次，需管理员 |
 | 注册 | `CurrentUser`（免管理员）或 `AllUsers`（需管理员） | 仅当前用户，免管理员 |
-| 格式 | 每次打开生产者时自由决定 | 注册时固定一个原生格式，之后不可改 |
+| 格式 | 每次打开生产者时自由决定 | 注册时固定一组格式（一个默认格式 + 若干可选像素格式）；消费端可选其中任意一个，生产端跟随切换 |
 | 跨会话 | 仅同一登录会话 | Frame Server 在 Session 0，跨会话 |
 
 经验法则：
@@ -154,13 +154,14 @@ ffplay -f dshow -i video="Studio Cam"
 ### 5.2 Media Foundation 示例
 
 ```powershell
-$id = & $exe register "Studio MF Cam" --backend mf --size 1280x720 --fps 30
+$id = & $exe register "Studio MF Cam" --backend mf --size 1280x720 --fps 30 `
+        --format nv12 --formats nv12,i420,yuy2,uyvy,p010
 & $exe stream $id --seconds 60
 ```
 
 推流期间打开"相机"应用或浏览器，选择 **Studio MF Cam (Windows 虚拟摄像头)**。Windows 会在名字后自动追加本地化后缀。
 
-MF 摄像头在 `stream` 时自动使用注册时的格式；`--format/--size/--fps` 对 MF 的 `stream` 无效。
+`--format` 是源端的初始默认格式（并确定共用尺寸、帧率和色彩参数），`--formats` 是应用可选的格式集合，二者共用 `--size/--fps`。**它不保证 Windows Frame Server 或消费端最终选择相同的像素格式**：Frame Server 可能优先选择媒体类型列表中的第一项；为避免 DirectShow 桥接自行转换造成 YUY2 错行，MF 源会将 YUY2/UYVY 排在 NV12/I420/P010 前面。例如注册默认 NV12、同时声明 YUY2 时，Frame Server 可能首先选择 YUY2。`stream` 会读取 `requested_format()`，包括首次启动时的请求，并以消费端所选格式重开生产者；切换完成前可能短暂输出黑帧，不会进行隐式格式转换。省略 `--formats` 时只声明 `--format` 这一种格式。
 
 ### 5.3 删除
 
@@ -177,7 +178,7 @@ MF 摄像头在 `stream` 时自动使用注册时的格式；`--format/--size/--
 | `ManagedCameraManager` | 注册/列出/重命名/删除/打开自有摄像头；可廉价 clone |
 | `AppId` | 程序命名空间：`A-Z a-z 0-9 . _ -`，1–128 字符 |
 | `DirectShowRegistration` | DirectShow 注册参数：`name`、`scope`、`default_format`、`pixel_formats`（按偏好排序的可选像素格式）、`frame_rates`（按偏好排序的可选帧率，至多 16 个） |
-| `MediaFoundationRegistration` | MF 注册参数：`name`、`native_format` |
+| `MediaFoundationRegistration` | MF 注册参数：`name`、`default_format`（默认格式，同时决定所有格式共用的分辨率/帧率/色彩空间）、`pixel_formats`（可选像素格式集合，仅支持 NV12/I420/YUY2/UYVY/P010，必须包含默认格式，顺序仅作偏好） |
 | `ManagedCameraInfo` | 查询结果：`id`、`name`、`backend`、`scope`、`app_id`、`format`、`health` |
 | `ManagedCameraId` | 稳定 ID（GUID 形式），可 `Display`/`parse` |
 | `VirtualCamera` | 已打开的生产者：`write_host`、`is_ready`、`close` 等 |
@@ -264,13 +265,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Media Foundation source 未安装（见第 4.2 节）".into());
     }
     let manager = ManagedCameraManager::new();
-    let native = VideoFormat::new(PixelFormat::Nv12, 1920, 1080, FrameRate::fps(30));
-    let info = manager.register(MediaFoundationRegistration::new("Studio MF Cam", native))?;
+    // 默认格式决定所有可选格式共用的分辨率、帧率与色彩空间。
+    let default = VideoFormat::new(PixelFormat::Nv12, 1920, 1080, FrameRate::fps(30));
+    let info = manager.register(MediaFoundationRegistration::new(
+        "Studio MF Cam",
+        default,
+        [PixelFormat::Nv12, PixelFormat::I420, PixelFormat::Yuy2, PixelFormat::Uyvy, PixelFormat::P010],
+    ))?;
 
-    // 使用原生格式；open(id, format) 也接受 source 提供的 YUY2 mode。
+    // 默认格式；open(id, format) 也接受集合中的其他格式。
     let mut camera = manager.open_registered(info.id)?;
-    let frame = vec![0x10_u8; camera.frame_size()];
+    let mut frame = vec![0x10_u8; camera.frame_size()];
     loop {
+        // 应用切换了格式：以自己的数据源产出新格式，并重开写入会话。
+        if let Some(wanted) = camera.requested_format() {
+            camera.close()?;
+            camera = manager.open(info.id, wanted)?;
+            frame = vec![0x10_u8; camera.frame_size()];
+        }
         match camera.write_host(&frame)? {
             WriteStatus::Written => {}                 // 有应用正在使用摄像头
             WriteStatus::ConsumerInactive => {}        // 没有应用打开它；帧被丢弃，可降低工作量
@@ -283,7 +295,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 要点：
 
-- MF 摄像头的格式在注册时固定。要换格式，就 `unregister` 后重新 `register`。
+- MF 摄像头的格式集合在注册时固定：一个默认格式 + 若干可选 YUV 像素格式（NV12/I420/YUY2/UYVY/P010，RGB 仅 DirectShow 支持），全部共用默认格式的分辨率、帧率与色彩空间。要改变集合本身，就 `unregister` 后重新 `register`；应用在集合内切换格式不需要重建摄像头。
+- 生产者必须写入**当前会话的格式**（`camera.video_format()`），长度精确等于 `camera.frame_size()`。写入其他格式的帧会被 source 以黑帧替代，不会被转换。
+- `open(id, format)` 要求请求的分辨率、帧率与 `ColorSpace` 与注册值一致；色彩参数不一致返回 `Error::FormatMismatch`，不会被静默替换为注册值。
 - 生产者是**惰性连接**的：没有应用打开摄像头时，`write_host` 返回 `WriteStatus::ConsumerInactive`，`is_ready()` 为 `false`。应用打开摄像头后，生产者在约 250 ms 内自动连接，之后返回 `Written`。
 - 只有摄像头所属的 Windows 用户能向它推流。source 通过命名管道校验生产者进程令牌中的 SID；其他用户的进程无法注入画面。
 - `rename` 对 MF 摄像头是"删除后重建"，Windows 的 symbolic link 可能改变，已经打开它的应用需要重新打开。
@@ -392,10 +406,10 @@ let one = manager.get(id)?;
 
 - 两个 managed 后端共用交付判断：按 generation + sequence 识别新帧，按协商帧率的理论时间网格限速：新帧不早于网格时刻前四分之一帧间隔时立即交付，更早到的帧直接跳过而不是延后（容忍生产者抖动、不增加延迟，网格自动对齐生产者节奏），长期速率不超过协商帧率（例如 60 FPS 写入 30 FPS 摄像头时恰好每两帧交一帧）；没有生产者帧时按网格交黑帧；生产者停滞时每秒重交一次最新帧。应用连续请求也不会超过这个节奏。
 - 生产端写入并提交帧后触发新帧事件。MF source 在认证成功后创建 ring 和跨进程帧事件，经握手返回两者名字；二者使用相同的授权身份，事件使用独立的等待/触发权限。source 等待事件、状态变化或交付期限，不再每 1 ms 轮询 ring。
-- 生产者格式无法转换时输出的黑帧也遵守同样的节流规则。stream 暂停后恢复会继续处理待交付请求；停止会取消待交付请求，重启后不再交付旧请求。
-- 时间戳使用系统 QPC 时钟（`MFGetSystemTime`），时长等于原生帧间隔。
+- 生产端写入的格式与消费端所选不一致时输出的黑帧也遵守同样的节流规则。stream 暂停后恢复会继续处理待交付请求；停止会取消待交付请求，重启后不再交付旧请求。
+- 时间戳使用系统 QPC 时钟（`MFGetSystemTime`），时长等于默认格式的帧间隔。
 - 生产者断开（管道关闭）时立即回到黑帧；正常停止不会发送流结束事件，应用可以继续使用摄像头。
-- 原生 NV12/I420 的摄像头还提供 YUY2。应用选定的格式经管道告知生产者，生产者用 `VirtualCamera::requested_format()` 读取（随存活检查约每 100 ms 更新），可关闭后以 `ManagedCameraManager::open(id, requested)` 重开并自己产出该格式，source 此后只复制；重开之前 source 能转换就自行转换（NV12/I420 → YUY2），不能转换则输出黑帧。
+- 摄像头按注册时声明的格式集合向应用公开多个媒体类型；应用选定的格式经管道告知生产者，生产者用 `VirtualCamera::requested_format()` 读取（随存活检查约每 100 ms 更新），可关闭后以 `ManagedCameraManager::open(id, requested)` 重开并自己产出该格式。重开之前，写入其他格式的帧一律输出黑帧——source 不做任何像素转换。切换格式既不需要注销/重新注册摄像头，也不需要重建 source；切换期间的管道重连不会丢失应用的最新选择。
 - 摄像头是 System lifetime：重启后仍然存在，直到 `unregister`。
 - 两个 managed 后端的 `requested_format()` 都只在消费端选择的格式与当前写入格式不同时返回 `Some`。生产端与 MF source DLL 应使用相同的当前协议定义。
 - MF 交付期限使用高精度 waitable timer，以维持空闲和持续推流时的协商帧率。
@@ -463,7 +477,8 @@ let status = unsafe { camera.write_cuda(device_ptr, camera.frame_size(), Some(st
 | `CameraNotFound` | ID 不存在，或不属于当前 AppId | 检查 `list()`；或改用 `ManagedCameraManager::new()` |
 | `InvalidDimensions` / `InvalidFrameRate` | 超出范围或违反奇偶要求 | 见第 7 节 |
 | `UnsupportedFormat` | 该后端不支持此像素格式 | 自有摄像头使用第 7.1 节列出的格式 |
-| `FormatMismatch` | MF 摄像头以原生及 offered 列表以外的格式打开 | 用 `open_registered`，或 `requested_format()` 返回的 offered mode |
+| `FormatMismatch` | MF 摄像头以未声明的像素格式，或与注册值不同的分辨率、帧率、色彩参数打开 | 使用 `open_registered`，或传入 `requested_format()` 返回的完整 `VideoFormat` |
+| `InvalidFormatSet` | MF 注册既没有声明任何像素格式，默认格式也不在其中 | 声明至少一个格式，并把 `default_format.pixel_format` 包含进去 |
 | `FrameSizeMismatch` | `write_host` 长度 ≠ `frame_size()` | 按 `frame_size()` 分配缓冲 |
 | `DeviceInUse` | 已有另一个生产者 | 关闭另一个生产者 |
 | `BackendUnavailable(..)` | DLL 未找到、MF source 未安装、路径为网络盘等 | 检查第 4 节 |
@@ -516,8 +531,10 @@ cargo test --all-features --test windows_installed -- --ignored --test-threads=1
 ## 14. 限制
 
 - 仅支持 x64：没有 x86 DirectShow DLL（32 位应用看不到摄像头），也没有 ARM64 构建。
-- MF 摄像头每台只有一个原生格式；改格式需要重建摄像头。
+- MF 摄像头的格式集合（含分辨率、帧率、色彩空间）在注册时固定；要改变集合本身，需要 `unregister` 后重新 `register`。消费端在集合内部切换格式则不需要重建。
 - MF 只支持当前用户访问 + System lifetime；不支持 AllUsers，也不支持 Session lifetime。
+- MF 摄像头只能声明 NV12/I420/YUY2/UYVY/P010 五种 YUV 格式；RGB24/BGRA32 仅 DirectShow 支持。
 - 同一 Windows 用户下的恶意进程可以向该用户自己的摄像头推流（威胁模型只防跨用户、远程和未认证注入）。
 - 多用户 / 快速用户切换场景尚未经过真机验证。
-- 生产端不缩放或转换像素；MF source 可将 NV12/I420 转换为 YUY2，其余格式由生产端提供。
+- 生产端与 source 都不缩放或转换像素；`write_host` / `write_cuda` 必须写入当前会话所声明格式的完整帧。
+- 从"每台摄像头只有一个原生格式"的旧版本升级时，需要重新以管理员安装 `virtualcam_mf.dll`，并重新注册 MF 摄像头：vendor attribute 集合带版本号（`PROTOCOL_VERSION`），旧版本注册的摄像头在新版本中显示为 `RegistrationHealth::Degraded`，`unregister` 后重新 `register` 即可修复。

@@ -1,13 +1,15 @@
 //! Producer side of this crate's managed Media Foundation camera.
 //!
-//! The Frame Server source owns the format and the transport. A producer
-//! attaches lazily: at most every 250 ms it tries the camera's rendezvous
-//! pipe (absent until a client opens the camera), authenticates by its
-//! token, and maps the source-created ring for writing. Until then frames
+//! The Frame Server source owns the declared format set and the transport. A
+//! producer attaches lazily: at most every 250 ms it tries the camera's
+//! rendezvous pipe (absent until a client opens the camera), authenticates by
+//! its token, and maps the source-created ring for writing. Until then frames
 //! are dropped with [`WriteStatus::ConsumerInactive`]. The open pipe is the
 //! liveness link in both directions, and carries the source's `Request`s:
 //! the mode consumers selected, exposed through `requested_format` so the
-//! application can reopen in that mode (any mode the source offers).
+//! application can reopen in that mode (any declared mode). The session's
+//! format is the ring's format; the source copies it only while consumers
+//! have selected the same mode and shows black otherwise.
 
 use std::time::{Duration, Instant};
 

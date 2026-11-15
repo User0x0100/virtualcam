@@ -2,8 +2,9 @@
 //!
 //! Producers always supply *tightly packed* frames in the layout described by
 //! [`PixelFormat::layout`]. Sources copy them plane-by-plane into whatever
-//! pitch the consumer's buffer uses. The only conversions are the ones a Media
-//! Foundation source offers besides its native mode ([`crate::convert`]).
+//! pitch the consumer's buffer uses. No format is ever converted into another:
+//! a producer writes the format the consumer selected, and a source that has
+//! no matching frame delivers black.
 
 use core::fmt;
 use core::mem::{align_of, offset_of, size_of};
@@ -76,6 +77,12 @@ pub enum PixelFormat {
 impl PixelFormat {
     /// Every format a managed camera can carry, in preference order.
     pub const MANAGED: [Self; 7] = [Self::Nv12, Self::I420, Self::Yuy2, Self::Uyvy, Self::P010, Self::Bgra32, Self::Rgb24];
+
+    /// Formats a Media Foundation camera may declare: the five YUV layouts its
+    /// source carries. RGB stays DirectShow-only, because a Media Foundation
+    /// camera fixes one colorimetry for every mode and never converts, so
+    /// advertising RGB beside YUV would promise a frame it cannot build.
+    pub const MEDIA_FOUNDATION: [Self; 5] = [Self::Nv12, Self::I420, Self::Yuy2, Self::Uyvy, Self::P010];
 
     /// Stable transport code, or `None` for formats managed cameras cannot carry.
     pub const fn wire_code(self) -> Option<u32> {

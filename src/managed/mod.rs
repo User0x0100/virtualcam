@@ -5,9 +5,17 @@
 //! - **DirectShow**: registration persists only identity (plus an optional
 //!   idle default format). Each producer session chooses its own format.
 //!   Per-user registration needs no elevation; machine-wide needs admin.
-//! - **Media Foundation**: registration fixes one immutable native mode,
-//!   because Frame Server must enumerate media types before any producer
-//!   exists. Cameras are per-user (`CurrentUser` access, `System` lifetime).
+//! - **Media Foundation**: registration fixes one immutable set of modes — a
+//!   default format plus every pixel format consumers may select, all sharing
+//!   its size, frame rate and colorimetry — because Frame Server must
+//!   enumerate media types before any producer exists. Cameras are per-user
+//!   (`CurrentUser` access, `System` lifetime).
+//!
+//! In both backends the consumer picks the format and the producer writes it:
+//! no source ever converts pixels. A connected DirectShow graph or a Frame
+//! Server consumer keeps its negotiated mode, so a producer in another mode
+//! shows black there until it reopens in the requested one
+//! ([`VirtualCamera::requested_format`]).
 //!
 //! Every camera may carry an [`AppId`] tag. A manager created with
 //! [`ManagedCameraManager::for_app`] stamps its tag on new cameras and only
@@ -131,14 +139,59 @@ impl DirectShowRegistration {
 pub struct MediaFoundationRegistration {
     /// Friendly name; unique among this user's Media Foundation cameras.
     pub name: String,
-    /// The single immutable mode the camera advertises and producers write.
-    pub native_format: VideoFormat,
+    /// The format consumers get when they select none. It also fixes the size,
+    /// frame rate and colorimetry shared by every offered format; changing any
+    /// of them requires registering the camera again.
+    pub default_format: VideoFormat,
+    /// Pixel formats consumers may select, in preference order: NV12, I420,
+    /// YUY2, UYVY or P010. Must include `default_format.pixel_format`;
+    /// duplicates are ignored. Frame Server lists packed 4:2:2 formats before
+    /// planar 4:2:0 ones whatever this order is, so the DirectShow bridge
+    /// picks an exact type instead of converting with its own (row-padding)
+    /// filter.
+    pub pixel_formats: Vec<PixelFormat>,
 }
 
 impl MediaFoundationRegistration {
-    /// A camera with the given immutable native mode.
-    pub fn new(name: impl Into<String>, native_format: VideoFormat) -> Self {
-        Self { name: name.into(), native_format }
+    /// A camera offering `pixel_formats`, defaulting to `default_format`.
+    pub fn new(name: impl Into<String>, default_format: VideoFormat, pixel_formats: impl IntoIterator<Item = PixelFormat>) -> Self {
+        Self {
+            name: name.into(),
+            default_format,
+            pixel_formats: pixel_formats.into_iter().collect(),
+        }
+    }
+
+    /// A camera offering exactly one pixel format.
+    pub fn single(name: impl Into<String>, format: VideoFormat) -> Self {
+        Self::new(name, format, [format.pixel_format])
+    }
+
+    /// Validates and normalizes the offered set: the five YUV formats only, no
+    /// duplicates, each valid at the default geometry, default included.
+    fn formats(&self) -> Result<Vec<PixelFormat>> {
+        self.default_format.validate()?;
+        let mut formats: Vec<PixelFormat> = Vec::new();
+        for format in &self.pixel_formats {
+            if !PixelFormat::MEDIA_FOUNDATION.contains(format) || formats.len() == virtualcam_protocol::registry::MAX_PIXEL_FORMATS {
+                return Err(Error::UnsupportedFormat);
+            }
+            if formats.contains(format) {
+                continue;
+            }
+            // Every offered format shares the default size, rate and
+            // colorimetry, so it must be valid at that geometry.
+            VideoFormat {
+                pixel_format: *format,
+                ..self.default_format
+            }
+            .validate()?;
+            formats.push(*format);
+        }
+        if formats.is_empty() || !formats.contains(&self.default_format.pixel_format) {
+            return Err(Error::InvalidFormatSet);
+        }
+        Ok(formats)
     }
 }
 
@@ -186,13 +239,15 @@ pub struct ManagedCameraInfo {
     pub scope: RegistrationScope,
     /// Owning application tag, if any.
     pub app_id: Option<AppId>,
-    /// DirectShow idle default format, or the Media Foundation native mode.
+    /// DirectShow idle default format, or the Media Foundation default format.
     pub format: Option<VideoFormat>,
-    /// DirectShow offered pixel formats (see
-    /// [`DirectShowRegistration::pixel_formats`]); empty for Media Foundation.
+    /// Offered pixel formats, in declaration order: the DirectShow
+    /// [`DirectShowRegistration::pixel_formats`] list, or the Media Foundation
+    /// declared format set (the default format's pixel format among them).
     pub pixel_formats: Vec<PixelFormat>,
     /// DirectShow offered frame rates (see
-    /// [`DirectShowRegistration::frame_rates`]); empty for Media Foundation.
+    /// [`DirectShowRegistration::frame_rates`]); empty for Media Foundation,
+    /// whose modes all use the default format's rate.
     pub frame_rates: Vec<FrameRate>,
     /// Registration completeness.
     pub health: RegistrationHealth,
@@ -252,7 +307,7 @@ impl ManagedCameraManager {
             }
             ManagedCameraRegistration::MediaFoundation(r) => {
                 validate_name(&r.name)?;
-                r.native_format.validate()?;
+                r.formats()?;
             }
         }
         imp::register(self, registration)
@@ -285,10 +340,13 @@ impl ManagedCameraManager {
     /// DirectShow accepts any valid managed format per session; a consumer
     /// graph that is already connected keeps its negotiated format (and shows
     /// black for a different one) until it reconnects. Media Foundation
-    /// accepts the native mode or a mode the source offers as a conversion of
-    /// it (NV12/I420 cameras also offer YUY2), otherwise
-    /// [`Error::FormatMismatch`]; [`VirtualCamera::requested_format`] reports
-    /// the mode consumers selected so the producer can follow it.
+    /// accepts the default format or any other declared format of the same
+    /// size, rate and colorimetry — a request that disagrees with the
+    /// registered colorimetry is [`Error::FormatMismatch`], never silently
+    /// rewritten.
+    /// [`VirtualCamera::requested_format`] reports the mode consumers selected
+    /// so the producer can reopen in it; until it does, mismatched frames are
+    /// delivered as black rather than converted.
     pub fn open(&self, id: ManagedCameraId, format: VideoFormat) -> Result<VirtualCamera> {
         imp::open(self, id, Some(format))
     }
@@ -342,7 +400,7 @@ impl ManagedCameraManager {
     }
 
     /// Opens a producer session with the camera's registered format (the
-    /// Media Foundation native mode or the DirectShow default format).
+    /// Media Foundation default format or the DirectShow default format).
     pub fn open_registered(&self, id: ManagedCameraId) -> Result<VirtualCamera> {
         imp::open(self, id, None)
     }
@@ -360,6 +418,24 @@ fn validate_name(name: &str) -> Result<()> {
         return Err(Error::InvalidCameraName);
     }
     Ok(())
+}
+
+/// The producer session format a Media Foundation camera accepts for
+/// `requested`.
+///
+/// The camera's size, frame rate and colorimetry are fixed at registration and
+/// advertised to consumers, so a request must agree with them: it resolves to
+/// the declared format only when the geometry matches, and a differing
+/// colorimetry is rejected rather than replaced behind the caller's back.
+fn media_foundation_session_format(default: VideoFormat, declared: &[PixelFormat], requested: VideoFormat) -> Result<VideoFormat> {
+    if requested.color != default.color {
+        return Err(Error::FormatMismatch);
+    }
+    declared
+        .iter()
+        .find(|declared| **declared == requested.pixel_format && requested.width == default.width && requested.height == default.height && requested.frame_rate.interval_100ns() == default.frame_rate.interval_100ns())
+        .map(|pixel_format| VideoFormat { pixel_format: *pixel_format, ..default })
+        .ok_or(Error::FormatMismatch)
 }
 
 #[cfg(windows)]
@@ -592,12 +668,9 @@ mod imp {
                 VirtualCamera::open_managed_dshow(id, format.validate()?)
             }
             ManagedBackend::MediaFoundation => {
-                let native = record.format.ok_or(Error::RegistrationDegraded { detail: "native format is missing" })?;
-                let format = format.unwrap_or(native);
-                if !virtualcam_protocol::convert::is_offered(&native, &format) {
-                    return Err(Error::FormatMismatch);
-                }
-                mf::open(&record, format.validate()?)
+                let default = record.format.ok_or(Error::RegistrationDegraded { detail: "default format is missing" })?;
+                let selected = media_foundation_session_format(default, &record.pixel_formats, format.unwrap_or(default))?;
+                mf::open(&record, selected.validate()?)
             }
         }
     }
@@ -629,6 +702,8 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    use virtualcam_protocol::{ColorMatrix, ColorPrimaries, ColorRange, ColorSpace, TransferFunction};
+
     use super::*;
 
     #[test]
@@ -654,5 +729,97 @@ mod tests {
         let manager = ManagedCameraManager::for_app(AppId::new("com.example").expect("valid"));
         assert_eq!(manager.app_id().map(AppId::as_str), Some("com.example"));
         assert_eq!(ManagedCameraManager::new().app_id(), None);
+    }
+
+    #[test]
+    fn media_foundation_registrations_declare_a_consistent_format_set() {
+        let default = VideoFormat::new(PixelFormat::Nv12, 1280, 720, FrameRate::fps(30));
+        let five = [PixelFormat::Nv12, PixelFormat::I420, PixelFormat::Yuy2, PixelFormat::Uyvy, PixelFormat::P010];
+        assert_eq!(MediaFoundationRegistration::new("Cam", default, five).formats(), Ok(five.to_vec()));
+        assert_eq!(MediaFoundationRegistration::single("Cam", default).formats(), Ok(vec![PixelFormat::Nv12]));
+        assert_eq!(
+            MediaFoundationRegistration::new("Cam", default, [PixelFormat::Yuy2, PixelFormat::Yuy2, PixelFormat::Nv12]).formats(),
+            Ok(vec![PixelFormat::Yuy2, PixelFormat::Nv12]),
+            "duplicates are ignored, declaration order is kept"
+        );
+        // The default format must be one of the declared formats.
+        assert_eq!(MediaFoundationRegistration::new("Cam", default, [PixelFormat::Yuy2]).formats(), Err(Error::InvalidFormatSet));
+        assert_eq!(MediaFoundationRegistration::new("Cam", default, []).formats(), Err(Error::InvalidFormatSet));
+        // A format declared beside the default must be valid at its geometry:
+        // NV12 needs an even height, which this YUY2 default does not have.
+        let odd = VideoFormat::new(PixelFormat::Yuy2, 1280, 721, FrameRate::fps(30));
+        assert!(odd.validate().is_ok());
+        assert_eq!(MediaFoundationRegistration::new("Cam", odd, [PixelFormat::Yuy2, PixelFormat::Nv12]).formats(), Err(Error::InvalidDimensions));
+    }
+
+    #[test]
+    fn media_foundation_registrations_accept_only_the_five_yuv_formats() {
+        let default = VideoFormat::new(PixelFormat::Nv12, 1280, 720, FrameRate::fps(30));
+        for format in PixelFormat::MEDIA_FOUNDATION {
+            let single = VideoFormat { pixel_format: format, ..default };
+            assert_eq!(MediaFoundationRegistration::new("Cam", single, [format]).formats(), Ok(vec![format]), "{format:?}");
+        }
+        assert_eq!(MediaFoundationRegistration::new("Cam", default, PixelFormat::MEDIA_FOUNDATION).formats(), Ok(PixelFormat::MEDIA_FOUNDATION.to_vec()));
+        // RGB is DirectShow-only: a Media Foundation camera fixes one
+        // colorimetry for all its modes and never converts.
+        for format in [PixelFormat::Bgra32, PixelFormat::Rgb24, PixelFormat::Rgba8, PixelFormat::Rgba16FloatGamma] {
+            assert_eq!(MediaFoundationRegistration::new("Cam", default, [PixelFormat::Nv12, format]).formats(), Err(Error::UnsupportedFormat), "{format:?}");
+        }
+        // The default format itself must be one of the five.
+        for format in [PixelFormat::Bgra32, PixelFormat::Rgb24] {
+            let rgb = VideoFormat::new(format, 1280, 720, FrameRate::fps(30));
+            assert_eq!(MediaFoundationRegistration::single("Cam", rgb).formats(), Err(Error::UnsupportedFormat), "{format:?}");
+        }
+        // DirectShow keeps its wider set.
+        assert!(PixelFormat::Rgb24.is_managed() && PixelFormat::Bgra32.is_managed());
+    }
+
+    #[test]
+    fn media_foundation_sessions_require_the_registered_colorimetry() {
+        let default = VideoFormat::new(PixelFormat::Nv12, 1280, 720, FrameRate::fps(30)).with_color(ColorSpace::BT709);
+        let declared = [PixelFormat::Nv12, PixelFormat::Yuy2];
+        let session = |format| media_foundation_session_format(default, &declared, format);
+        let yuy2 = VideoFormat {
+            pixel_format: PixelFormat::Yuy2,
+            ..default
+        };
+
+        assert_eq!(session(default), Ok(default));
+        assert_eq!(session(yuy2), Ok(yuy2), "another declared mode keeps the registered colorimetry");
+        // Any colorimetry difference is a mismatch, never silently replaced.
+        for color in [
+            ColorSpace {
+                range: ColorRange::Full,
+                ..ColorSpace::BT709
+            },
+            ColorSpace {
+                matrix: ColorMatrix::Bt601,
+                ..ColorSpace::BT709
+            },
+            ColorSpace {
+                primaries: ColorPrimaries::Bt2020,
+                ..ColorSpace::BT709
+            },
+            ColorSpace {
+                transfer: TransferFunction::Srgb,
+                ..ColorSpace::BT709
+            },
+            ColorSpace::BT601,
+            ColorSpace::BT709_FULL,
+            ColorSpace::SRGB,
+            ColorSpace::default(),
+        ] {
+            assert_eq!(session(VideoFormat { color, ..default }), Err(Error::FormatMismatch), "{color:?}");
+        }
+        // Geometry and declared formats are still enforced.
+        assert_eq!(session(VideoFormat::new(PixelFormat::Nv12, 1920, 1080, FrameRate::fps(30)).with_color(ColorSpace::BT709)), Err(Error::FormatMismatch));
+        assert_eq!(session(VideoFormat::new(PixelFormat::Nv12, 1280, 720, FrameRate::fps(60)).with_color(ColorSpace::BT709)), Err(Error::FormatMismatch));
+        assert_eq!(
+            session(VideoFormat {
+                pixel_format: PixelFormat::P010,
+                ..default
+            }),
+            Err(Error::FormatMismatch)
+        );
     }
 }

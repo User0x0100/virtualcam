@@ -6,9 +6,10 @@
 //!     Name          REG_SZ      friendly name
 //!     AppId         REG_SZ      optional owning-application tag
 //!     Format        REG_BINARY  WireVideoFormat: DirectShow idle default /
-//!                               Media Foundation immutable native mode
-//!     PixelFormats  REG_BINARY  DirectShow: offered pixel formats, in order,
-//!                               as little-endian u32 wire codes
+//!                               Media Foundation default format
+//!     PixelFormats  REG_BINARY  offered pixel formats, in order, as
+//!                               little-endian u32 wire codes (Media
+//!                               Foundation: the declared format set)
 //!     FrameRates    REG_BINARY  DirectShow: offered frame rates, in order, as
 //!                               little-endian u32 numerator/denominator pairs
 //!     SourcePath    REG_SZ      DirectShow: registered source DLL
@@ -98,7 +99,7 @@ pub mod values {
     pub const APP_ID: &str = "AppId";
     /// `REG_BINARY` wire format.
     pub const FORMAT: &str = "Format";
-    /// `REG_BINARY` DirectShow offered pixel formats.
+    /// `REG_BINARY` offered pixel formats.
     pub const PIXEL_FORMATS: &str = "PixelFormats";
     /// `REG_BINARY` DirectShow offered frame rates.
     pub const FRAME_RATES: &str = "FrameRates";
