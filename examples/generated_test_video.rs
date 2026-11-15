@@ -8,7 +8,7 @@ use std::io::{Error as IoError, ErrorKind};
 use std::time::{Duration, Instant};
 use std::{env, thread};
 
-use virtualcam::{CameraType, ObsFrameRate, ObsOptions, PixelFormat, UnityCaptureOptions, VirtualCamera, WriteStatus};
+use virtualcam::{CameraType, FrameRate, ObsOptions, PixelFormat, UnityCaptureOptions, VirtualCamera, WriteStatus};
 
 const USAGE: &str = "\
 Generated virtual-camera test video
@@ -362,11 +362,11 @@ const fn camera_name(camera_type: CameraType) -> &'static str {
     }
 }
 
-fn obs_frame_rate(fps: f64) -> ObsFrameRate {
+fn obs_frame_rate(fps: f64) -> FrameRate {
     const PRECISION: u32 = 1_000_000;
     let numerator = (fps * f64::from(PRECISION)).round() as u32;
     let divisor = greatest_common_divisor(numerator, PRECISION);
-    ObsFrameRate {
+    FrameRate {
         numerator: numerator / divisor,
         denominator: PRECISION / divisor,
     }
@@ -620,8 +620,8 @@ mod tests {
 
     #[test]
     fn floating_fps_is_reduced_to_an_obs_ratio() {
-        assert_eq!(obs_frame_rate(30.0), ObsFrameRate { numerator: 30, denominator: 1 });
-        assert_eq!(obs_frame_rate(29.97), ObsFrameRate { numerator: 2997, denominator: 100 });
+        assert_eq!(obs_frame_rate(30.0), FrameRate { numerator: 30, denominator: 1 });
+        assert_eq!(obs_frame_rate(29.97), FrameRate { numerator: 2997, denominator: 100 });
     }
 
     #[test]

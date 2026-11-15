@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_zero_uses_legacy_unsuffixed_names() {
+    fn capture_zero_uses_unsuffixed_protocol_names() {
         let names = ObjectNames::for_capture(0).expect("valid capture number");
         assert_eq!(names.mutex.to_bytes(), b"UnityCapture_Mutx");
         assert_eq!(names.want.to_bytes(), b"UnityCapture_Want");

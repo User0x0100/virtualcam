@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::{env, fs};
 
-use virtualcam::{CameraType, Error, ObsFrameRate, ObsOptions, PixelFormat, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode, VirtualCamera, WriteStatus};
+use virtualcam::{CameraType, Error, FrameRate, ObsOptions, PixelFormat, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode, VirtualCamera, WriteStatus};
 
 // Both installed-driver tests touch globally named protocol objects. Serializing
 // them also makes failures easier to attribute when they are explicitly enabled.
@@ -42,7 +42,7 @@ fn tiny_obs_options() -> ObsOptions {
     ObsOptions {
         width: 2,
         height: 2,
-        frame_rate: ObsFrameRate::default(),
+        frame_rate: FrameRate::default(),
         force_open: false,
     }
 }

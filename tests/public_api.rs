@@ -1,6 +1,6 @@
 #[cfg(windows)]
 use virtualcam::CameraType;
-use virtualcam::{AppId, ColorSpace, Error, FormatError, FrameRate, ObsFrameRate, ObsOptions, PixelFormat, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode, VideoFormat, VirtualCamera};
+use virtualcam::{AppId, ColorSpace, Error, FormatError, FrameRate, ObsOptions, PixelFormat, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode, VideoFormat, VirtualCamera};
 
 #[test]
 fn pixel_format_validates_dimensions_and_checked_sizes() {
@@ -33,7 +33,7 @@ fn managed_formats_cover_common_yuv_and_rgb_encodings() {
 
 #[test]
 fn backend_options_are_independent_and_match_upstream_defaults() {
-    assert_eq!(ObsOptions::default().frame_rate, ObsFrameRate { numerator: 30, denominator: 1 });
+    assert_eq!(ObsOptions::default().frame_rate, FrameRate { numerator: 30, denominator: 1 });
     assert!(!ObsOptions::default().force_open);
 
     let unity = UnityCaptureOptions::default();
@@ -72,7 +72,7 @@ fn open_rejects_invalid_configuration_before_driver_discovery() {
     let invalid_rate = ObsOptions {
         width: 2,
         height: 2,
-        frame_rate: ObsFrameRate { numerator: 0, denominator: 1 },
+        frame_rate: FrameRate { numerator: 0, denominator: 1 },
         force_open: false,
     };
     assert!(matches!(VirtualCamera::open_obs(invalid_rate), Err(Error::InvalidFrameRate)));

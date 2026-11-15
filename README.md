@@ -19,7 +19,7 @@ The workspace builds two COM source DLLs and the library that manages them:
 
 | | DirectShow (`virtualcam_dshow.dll`) | Media Foundation (`virtualcam_mf.dll`) |
 | --- | --- | --- |
-| Seen by | DirectShow apps: FFmpeg `dshow`, OpenCV `CAP_DSHOW`, OBS, legacy conferencing apps | Frame Server apps: Windows Camera, browsers, Teams, WinRT `MediaCapture`, `IMFSourceReader` |
+| Seen by | DirectShow apps: FFmpeg `dshow`, OpenCV `CAP_DSHOW`, OBS, traditional conferencing apps | Frame Server apps: Windows Camera, browsers, Teams, WinRT `MediaCapture`, `IMFSourceReader` |
 | Install | none; each registration points at the DLL | once per machine, elevated: `install_media_foundation_source` |
 | Registration | `CurrentUser` (no elevation) or `AllUsers` (elevated) | per-user (`CurrentUser` access, `System` lifetime), no elevation |
 | Format | chosen by the producer for each session | one immutable native mode fixed at registration, plus YUY2 for NV12/I420 (the producer may follow the selected mode via `requested_format()`, else the source converts) |
@@ -97,19 +97,14 @@ let _status: WriteStatus = camera.write_host(&frame)?;
 
 - **Idle cameras** emit black. A DirectShow camera advertises its current format — the live producer's, else the registered `default_format`, else this user's last published format for that camera, else NV12 640x480@30 — followed by every other registered `pixel_formats` entry at the same size; each pixel format is offered at the current rate and then at every registered `frame_rates` entry. The connected rate reaches the producer through `requested_format()`, and the source paces delivery to it. `IAMStreamConfig::SetFormat` lets a consumer pick an offered pixel format before connecting.
 - **One consumer graph** may connect a DirectShow camera at a time (a second one gets `ERROR_BUSY`). It publishes its negotiated format; a producer reads it with `VirtualCamera::requested_format()` and may reopen in that pixel format.
-- **Frame-driven delivery:** each published frame signals the DirectShow source, which delivers it immediately instead of on its own timer (no pacing latency, no beat against the producer's cadence).
+- **Frame-driven delivery:** each published frame signals the DirectShow source, which delivers eligible frames under the negotiated frame-rate schedule without introducing an extra periodic polling delay.
 - A connected DirectShow graph keeps its negotiated format; a producer with another format shows black there until the graph reconnects. Producers with the same format attach without reconnecting.
 - **One producer per camera** (`Error::DeviceInUse` otherwise). A crashed producer is detected (process handle + creation time / pipe closure) and consumers fall back to black.
 - **Transport v2**: every session writes a fresh ring whose slots are guarded by a sequence lock, so consumers never accept a torn frame and the writer never waits. DirectShow delivery is paced by a high-resolution timer without catch-up bursts.
 - **Media Foundation producers** attach lazily: `write_host` returns `ConsumerInactive` (and `is_ready` is `false`) until a client starts the camera. The source authenticates the producer's Windows token against the camera owner on a DACL-protected pipe and hands it a ring created with an owner-only DACL; another user cannot inject frames.
 - **Managed delivery** shares one timing policy: new frames are identified by generation and sequence, rate-limited by a virtual schedule (GCRA): a new frame seen no earlier than a quarter interval before its grid slot goes out at once and an earlier one is skipped rather than delayed, so jitter adds no latency and the grid locks onto the producer's phase, while the long-term rate never exceeds the negotiated one and the cadence does not drift; without producer frames, black follows the grid at the negotiated rate; a stalled producer's last frame repeats once per second. Both producers commit then signal an auto-reset frame event. Media Foundation waits for this event, state changes or the delivery deadline, with no ring polling; incompatible frames replaced with black are paced too. Stream pause preserves pending requests for the next Start; stream stop cancels them. `requested_format()` returns a selected mode only when it differs from the mode being written.
-- **MF source upgrades:** rendezvous wire version 2 requires both ring and frame-event names. Update the producer library and source DLL together. The persisted configuration version remains 1, so existing camera registrations do not need recreation.
-- MF delivery deadlines use a high-resolution waitable timer: ordinary millisecond waits rounded idle 30 FPS delivery to about 21 FPS in real Session 0. See the [Frame Server CPU and latency measurements](docs/performance/2026-11-07-mf-events.md), including the native NV12 client-CPU increase; the event path does not improve every workload.
+- MF delivery deadlines use a high-resolution waitable timer to maintain the negotiated cadence, including when the producer is idle.
 - Every exported function and COM method is panic-guarded; `DllMain` does nothing.
-
-### Migrating cameras of the retired C++ driver
-
-Cameras registered by the previous C++ DirectShow DLL keep working only while that DLL exists. `ManagedCameraManager::legacy_cameras()` lists them; `remove_legacy_camera(id)` (elevated) removes one, after which a new camera can be registered. The CLSID changes.
 
 ### Scope and limitations
 
@@ -129,13 +124,13 @@ OBS exposes the complete upstream queue creation parameters—dimensions and an
 exact rational frame rate—plus its backend-only recovery extension:
 
 ```rust,no_run
-use virtualcam::{ObsFrameRate, ObsOptions, VirtualCamera, WriteStatus};
+use virtualcam::{FrameRate, ObsOptions, VirtualCamera, WriteStatus};
 
 fn main() -> Result<(), virtualcam::Error> {
     let mut camera = VirtualCamera::open_obs(ObsOptions {
             width: 1280,
             height: 720,
-            frame_rate: ObsFrameRate {
+            frame_rate: FrameRate {
                 numerator: 30_000,
                 denominator: 1001,
             },
@@ -386,4 +381,4 @@ The Media Foundation contract (activation, attributes, events, `RequestSample`, 
 cargo test --test windows_mf -- --ignored
 ```
 
-`cargo run --example managed_camera -- register|list|stream|unregister|legacy|remove-legacy ...` exercises the manager from the command line.
+`cargo run --example managed_camera -- register|list|stream|unregister|install-mf|uninstall-mf ...` exercises the manager from the command line.

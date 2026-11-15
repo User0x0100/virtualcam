@@ -1,10 +1,11 @@
-//! Windows virtual-camera producers plus an independently managed NV12 `DirectShow` driver.
+//! Windows virtual-camera producers and managed DirectShow / Media Foundation sources.
 //!
-//! `virtualcam` writes frames to the shared-memory protocols used by OBS Virtual
-//! Camera and Unity Capture, and [`ManagedCameraManager`] manages this repository's
-//! independent NV12 `DirectShow` camera DLL. Managed and OBS cameras accept
-//! [`PixelFormat::Nv12`]; Unity Capture accepts RGBA8 and the upstream gamma/linear
-//! RGBA binary16 formats. The Rust producer path never scales or converts frames.
+//! [`ManagedCameraManager`] registers and manages native Rust DirectShow and
+//! Media Foundation cameras with configurable video formats. The library also
+//! publishes frames to the installed OBS Virtual Camera (NV12) and Unity
+//! Capture (RGBA8 or gamma/linear FP16) shared-memory protocols. Producers
+//! do not resize or convert frames; Media Foundation sources can convert
+//! NV12/I420 to YUY2 for consumers that select that format.
 //!
 //! Windows is the only functional platform in this release. The public API is
 //! intentionally platform-neutral, so Linux and macOS applications still compile;
@@ -73,7 +74,7 @@ mod platform;
 mod status;
 
 pub use camera::VirtualCamera;
-pub use config::{CameraType, ObsFrameRate, ObsOptions, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode};
+pub use config::{CameraType, ObsOptions, UnityCaptureFormat, UnityCaptureMirrorMode, UnityCaptureOptions, UnityCaptureResizeMode};
 #[cfg(feature = "cuda")]
 pub use cuda::CudaStream;
 pub use error::{Error, Result};

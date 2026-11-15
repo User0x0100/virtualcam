@@ -2,7 +2,7 @@
 name = "virtualcam"
 version = "0.1.0"
 edition = "2024"
-description = "Manage NV12 DirectShow cameras and write host or CUDA frames to Windows virtual cameras"
+description = "Manage Windows DirectShow and Media Foundation cameras and publish host or CUDA frames"
 license = "MIT"
 readme = "README.md"
 keywords = ["virtual-camera", "obs", "unity", "cuda", "windows"]

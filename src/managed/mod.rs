@@ -17,8 +17,6 @@
 use core::fmt;
 use std::path::PathBuf;
 
-#[cfg(windows)]
-pub use legacy::LegacyCamera;
 pub use virtualcam_protocol::CameraId as ManagedCameraId;
 
 use crate::{Error, FrameRate, PixelFormat, Result, VideoFormat, VirtualCamera};
@@ -27,8 +25,6 @@ use crate::{Error, FrameRate, PixelFormat, Result, VideoFormat, VirtualCamera};
 mod com;
 #[cfg(windows)]
 mod dshow;
-#[cfg(windows)]
-mod legacy;
 #[cfg(windows)]
 pub(crate) mod metadata;
 #[cfg(windows)]
@@ -331,23 +327,6 @@ impl ManagedCameraManager {
             let _ = other_users_cleaned;
             Err(Error::UnsupportedPlatform)
         }
-    }
-
-    /// Lists cameras registered by the retired C++ DirectShow driver.
-    ///
-    /// They keep working only while their C++ DLL exists. Migrate by
-    /// removing each with [`Self::remove_legacy_camera`] and registering a
-    /// new camera (the CLSID changes).
-    #[cfg(windows)]
-    pub fn legacy_cameras() -> Result<Vec<LegacyCamera>> {
-        legacy::list()
-    }
-
-    /// Removes one legacy C++-driver camera (requires elevation).
-    #[cfg(windows)]
-    pub fn remove_legacy_camera(id: ManagedCameraId) -> Result<()> {
-        let _lock = imp::ManagementLock::acquire()?;
-        legacy::remove(id)
     }
 
     /// The installed Media Foundation source DLL, if any.

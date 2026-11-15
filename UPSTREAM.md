@@ -1,15 +1,15 @@
-# Upstream protocol record
+# Third-party protocol contracts
 
-This file pins the protocol sources used by `virtualcam` 0.1.0. The two Rust examples supplied with the original task were used only as calling-scenario clues.
+This file records the external OBS Virtual Camera and Unity Capture wire contracts implemented by the current library. Managed DirectShow and Media Foundation cameras use the project's own protocols.
 
-## Revisions
+## Pinned sources
 
 | Project | Branch inspected | Commit |
 | --- | --- | --- |
 | [obsproject/obs-studio](https://github.com/obsproject/obs-studio) | `master` | `ca937366c1e9fc7f22fd5f1c7d3a3a5f7951170b` |
 | [schellingb/UnityCapture](https://github.com/schellingb/UnityCapture) | `master` | `3ed54c325e0ad71afcf4f246c07e5e17b3d7f2d2` |
 
-The OBS and Unity revisions were resolved and checked out on 2026-07-14. Runtime code does not fetch or follow these branches.
+Runtime code does not fetch these repositories. Their commit identifiers serve as fixed protocol references.
 
 ## OBS mapping
 
@@ -37,7 +37,7 @@ Rust coverage: `src/backend/windows/obs.rs` (naming, occupancy, resolution hint)
 | Slots | 3; header and each `(32-byte frame header + NV12)` extent aligned to 32 | checked layout calculation |
 | Frame | timestamp at slot start; image at `slot + 32`; Y then UV | tight NV12 split at `width * height` |
 | Publish order | increment write index, timestamp, Y, UV, read index, READY | identical observable order; every publish is a full barrier, so the order also holds on ARM64 |
-| Interval | `fps_den * 10_000_000 / fps_num` in 100ns units | exact `ObsFrameRate` integer calculation |
+| Interval | `fps_den * 10_000_000 / fps_num` in 100ns units | exact `FrameRate` integer calculation |
 | Timestamp | `video_data.timestamp`, derived from QPC as nanoseconds | QPC converted to nanoseconds with upstream mul/div algorithm |
 | Close | writer stores STOPPING before unmap/close | same |
 | Resolution hint | `virtualcam_start` writes `%APPDATA%\obs-virtualcam.txt` as `%dx%dx%lld` (tmp + replace) before creating the queue; the filter reads it when no queue exists | same format and replace-through-temporary write, but only after the queue was created |
@@ -46,7 +46,7 @@ The DirectShow consumer currently discards the stored slot timestamp when produc
 
 ## Managed cameras
 
-The managed DirectShow and Media Foundation cameras (`crates/virtualcam-dshow`, `crates/virtualcam-mf`, `crates/virtualcam-protocol`) are original Rust implementations of the public DirectShow and Frame Server custom-media-source contracts. They contain no OBS or libdshowcapture code; the retired libdshowcapture-derived C++ driver was removed after `ManagedCameraManager::legacy_cameras` / `remove_legacy_camera` provided its migration path. The OBS queue above is used only by the OBS producer.
+The managed DirectShow and Media Foundation cameras (`crates/virtualcam-dshow`, `crates/virtualcam-mf`, `crates/virtualcam-protocol`) are Rust implementations of the Windows DirectShow and Frame Server custom-source contracts. Their shared frame ring is independent of OBS and Unity Capture. The OBS queue is used only by the OBS producer.
 
 ## Unity Capture mapping
 
@@ -84,7 +84,7 @@ Rust coverage: `src/backend/windows/unity_capture.rs` and `src/backend/windows/p
 - `force_open` is a requested extension, isolated in the OBS open path. It validates the accessible mapped region with `VirtualQuery` before reinitializing.
 - Unity Capture's C++ destructor omits `UnmapViewOfFile`; Rust owns and unmaps the view with RAII.
 - Failed mutex waits/releases and event operations become errors with their exact Win32 code instead of being ignored.
-- Like the OBS application, a successful OBS open writes `%APPDATA%\obs-virtualcam.txt`, because the OBS filter uses it as its consumer-first mode; without it a consumer that opens first negotiates a stale mode and the filter scales this producer's frames into it. Unlike upstream, the file is written only after the queue was created, so a producer rejected with `DeviceInUse` never overwrites the active producer's mode. (Earlier releases deliberately skipped this file.)
+- Like the OBS application, a successful OBS open writes `%APPDATA%\obs-virtualcam.txt`, because the OBS filter uses it as its consumer-first mode; without it a consumer that opens first negotiates a stale mode and the filter scales this producer's frames into it. Unlike upstream, the file is written only after the queue was created, so a producer rejected with `DeviceInUse` never overwrites the active producer's mode.
 - Queue control fields use sequentially consistent atomics instead of relying on MSVC's x86/x64 `/volatile:ms` acquire/release semantics. The binary layout and the publication sequence are unchanged.
 - Unity's D3D11 texture readback and optional double-buffering are outside `SharedImageMemory::Send`; host/CUDA callers already provide an accessible buffer, so those plugin-only controls are not fabricated by this crate.
 - CUDA writes replace only the upstream CPU data-copy step: one Runtime D2H copy
@@ -93,6 +93,6 @@ Rust coverage: `src/backend/windows/unity_capture.rs` and `src/backend/windows/p
   The mapped destination is contiguous virtual memory but is not registered or
   page-locked by this crate.
 
-## Upgrade checklist
+## Protocol conformance checklist
 
 Before changing either pinned SHA, re-check object names/access masks, struct size/alignment/offsets on 32-bit and 64-bit MSVC, state values, slot count/alignment, interval/timestamp units, publish order, sender/receiver create/open roles, automatic-reset flags, maximum mapping size, capture suffix encoding, metadata enum values, mutex/event order, frame-skip behavior, and closing transitions. Update conformance assertions and this file in the same change.

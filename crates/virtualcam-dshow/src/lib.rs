@@ -12,7 +12,7 @@
 //!
 //! Loader-lock discipline: there is no `DllMain` work at all; everything is
 //! initialized lazily through normal COM activation. Every exported function
-//! and COM method runs inside [`guard`], so a Rust panic becomes
+//! and COM method runs inside `guard`, so a Rust panic becomes
 //! `E_UNEXPECTED` instead of unwinding into the host process.
 
 #![cfg(windows)]

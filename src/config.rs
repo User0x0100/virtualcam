@@ -4,8 +4,7 @@ use crate::{FrameRate, PixelFormat};
 
 /// Selects the virtual-camera protocol used by a camera instance.
 ///
-/// New managed backends (Media Foundation) are added as new variants, so
-/// matches must keep a wildcard arm.
+/// The enum is non-exhaustive; callers must keep a wildcard match arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CameraType {
@@ -20,11 +19,6 @@ pub enum CameraType {
     /// The Unity Capture `SharedImageMemory` protocol.
     UnityCapture,
 }
-
-/// Compatibility alias for existing OBS API callers.
-///
-/// New backend-neutral code should use [`FrameRate`].
-pub type ObsFrameRate = FrameRate;
 
 /// Complete producer controls for OBS Virtual Camera.
 ///

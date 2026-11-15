@@ -3,7 +3,7 @@
 //!
 //! This crate is platform-neutral and owns no OS handles. It defines:
 //!
-//! - [`format`]: the pixel-format / colorimetry / frame-rate model and its
+//! - [`mod@format`]: the pixel-format / colorimetry / frame-rate model and its
 //!   fixed 32-byte wire encoding.
 //! - [`ring`]: the transport v2 frame ring — a header plus N slots, each slot
 //!   guarded by a sequence lock so a reader never consumes a torn frame.
